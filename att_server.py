@@ -25,6 +25,8 @@ try:
 except ImportError:
     pass
 
+import modmanager as _modmanager
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  DARK TITLE BAR  (Windows 10/11 — safe no-op elsewhere)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1229,6 +1231,7 @@ def _btn(parent, text, cmd, style="normal", **kw):
         "primary": ("#3d2a0a", AMBER, "#5a3d0e","#ffd080"),
         "danger":  ("#3d1010","#e88080","#5a1818","#ffaaaa"),
         "success": ("#1a3d1e","#a8d8a0","#2a5e2e","#c8f0c0"),
+        "dim":     (SURF,     MUTED,  SURF2,   PARCH),
     }[style]
     return tk.Button(parent, text=text, bg=colors[0], fg=colors[1],
                      activebackground=colors[2], activeforeground=colors[3],
@@ -3472,6 +3475,7 @@ class ServerSettingsWindow(tk.Toplevel):
 class ServerLauncher(tk.Tk):
     def __init__(self):
         super().__init__()
+        _modmanager.set_helpers(sys.modules[__name__])
         self.title("TavernLauncher - Server")
         self.configure(bg=BG)
         # Same reasoning as the client launcher — this window's log is the
@@ -3552,6 +3556,9 @@ class ServerLauncher(tk.Tk):
         self._mods_btn = _btn(tr, "🧪 Mods", self._open_mods,
                               font=("Segoe UI",9), pady=7, padx=12)
         self._mods_btn.pack(side="left", padx=6)
+        self._community_btn = _btn(tr, "📦 Community Mods", self._open_community_mods,
+                                   font=("Segoe UI",9), pady=7, padx=12)
+        self._community_btn.pack(side="left", padx=(0,6))
         _btn(tr, "📁 Saves",    self._open_saves,    font=("Segoe UI",9),
              pady=7, padx=12).pack(side="right")
         _divider(self)
@@ -3803,6 +3810,15 @@ class ServerLauncher(tk.Tk):
         if self._mods_win and self._mods_win.winfo_exists():
             self._mods_win.lift(); return
         self._mods_win = ModsWindow(self, exe, on_status_change=self._refresh_mods_alert)
+
+    def _open_community_mods(self):
+        exe = self.v_exe.get().strip()
+        if not exe or not os.path.isfile(exe):
+            messagebox.showerror("Game not found",
+                "Please set the path to 'A Township Tale.exe' above first.", parent=self)
+            return
+        _modmanager.CommunityModsWindow(self, os.path.dirname(exe), side="server",
+                                        on_change=self._refresh_mods_alert)
 
     # ── Patch / Mods buttons (same mechanism as the client launcher) ────────
 

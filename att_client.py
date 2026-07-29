@@ -24,6 +24,8 @@ try:
 except ImportError:
     pass
 
+import modmanager as _modmanager
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  DARK TITLE BAR  (Windows 10/11 only — safe no-op elsewhere)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4307,6 +4309,7 @@ class ModsWindow(tk.Toplevel):
 class ClientLauncher(tk.Tk):
     def __init__(self):
         super().__init__()
+        _modmanager.set_helpers(sys.modules[__name__])
         self.title("TavernLauncher - Client")
         self.configure(bg=BG)
         # This is the one window players stare at while the log scrolls —
@@ -4371,6 +4374,9 @@ class ClientLauncher(tk.Tk):
         self._mods_btn = _btn(btn_row_mods, "🧪 Mods", self._open_mods,
              font=("Segoe UI",9), pady=5, padx=10)
         self._mods_btn.pack(side="left", padx=(6,0))
+        self._community_btn = _btn(btn_row_mods, "📦 Community Mods",
+             self._open_community_mods, font=("Segoe UI",9), pady=5, padx=10)
+        self._community_btn.pack(side="left", padx=(6,0))
         _hint(self, "Please install the above mods in order before you launch the game")
 
         _divider(self)
@@ -4873,6 +4879,15 @@ class ClientLauncher(tk.Tk):
                 "Please set the path to 'A Township Tale.exe' above first.", parent=self)
             return
         ModsWindow(self, exe, on_status_change=self._refresh_mods_alert)
+
+    def _open_community_mods(self):
+        exe = self.v_exe.get().strip()
+        if not exe or not os.path.isfile(exe):
+            messagebox.showerror("Game not found",
+                "Please set the path to 'A Township Tale.exe' above first.", parent=self)
+            return
+        _modmanager.CommunityModsWindow(self, os.path.dirname(exe), side="client",
+                                        on_change=self._refresh_mods_alert)
 
     def _on_ip_changed(self, *_):
         """Clear the stale check-status line whenever the IP field changes —
