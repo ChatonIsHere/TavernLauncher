@@ -3240,7 +3240,7 @@ class ModsWindow(tk.Toplevel):
                     lambda m: self.after(0, lambda: self._status.set(m)))
                 self.after(0, lambda: self._finish_install(True, "MelonLoader installed."))
             except Exception as e:
-                self.after(0, lambda: self._finish_install(False, f"Install failed: {e}"))
+                self.after(0, lambda e=e: self._finish_install(False, f"Install failed: {e}"))
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_tavernlib_click(self):
@@ -3257,7 +3257,7 @@ class ModsWindow(tk.Toplevel):
                     lambda m: self.after(0, lambda: self._status.set(m)))
                 self.after(0, lambda: self._finish_install(True, "TavernLib installed."))
             except Exception as e:
-                self.after(0, lambda: self._finish_install(False, f"Install failed: {e}"))
+                self.after(0, lambda e=e: self._finish_install(False, f"Install failed: {e}"))
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_circuitsvoicechat_click(self):
@@ -3274,7 +3274,7 @@ class ModsWindow(tk.Toplevel):
                     lambda m: self.after(0, lambda: self._status.set(m)))
                 self.after(0, lambda: self._finish_install(True, "CircuitsVoiceChat installed."))
             except Exception as e:
-                self.after(0, lambda: self._finish_install(False, f"Install failed: {e}"))
+                self.after(0, lambda e=e: self._finish_install(False, f"Install failed: {e}"))
         threading.Thread(target=worker, daemon=True).start()
 
     def _finish_install(self, ok, msg):
