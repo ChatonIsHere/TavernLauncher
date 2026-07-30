@@ -516,10 +516,16 @@ def ping_server(host, timeout=5):
     return json.loads(raw.decode()), ms
 
 
+# Hard ceiling on a framed response body.
+_MAX_FRAMED_BYTES = 8 * 1024 * 1024
+
+
 def _recv_framed(s, timeout):
     """Reads one length-prefixed message: a 4-byte big-endian byte count, then
     exactly that many bytes, looping recv() since a single call can return a
-    partial read no matter the buffer size. Raises on a short/closed stream."""
+    partial read no matter the buffer size. Raises on a short/closed stream, or
+    on a declared length past _MAX_FRAMED_BYTES (rejected from the header alone,
+    before a single body byte is read or buffered)."""
     s.settimeout(timeout)
     header = b""
     while len(header) < 4:
@@ -528,6 +534,10 @@ def _recv_framed(s, timeout):
             raise ConnectionError("Connection closed while reading length header.")
         header += chunk
     length = int.from_bytes(header, "big")
+    if length > _MAX_FRAMED_BYTES:
+        raise ConnectionError(
+            f"Server declared a {length}-byte response, over the "
+            f"{_MAX_FRAMED_BYTES}-byte limit; refusing to read it.")
     body = bytearray()
     while len(body) < length:
         chunk = s.recv(min(65536, length - len(body)))
@@ -547,10 +557,15 @@ def fetch_server_mods(host, timeout=10):
     server that doesn't understand the request (older TavernLib/launcher)."""
     s = socket.socket()
     s.settimeout(timeout)
-    s.connect((host, AUTH_PORT))
-    s.sendall(json.dumps({"mods_list": True}).encode())
-    body = _recv_framed(s, timeout)
-    s.close()
+    try:
+        s.connect((host, AUTH_PORT))
+        s.sendall(json.dumps({"mods_list": True}).encode())
+        body = _recv_framed(s, timeout)
+    finally:
+        # Closed on every path: this runs against an unreachable or misbehaving
+        # host often enough that leaking the socket on the error path matters.
+        try: s.close()
+        except OSError: pass
     resp = json.loads(body.decode())
     if resp.get("status") != "ok":
         raise Exception(resp.get("message", "Server rejected the mods list request."))
@@ -5183,6 +5198,22 @@ class ClientLauncher(tk.Tk):
         if not (_melonloader_installed(game_dir) and _tavernlib_installed(game_dir)):
             return True
 
+        # Cache whatever is in Mods/ right now, BEFORE anything below can
+        # overwrite it. Without this, a mod installed straight to Mods/ (the
+        # Community Mods window, or an older launcher with no cache at all) is
+        # unknown to the cache, so rendering an active set that needs a
+        # different version of it replaces the folder and destroys the only copy
+        # of the version that was there - making a later switch back a
+        # re-download instead of the file move the cache exists to guarantee.
+        # Idempotent: an already-cached version is skipped.
+        try:
+            adopted = _modmanager.adopt_installed_mods(game_dir)
+            if adopted:
+                self._print(f"Cached {len(adopted)} already-installed mod(s): "
+                            f"{', '.join(adopted)}", "dim")
+        except Exception as e:
+            self._print(f"Could not cache the currently-installed mods: {e}", "warn")
+
         server_mods = self._get_server_mods(host)
         if not server_mods:
             return True
@@ -5381,19 +5412,26 @@ class ClientLauncher(tk.Tk):
                                     **self._popen_console_kwargs())
             self._print(f"Game running (PID {proc.pid})", "ok")
             threading.Thread(target=self._watch_for_rejection,
-                             args=(proc, host), daemon=True).start()
+                             args=(proc, host, lambda: self._do_launch(password=None)),
+                             daemon=True).start()
         except Exception as e:
             self._print(f"Launch failed: {e}", "err")
         self._action_btn.config(state="normal")
 
-    def _watch_for_rejection(self, proc, host):
+    def _watch_for_rejection(self, proc, host, relaunch):
         """Runs on a background thread once the game process is launched.
         Waits for it to exit, then checks for TavernLib's
         last_rejection.json, written by this same client's own TavernLib
         instance right before exiting, if (and only if) the server denied the
-        join for a mod-mismatch reason. _do_launch already deleted any stale
-        copy before this process started, so a file present now was written
-        by this exact attempt."""
+        join for a mod-mismatch reason. The launch path already deleted any
+        stale copy before this process started, so a file present now was
+        written by this exact attempt.
+
+        relaunch is the caller's own way back in, so recovery rejoins via the
+        path the player actually used - _do_launch for the auth-gated flow,
+        _do_launch_headless for the direct one. Hardcoding _do_launch here
+        would send a headless join through an auth handshake its server never
+        answers."""
         proc.wait()
         path = _last_rejection_path()
         if not os.path.isfile(path):
@@ -5419,13 +5457,19 @@ class ClientLauncher(tk.Tk):
         missing = payload.get("missing") or []
         if not missing:
             return
-        self.after(0, lambda: self._offer_rejection_recovery(payload))
+        self.after(0, lambda: self._offer_rejection_recovery(payload, relaunch))
 
-    def _offer_rejection_recovery(self, payload):
+    def _offer_rejection_recovery(self, payload, relaunch):
         """The server rejected the join over exact mods the client didn't
         have. Offers to fetch exactly those (and their dependencies), same
         confirm-before-install and never-auto-add-a-repo rules as everywhere
-        else, then rejoins."""
+        else, then rejoins.
+
+        Only the prompt runs here, on the UI thread; the index fetch and the
+        downloads go to a worker (see below), same as every other install path
+        in this file. Doing them inline would freeze the whole launcher for the
+        length of a download - up to the 30-minute wall-clock cap - with no
+        window redraw and no way to cancel."""
         missing = payload.get("missing") or []
         names = "\n".join(f"  • {m['id']} {m['version']}" for m in missing)
         if not messagebox.askyesno("Mods needed to rejoin",
@@ -5436,32 +5480,58 @@ class ClientLauncher(tk.Tk):
 
         exe = self.v_exe.get().strip()
         game_dir = os.path.dirname(exe)
-        cfg = load_cfg()
-        repo_bases = _modmanager.list_repos(cfg)
-        try:
-            index = _modmanager.fetch_indexes(repo_bases)
-            roots, dependencies = _modmanager.resolve_missing_mods(missing, index, repo_bases)
-            libraries = _modmanager.collect_library_dependencies(roots + dependencies)
-            for mod in roots + dependencies:
-                _modmanager.install_mod(game_dir, mod, lambda *_: None)
-            for lib in libraries:
-                _modmanager.install_library_dependency(game_dir, lib, lambda *_: None)
-        except _modmanager.ModManagerError as e:
-            messagebox.showerror("Recovery failed", str(e), parent=self)
-            return
-        except Exception as e:
-            messagebox.showerror("Recovery failed", f"Unexpected error: {e}", parent=self)
-            return
+        self._action_btn.config(state="disabled")
+        self._print("Recovering the missing mods…", "warn")
 
+        def worker():
+            try:
+                cfg = load_cfg()
+                repo_bases = _modmanager.list_repos(cfg)
+                index = _modmanager.fetch_indexes(repo_bases)
+                roots, dependencies = _modmanager.resolve_missing_mods(missing, index, repo_bases)
+                libraries = _modmanager.collect_library_dependencies(roots + dependencies)
+                for mod in roots + dependencies:
+                    _modmanager.install_mod(
+                        game_dir, mod,
+                        lambda m, _i=mod: self.after(0, lambda: self._print(
+                            f"{_i.id}: {m}", "dim")))
+                for lib in libraries:
+                    _modmanager.install_library_dependency(
+                        game_dir, lib,
+                        lambda m, _l=lib: self.after(0, lambda: self._print(
+                            f"{_l.filename}: {m}", "dim")))
+            except Exception as e:
+                self.after(0, lambda e=e: self._recovery_failed(e))
+                return
+            self.after(0, lambda: self._recovery_done(relaunch))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _recovery_failed(self, err):
+        self._action_btn.config(state="normal")
+        messagebox.showerror("Recovery failed", str(err), parent=self)
+
+    def _recovery_done(self, relaunch):
+        self._action_btn.config(state="normal")
         self._print("Recovered the missing mods, rejoining…", "ok")
-        self._do_launch(password=None)
+        relaunch()
 
     def _do_launch_headless(self):
-        """Same launch as _do_launch, minus the port-1762 handshake entirely —
-        for servers hosted directly via the game itself with no auth gate.
+        """Same launch as _do_launch, minus the port-1762 auth handshake, for
+        servers hosted directly via the game itself with no auth gate.
         user_id has no server to come from here, so it's derived locally
         instead (see _headless_user_id); everything after that point is
-        identical to the official flow."""
+        identical to the official flow.
+
+        Mod reconciliation still runs, because it is a separate concern from
+        auth. TavernLib's join-time parity check (PlayerJoinFilter) is a
+        Harmony patch on the join pipeline, not part of the auth service, so it
+        applies to this path exactly as it does to the official one: a server
+        reached this way still rejects a client whose mods don't match. Skipping
+        the mod work here would therefore mean presenting an empty mods claim to
+        a server that requires mods and being rejected every single time, with
+        no rejection watcher running to recover from it either. If the host
+        serves no mod info at all, _reconcile_mods_before_launch is a no-op."""
         exe      = self.v_exe.get().strip()
         username = self.v_username.get().strip()
         platform = self.v_platform.get()
@@ -5498,7 +5568,23 @@ class ClientLauncher(tk.Tk):
         cfg["recent_servers"] = recent[:20]
         save_cfg(cfg)
 
-        access, refresh, identity = build_tokens(user_id, username)
+        # Same resolution the /dev_server_ip arg below uses, so the host the
+        # reconcile and the rejection watcher key off is the one the game
+        # actually connects to (TavernLib records the resolved address in the
+        # rejection payload, and _watch_for_rejection cross-checks against it).
+        resolved_host = _resolve_ip_for_game(host)
+        if not self._reconcile_mods_before_launch(resolved_host, exe):
+            self._action_btn.config(state="normal")
+            return
+
+        mods_claim = ""
+        try:
+            _, _, mods_list = _modmanager.handshake_snapshot(os.path.dirname(exe))
+            mods_claim = json.dumps({m["id"]: m["version"] for m in mods_list})
+        except Exception as e:
+            self._print(f"Could not read installed mods for the join handshake: {e}", "warn")
+
+        access, refresh, identity = build_tokens(user_id, username, "", mods_claim)
         args = [exe, "/force_offline",
                 "/access_token", access, "/refresh_token", refresh,
                 "/identity_token", identity, "/join_local_server"]
@@ -5508,16 +5594,23 @@ class ClientLauncher(tk.Tk):
         elif platform:
             args[-1:] = ["/vrmode", platform, "/join_local_server"]
         if ip:
-            args += ["/dev_server_ip", _resolve_ip_for_game(ip)]
+            args += ["/dev_server_ip", resolved_host]
         args += ["/dev_server_port", str(_valid_port(self.v_port.get()))]
         if self.v_debug_helper.get():
             args.append("/debug_helper")
+
+        # Same staleness guard as _do_launch: a rejection file present after
+        # this process exits was written by this attempt.
+        _delete_last_rejection_file()
 
         self._print(f"Launching on {platform or 'default'}…", "warn")
         try:
             proc = subprocess.Popen(args, cwd=os.path.dirname(exe),
                                     **self._popen_console_kwargs())
             self._print(f"Game running (PID {proc.pid})", "ok")
+            threading.Thread(target=self._watch_for_rejection,
+                             args=(proc, resolved_host, self._do_launch_headless),
+                             daemon=True).start()
         except Exception as e:
             self._print(f"Launch failed: {e}", "err")
         self._action_btn.config(state="normal")

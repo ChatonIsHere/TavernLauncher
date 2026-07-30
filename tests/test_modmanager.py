@@ -392,7 +392,6 @@ class _FakeInstallFixture:
 
         mm.set_helpers(types.SimpleNamespace(_download_with_progress=fake_download,
                                              _sha256_file=fake_hash))
-        mm._local_av_scan = lambda p: None
         self.addCleanup(lambda: __import__("shutil").rmtree(self.game, ignore_errors=True))
 
     def _sha_for(self, url):
@@ -862,7 +861,7 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
 
 
 class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
-    """render_active_set (4d): applying a JoinPlan to disk. Same throwaway
+    """render_active_set: applying a JoinPlan to disk. Same throwaway
     _tavern_data_dir patch as ClientModCache/PlanJoin."""
 
     def setUp(self):
@@ -901,6 +900,38 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
         mm.render_active_set(self.game, plan)
         self.assertEqual(len(self.dl_dirs), downloads_before)   # no new download
         self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "cch.m", "cch.m.dll")))
+
+    def test_adopting_first_preserves_the_version_a_render_replaces(self):
+        """The reason att_client calls adopt_installed_mods before planning.
+
+        A mod installed straight to Mods/ (Community Mods window, or an older
+        launcher with no cache) is unknown to the cache. Rendering a server's
+        different required version over it must not be allowed to destroy the
+        only copy of what was there, or switching back later is a re-download
+        rather than the file move the cache exists to guarantee."""
+        self._install("adopt.m", "1.0.0")
+        self._publish("adopt.m", "2.0.0")
+        self.assertFalse(os.path.isdir(mm._cache_mod_dir("adopt.m", "1.0.0")))
+
+        mm.adopt_installed_mods(self.game)
+        self.assertTrue(os.path.isdir(mm._cache_mod_dir("adopt.m", "1.0.0")))
+
+        server_mods = [{"id": "adopt.m", "version": "2.0.0", "client_side": True, "server_side": True}]
+        index = [summary("adopt.m", ["1.0.0"]), summary("adopt.m", ["2.0.0"])]
+        mm.render_active_set(self.game, mm.plan_join(self.game, server_mods, index, [self.BASE]))
+
+        # 2.0.0 is now what's live, and 1.0.0 survived the swap in the cache.
+        self.assertEqual(mm._read_mod_record(self.game, "adopt.m")["version"], "2.0.0")
+        self.assertTrue(os.path.isdir(mm._cache_mod_dir("adopt.m", "1.0.0")))
+
+        # Dropping back to 1.0.0 is therefore a file move, not a download.
+        back = [{"id": "adopt.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        plan_back = mm.plan_join(self.game, back, index, [self.BASE])
+        self.assertTrue(plan_back.entries[0].cached)
+        downloads_before = len(self.dl_dirs)
+        mm.render_active_set(self.game, plan_back)
+        self.assertEqual(len(self.dl_dirs), downloads_before)
+        self.assertEqual(mm._read_mod_record(self.game, "adopt.m")["version"], "1.0.0")
 
     def test_already_active_entry_is_left_alone(self):
         self._install("act.m", "1.0.0")
@@ -977,7 +1008,7 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
 class ResolveMissingMods(_FakeInstallFixture, unittest.TestCase):
     """resolve_missing_mods: turns a rejection payload's `missing` entries
     into installable manifests, via the client's own configured repos
-    only; source_repo is never trusted directly (principle 14)."""
+    only; source_repo is never trusted directly."""
 
     def test_resolves_missing_entries_to_manifests(self):
         self._publish("miss.m", "1.4.0")
@@ -1150,7 +1181,6 @@ class ZipBundleInstall(unittest.TestCase):
 
         mm.set_helpers(types.SimpleNamespace(_download_with_progress=fake_download,
                                              _sha256_file=fake_hash))
-        mm._local_av_scan = lambda p: None
         self.addCleanup(lambda: __import__("shutil").rmtree(self.game, ignore_errors=True))
 
     def _make_zip(self, entries):
@@ -1254,16 +1284,6 @@ class ZipBundleInstall(unittest.TestCase):
         with self.assertRaises(mm.ModManagerError):
             self._install("many.m")
         self.assertFalse(os.path.exists(os.path.join(self.game, "Mods", "many.m")))
-
-
-class LocalAvScan(unittest.TestCase):
-    def test_scan_disabled_via_cfg_returns_none_without_running(self):
-        saved = mm._load_cfg
-        try:
-            mm._load_cfg = lambda: {mm.CFG_SCAN_KEY: False}
-            self.assertIsNone(mm._local_av_scan("does-not-exist.dll"))
-        finally:
-            mm._load_cfg = saved
 
 
 class SetHelpersHostHandoff(unittest.TestCase):
