@@ -4,8 +4,7 @@ Community mod manager for TavernLauncher.
 Lives next to att_client.py / att_server.py. Everything about fetching a mod
 index, resolving dependencies, and putting a verified .dll on disk lives HERE.
 The two mono files never talk to GitHub, hash anything, or touch Mods/ for
-index-driven mods directly. They only import this module (optionally, see the
-`_updater`-style guard in each) and call the functions below.
+index-driven mods directly.
 
 Two on-disk shapes are contracts any other installer of these mods must match
 byte-for-byte: the per-mod install layout + its record, and by-id resolution
@@ -53,6 +52,7 @@ import sys
 import json
 import time
 import shutil
+import hashlib
 import zipfile
 import tempfile
 import threading
@@ -61,7 +61,7 @@ import subprocess
 import urllib.request
 import urllib.error
 import tkinter as tk
-from tkinter import messagebox, simpledialog
+from tkinter import messagebox, simpledialog, filedialog
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -76,8 +76,13 @@ from urllib.parse import urlparse
 DEFAULT_REPO = "https://raw.githubusercontent.com/ChatonIsHere/CommunityMods/main"
 
 # Config key inside the dict load_cfg()/save_cfg() already read/write. No
-# separate config file. Holds user-added source repos; DEFAULT_REPO is implicit
-# (always present, never stored as removable, see list_repos/remove_repo).
+# separate config file. Holds user-added source repos, keyed by their
+# "Author/Repo" shorthand (see _repo_shorthand) mapping to the actual base URL;
+# DEFAULT_REPO is implicit (always present, never stored as removable, see
+# list_repos/remove_repo). A repo only ever lands in here through add_repo's
+# live fetch-and-validate check - the shorthand form is for identification only
+# (e.g. in a modlist's `repos` field) and is never enough on its own to add a
+# new pullable source.
 CFG_REPOS_KEY = "mod_repos"
 
 # Config key for the optional local antivirus scan on install (see
@@ -85,6 +90,12 @@ CFG_REPOS_KEY = "mod_repos"
 # AV false-positives on modded DLLs) can set it False. Stored in the same dict
 # load_cfg()/save_cfg() already manage. No separate file.
 CFG_SCAN_KEY = "scan_downloads"
+
+# Config key for the client's always-on pin list: a flat list of
+# "id" (track latest) / "id@version" (pin exact) strings, unioned into every
+# join's active set regardless of which server is joined (plan_join). Same
+# dict load_cfg()/save_cfg() already manage; see list_pinned/add_pin/remove_pin.
+CFG_PINNED_KEY = "pinned_mods"
 
 # A backstop distinct from cycle detection: a real cycle (A -> B -> A) is caught
 # regardless of this number, but a long strictly-acyclic chain would still
@@ -124,13 +135,22 @@ _ZIP_MAX_ENTRIES = 2000
 _ZIP_MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024   # 500 MB extracted, summed
 
 
+def _tavern_data_dir():
+    """Same shared appdata folder both mono files already use for their own
+    config (%AppData%/TheModdingTavern) - a small, dependency-free copy rather
+    than a set_helpers()-borrowed one, since it's a pure function of the
+    environment, not host state. Home for the client mod cache."""
+    base = os.environ.get("APPDATA", os.path.join(os.path.expanduser("~"), "AppData", "Roaming"))
+    return os.path.join(base, "TheModdingTavern")
+
+
 class ModManagerError(Exception):
     """One error type the UI can catch and show verbatim. Every raise below
     carries a specific, actionable message (which mods, which versions, which
     repo) rather than a generic failure."""
 
 
-# -- Host-provided surface (wired once from the mono file) -------------------
+# Host-provided surface (wired once from the mono file)
 # Everything this module borrows from its host launcher instead of re-defining:
 # the download/hash/config helpers (already tested in att_client.py /
 # att_server.py), the palette, and the small widget factories the windows render
@@ -191,7 +211,7 @@ def _warn(msg):
         pass
 
 
-# -- Version + path primitives -----------------------------------------------
+# Version + path primitives
 
 def _parse_version(v):
     """SemVer comparison is load-bearing for major-lock resolution, and the
@@ -239,7 +259,7 @@ def _safe_basename(name):
     return name
 
 
-# -- Data model --------------------------------------------------------------
+# Data model
 
 @dataclass
 class LibraryDependency:
@@ -275,12 +295,12 @@ class ModManifest:
 
     def install_name(self):
         """The basename this mod's single .dll lands under in Mods/<id>/. Nothing
-        ever looks the file up by name — every operation works on the Mods/<id>/
-        folder — so the file just keeps the name it was published under, taken from
+        ever looks the file up by name: every operation works on the Mods/<id>/
+        folder, so the file just keeps the name it was published under, taken from
         download_url. Two guards still apply, because a manifest from an unreviewed
         repo can't be trusted: _safe_basename rejects any traversal (a '..', a path
         separator, an empty/'.'/'..' name), and the result must end in '.dll' or
-        MelonLoader won't load it — either failure falls back to f"{id}.dll" (id is
+        MelonLoader won't load it; either failure falls back to f"{id}.dll" (id is
         already a validated safe segment). Only meaningful for package="dll"; a zip
         bundle names its own files."""
         base = os.path.basename(urlparse(self.download_url).path)
@@ -372,7 +392,7 @@ def _manifest_from_dict(d, source_repo):
         raise ModManagerError(f"manifest for {d.get('id', '?')} is missing field {e}.")
 
 
-# -- Tiny HTTP JSON GET (repository.json / manifests only) --------------------
+# Tiny HTTP JSON GET (repository.json / manifests only)
 # NOT the file downloader; that's the host's _download_with_progress, with its
 # wall-clock cap and progress reporting for large binaries. These are small
 # text fetches, so a plain urlopen with a timeout is the right, minimal tool.
@@ -391,7 +411,7 @@ def _get_json(url, timeout=15):
         raise ModManagerError(f"{url} did not return valid JSON.")
 
 
-# -- Repo sources (config-backed, not GitHub calls) --------------------------
+# Repo sources (config-backed, not GitHub calls)
 
 def _norm(url):
     return (url or "").rstrip("/")
@@ -399,6 +419,30 @@ def _norm(url):
 
 def _is_default(url):
     return _norm(url) == _norm(DEFAULT_REPO)
+
+
+def _repo_shorthand(url):
+    """Derives a GitHub-style "Author/Repo" display identifier from a repo's
+    base URL - the first two path segments (works for
+    raw.githubusercontent.com/<author>/<repo>/<branch> regardless of branch
+    name or depth beyond that; degrades to *some* stable identifier for a
+    non-GitHub host too). Display/identification only: this is what a modlist's
+    `repos` field lists, and it is NEVER resolved back into a URL except by
+    looking an already-registered repo up by this same key - it can't be used
+    to synthesize or guess a pullable URL."""
+    path = urlparse(_norm(url)).path.strip("/").split("/")
+    return "/".join(path[:2]) if len(path) >= 2 else _norm(url)
+
+
+def _named_repos(cfg):
+    """cfg[CFG_REPOS_KEY] as {shorthand: url}, migrating a pre-shorthand
+    list-of-URLs shape in memory (older configs stored a plain list; new ones
+    store the dict directly). Doesn't write back on its own - callers that
+    mutate the result save via _save_cfg."""
+    raw = cfg.get(CFG_REPOS_KEY, {})
+    if isinstance(raw, list):
+        return {_repo_shorthand(u): u for u in raw}
+    return dict(raw)
 
 
 def list_repos(cfg):
@@ -412,8 +456,16 @@ def list_repos(cfg):
     elsewhere. Pre-existing property of the config pattern, low-stakes for a
     single-user GUI, but callers should treat cfg as short-lived (load, mutate,
     save) rather than caching it."""
-    stored = [u for u in cfg.get(CFG_REPOS_KEY, []) if not _is_default(u)]
+    stored = [u for u in _named_repos(cfg).values() if not _is_default(u)]
     return [DEFAULT_REPO] + stored
+
+
+def list_repos_named(cfg):
+    """{shorthand: url} for every configured repo, DEFAULT_REPO included -
+    what a modlist's `repos` field lists (the keys only) and anywhere else a
+    repo needs its "Author/Repo" display identifier rather than its full URL."""
+    named = {k: v for k, v in _named_repos(cfg).items() if not _is_default(v)}
+    return {_repo_shorthand(DEFAULT_REPO): DEFAULT_REPO, **named}
 
 
 def add_repo(cfg, url):
@@ -422,11 +474,16 @@ def add_repo(cfg, url):
          expected schema. A URL that doesn't serve a valid index is rejected
          here, not discovered later mid-resolve. This is the one per-repo trust
          check we do (is this actually a mod-index repo, laid out correctly).
-      2. Not a duplicate.
+      2. Not a duplicate, and its derived shorthand doesn't already point
+         somewhere else (a repo renamed/moved by the same author would need its
+         old entry removed first, rather than silently repointing it).
     The *warning* that this repo is unverified (not reviewed by Modding Tavern,
     the user is responsible for vetting it) is surfaced by the UI at the moment
-    of adding, not enforced here. On success, appends and saves via the injected
-    save_cfg."""
+    of adding, not enforced here. This is the ONLY way a URL becomes pullable -
+    a shorthand appearing in an imported modlist is never enough on its own
+    (see resolve_dependencies/fetch_indexes, which only ever see list_repos'
+    output, never a modlist's `repos` field directly). On success, saves via
+    the injected save_cfg."""
     url = _norm(url)
     if not url:
         raise ModManagerError("Enter a repository URL.")
@@ -443,26 +500,36 @@ def add_repo(cfg, url):
             "repository.json). Double-check it's the raw-content base URL of a "
             "correctly structured repo.")
 
-    cfg.setdefault(CFG_REPOS_KEY, [])
-    cfg[CFG_REPOS_KEY].append(url)
+    shorthand = _repo_shorthand(url)
+    named = _named_repos(cfg)
+    if shorthand in named and _norm(named[shorthand]) != url:
+        raise ModManagerError(
+            f"'{shorthand}' is already registered pointing at a different URL "
+            f"({named[shorthand]}); remove it first if you want to repoint it.")
+    named[shorthand] = url
+    cfg[CFG_REPOS_KEY] = named
     if _save_cfg is not None:
         _save_cfg(cfg)
 
 
-def remove_repo(cfg, url):
-    """Removes a URL from cfg[CFG_REPOS_KEY]. Refuses DEFAULT_REPO; that entry is
-    non-removable (and the UI never offers its remove button). It's also the
-    collision-priority winner (its entry wins when two repos publish the same
-    id+major), but otherwise fetched/searched identically to every other repo."""
-    if _is_default(url):
+def remove_repo(cfg, ref):
+    """Removes a repo from cfg[CFG_REPOS_KEY], matched by either its shorthand
+    ("Author/Repo") or its full URL. Refuses DEFAULT_REPO (by either form);
+    that entry is non-removable (and the UI never offers its remove button).
+    It's also the collision-priority winner (its entry wins when two repos
+    publish the same id+major), but otherwise fetched/searched identically to
+    every other repo."""
+    if _is_default(ref) or _repo_shorthand(ref) == _repo_shorthand(DEFAULT_REPO):
         raise ModManagerError("The default Modding Tavern repository can't be removed.")
-    url = _norm(url)
-    cfg[CFG_REPOS_KEY] = [u for u in cfg.get(CFG_REPOS_KEY, []) if _norm(u) != url]
+    ref_norm = _norm(ref)
+    named = _named_repos(cfg)
+    cfg[CFG_REPOS_KEY] = {k: v for k, v in named.items()
+                          if k != ref and _norm(v) != ref_norm}
     if _save_cfg is not None:
         _save_cfg(cfg)
 
 
-# -- Index fetching / merging ------------------------------------------------
+# Index fetching / merging
 
 # base URL -> (fetched_at, list[ModSummary]).  Per-base so one slow/broken repo
 # doesn't invalidate the others' caches.
@@ -573,7 +640,7 @@ def fetch_indexes(repo_bases, force=False):
     return [s for (s, _default) in merged.values()]
 
 
-# -- Dependency resolution ---------------------------------------------------
+# Dependency resolution
 
 def resolve_dependencies(roots, summary_index, fetch_manifest):
     """Resolves the full dependency *closure* of one OR MORE root mods, returning
@@ -727,7 +794,7 @@ def resolve_mod_by_id(repo_bases, mod_id, prefer_repo=None, major=None):
     return _fetch_manifest_leaf(repo_bases, mod_id, leaf, prefer_repo, what=what)
 
 
-# -- Installation ------------------------------------------------------------
+# Installation
 
 # The record filename inside each mod folder. MUST be exactly "manifest.json":
 # recent MelonLoader only recurses into a Mods/ subfolder that contains a file by
@@ -745,7 +812,7 @@ DISABLED_RECORD_NAME = "manifest.disabled.json"
 
 
 def _mods_base(game_dir):
-    # The Mods/ path WITHOUT creating it — for building paths in read-only code
+    # The Mods/ path WITHOUT creating it, for building paths in read-only code
     # (status/listing) that shouldn't have the side effect of making folders.
     return os.path.join(game_dir, "Mods")
 
@@ -797,7 +864,7 @@ def _write_sidecar(path, data):
         json.dump(data, f, indent=2)
 
 
-# -- Optional local antivirus scan (best-effort, Windows Defender) -----------
+# Optional local antivirus scan (best-effort, Windows Defender)
 # Defense-in-depth on TOP of sha256 verification. The server-side VirusTotal scan
 # (see CommunityMods/tools/modindex.py) only guards the default repo; this scan
 # runs on the user's own machine at install time, so it also covers *unverified*
@@ -989,13 +1056,13 @@ def _safe_extract_zip(zip_path, dest_dir):
 def _mod_record(mod):
     """The record written to Mods/<id>/manifest.json: the fetched manifest
     verbatim (so status/uninstall need no re-fetch) plus install fields. Kept a
-    plain JSON object on purpose — it's also MelonLoader's folder marker, and a
+    plain JSON object on purpose: it's also MelonLoader's folder marker, and a
     future MelonLoader that parses it shouldn't choke. Keep this shape stable so
     any other installer can read it too.
 
     Note there is NO placed-dll filename here: every operation works on the
     Mods/<id>/ folder (install swaps it, uninstall deletes it, update replaces it),
-    so nothing ever needs to find the .dll by name — recording it would be dead
+    so nothing ever needs to find the .dll by name; recording it would be dead
     weight."""
     return {
         "manifest_version": mod.manifest_version,
@@ -1190,7 +1257,7 @@ def _remove_library(game_dir, filename):
     return removed
 
 
-# -- Status / listing --------------------------------------------------------
+# Status / listing
 
 def _read_sidecar(path):
     try:
@@ -1316,7 +1383,569 @@ def list_installed_mods(game_dir):
     return list(out.values())
 
 
-# -- Community-mods UI -------------------------------------------------------
+def handshake_snapshot(game_dir):
+    """Fingerprint of every currently-ENABLED installed mod, for the ping/pong
+    mod-sync check. Disabled mods are excluded: they aren't loaded, so a
+    joining client shouldn't be asked to match them. Returns
+    (mods_hash, mods_count, mods_list):
+    - mods_hash: sha256 of the sorted "id@version" list, joined with newlines.
+      A client caches this per server; an unchanged hash means it already has
+      the full list and skips the extra round trip.
+    - mods_count: len(mods_list), sent alongside the hash in the pong so a
+      client can sanity-check its cache without decoding anything.
+    - mods_list: every entry as {"id", "version", "client_side", "server_side",
+      "source_repo"}, sorted by id: what the separate, length-prefixed
+      "mods_list" request sends on a cache miss. source_repo is a HINT only
+      (principle 14): plan_join uses it to tell a client which repo a required
+      mod not resolvable from any of the client's configured repos would come
+      from, so the user can add it explicitly; it's never resolved into a
+      pull on its own, same rule as everywhere else this field appears (the
+      modlist's `repos`, the rejection payload's `missing` entries)."""
+    mods = sorted((m for m in list_installed_mods(game_dir) if m.get("enabled")),
+                  key=lambda m: m["id"])
+    fingerprint = "\n".join(f"{m['id']}@{m.get('version', '')}" for m in mods)
+    mods_hash = hashlib.sha256(fingerprint.encode()).hexdigest()
+    mods_list = [
+        {"id": m["id"], "version": m.get("version", ""),
+         "client_side": bool(m.get("client_side", False)),
+         "server_side": bool(m.get("server_side", False)),
+         "source_repo": m.get("source_repo", "")}
+        for m in mods
+    ]
+    return mods_hash, len(mods_list), mods_list
+
+
+# Client mod cache
+#
+# A single client joins many servers with different required mods, so with
+# the render step wired in, Mods/ stops being permanent storage and becomes a
+# per-launch rendering of one server's required set (principle 15).
+# Downloaded mods live here instead, keyed by id+version so multiple versions
+# of the same mod coexist - switching servers moves files instead of
+# re-downloading. Libraries are keyed by filename+sha256, not filename alone,
+# since two different mods can pin the same filename at different exact
+# builds and both need to stay cached.
+
+def _cache_base():
+    return os.path.join(_tavern_data_dir(), "mod_cache")
+
+
+def _cache_mod_dir(mod_id, version):
+    return os.path.join(_cache_base(), _safe_basename(mod_id), _safe_basename(version))
+
+
+def _cache_library_dir(filename, sha256):
+    return os.path.join(_cache_base(), "_libraries", _safe_basename(filename), sha256)
+
+
+def cache_store_mod(game_dir, mod_id):
+    """Copies a mod currently on disk (Mods/<id>/, enabled or disabled) into
+    the cache under its recorded version, if not already there. Returns the
+    version stored, or None if the mod isn't actually installed. Safe to call
+    repeatedly - a version already in the cache is left untouched."""
+    rec = _read_mod_record(game_dir, mod_id)
+    if not rec or not rec.get("version"):
+        return None
+    version = rec["version"]
+    dest = _cache_mod_dir(mod_id, version)
+    if os.path.isdir(dest):
+        return version
+
+    src = _mod_dir_path(game_dir, mod_id)
+    staging = dest + ".caching"
+    if os.path.isdir(staging):
+        shutil.rmtree(staging, ignore_errors=True)
+    shutil.copytree(src, staging)
+    # The cache doesn't track enabled/disabled (that's a Mods/-only concept) -
+    # normalize to the plain record name so cache_restore_mod always finds it.
+    disabled = os.path.join(staging, DISABLED_RECORD_NAME)
+    if os.path.isfile(disabled):
+        os.replace(disabled, os.path.join(staging, RECORD_NAME))
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    os.replace(staging, dest)
+    return version
+
+
+def cache_store_library(game_dir, filename):
+    """Copies a UserLibs/ library currently on disk into the cache under its
+    recorded sha256, if not already there. Returns the sha256 stored, or None
+    if the library or its sidecar isn't actually present."""
+    src = os.path.join(_userlibs_dir(game_dir), filename)
+    sidecar = _library_sidecar_path(game_dir, filename)
+    meta = _read_sidecar(sidecar)
+    if not os.path.isfile(src) or not meta or not meta.get("sha256"):
+        return None
+    sha256 = meta["sha256"]
+    dest = _cache_library_dir(filename, sha256)
+    if os.path.isdir(dest):
+        return sha256
+
+    staging = dest + ".caching"
+    if os.path.isdir(staging):
+        shutil.rmtree(staging, ignore_errors=True)
+    os.makedirs(staging)
+    shutil.copy2(src, os.path.join(staging, filename))
+    shutil.copy2(sidecar, os.path.join(staging, f"{filename}.meta.json"))
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    os.replace(staging, dest)
+    return sha256
+
+
+def adopt_installed_mods(game_dir):
+    """Copies everything currently installed in Mods/ (and the UserLibs/
+    libraries they pin) into the cache, without touching Mods/ itself. Safe to
+    call on every launcher startup - already-cached versions are skipped. This
+    is what lets the first run after upgrading from a launcher without a cache
+    recognize its older, direct-to-Mods/ installs as already-cached, rather
+    than treating them as needing a fresh download the first time an active
+    set is rendered. Returns the list of mod ids newly adopted (already-cached
+    ones don't count)."""
+    adopted = []
+    for rec in list_installed_mods(game_dir):
+        version = rec.get("version")
+        if not version:
+            continue
+        already_cached = os.path.isdir(_cache_mod_dir(rec["id"], version))
+        if cache_store_mod(game_dir, rec["id"]) and not already_cached:
+            adopted.append(rec["id"])
+        for filename in rec.get("libraries", []):
+            cache_store_library(game_dir, filename)
+    return adopted
+
+
+def cache_restore_mod(game_dir, mod_id, version):
+    """Copies a cached mod version into Mods/<id>/, enabled, replacing
+    whatever's currently there (assembled in staging, swapped in atomically -
+    same pattern install_mod uses). Raises if that exact version isn't
+    cached."""
+    src = _cache_mod_dir(mod_id, version)
+    if not os.path.isdir(src):
+        raise ModManagerError(f"'{mod_id}' {version} isn't in the local cache.")
+
+    dest = _mod_dir_path(game_dir, mod_id)
+    staging = _staging_path(game_dir, mod_id)
+    if os.path.isdir(staging):
+        shutil.rmtree(staging, ignore_errors=True)
+    shutil.copytree(src, staging)
+    if os.path.isdir(dest):
+        shutil.rmtree(dest)
+    os.makedirs(_mods_base(game_dir), exist_ok=True)
+    os.replace(staging, dest)
+
+
+def cache_restore_library(game_dir, filename, sha256):
+    """Copies a cached library (and its sidecar) into UserLibs/, unless it's
+    already there with a matching hash. Raises if that exact
+    filename+sha256 isn't cached."""
+    dest = os.path.join(_userlibs_dir(game_dir), filename)
+    existing = _read_sidecar(_library_sidecar_path(game_dir, filename))
+    if os.path.isfile(dest) and existing and existing.get("sha256") == sha256:
+        return
+
+    src = _cache_library_dir(filename, sha256)
+    if not os.path.isdir(src):
+        raise ModManagerError(f"Library '{filename}' ({sha256[:12]}...) isn't in the local cache.")
+    shutil.copy2(os.path.join(src, filename), dest)
+    shutil.copy2(os.path.join(src, f"{filename}.meta.json"), _library_sidecar_path(game_dir, filename))
+
+
+# Pre-join reconciliation: plan_join
+#
+# plan_join is the resolution CORE only: given the server's required mods, it
+# computes what the active set should be and diffs it against what's already
+# cached/active. It never touches disk beyond read-only lookups (what's
+# cached, what's currently enabled in Mods/) and never fetches, installs, or
+# uninstalls anything itself - applying a JoinPlan is render_active_set.
+
+def _parse_pin_entry(entry):
+    """Parses a pinned_mods / modlist entry: "id" (track latest) or
+    "id@version" (pin an exact version) - same syntax used everywhere a
+    desired-mods list is written (the headless modlist's `mods`, the
+    launcher's `pinned_mods`). Returns (mod_id, version_or_None)."""
+    if "@" in entry:
+        mod_id, version = entry.split("@", 1)
+        return mod_id, version
+    return entry, None
+
+
+def list_pinned(cfg):
+    """The launcher's always-on pin list: "id" or "id@version" strings, in
+    cfg[CFG_PINNED_KEY]. Not repo-shorthand-keyed like mod_repos - a pin only
+    ever needs a mod id and an optional exact version, so a flat list is
+    enough."""
+    return list(cfg.get(CFG_PINNED_KEY, []))
+
+
+def add_pin(cfg, entry):
+    """Adds (or updates) a pin. entry is "id" or "id@version" - see
+    _parse_pin_entry. Replaces any existing pin for the same mod id rather
+    than allowing two pins for one mod to disagree. Saves via the injected
+    save_cfg, same convention as add_repo/remove_repo."""
+    entry = (entry or "").strip()
+    if not entry:
+        raise ModManagerError("Enter a mod id, e.g. Author.ModId or Author.ModId@1.2.0.")
+    mod_id, _version = _parse_pin_entry(entry)
+    if not mod_id:
+        raise ModManagerError(f"'{entry}' isn't a valid mod id.")
+    pinned = [p for p in list_pinned(cfg) if _parse_pin_entry(p)[0] != mod_id]
+    pinned.append(entry)
+    cfg[CFG_PINNED_KEY] = pinned
+    if _save_cfg is not None:
+        _save_cfg(cfg)
+
+
+def remove_pin(cfg, mod_id):
+    """Removes a mod's pin by id (with or without an @version suffix)."""
+    mod_id, _version = _parse_pin_entry(mod_id)
+    cfg[CFG_PINNED_KEY] = [p for p in list_pinned(cfg) if _parse_pin_entry(p)[0] != mod_id]
+    if _save_cfg is not None:
+        _save_cfg(cfg)
+
+
+@dataclass
+class PlanEntry:
+    """One mod in the computed active set."""
+    mod_id: str
+    version: str
+    source_repo: str
+    reason: str        # "required" (server needs it) | "dependency" | "pinned"
+    cached: bool       # already in the local cache at this exact version
+    active: bool       # Mods/<id>/ is already enabled at exactly this version - a no-op
+    manifest: object   # the resolved ModManifest - render_active_set installs straight
+                        # from this rather than re-fetching it a second time
+
+
+@dataclass
+class JoinPlan:
+    entries: list           # list[PlanEntry] - the full computed active set
+    to_deactivate: list      # mod ids enabled in Mods/ that aren't in the active set
+    libraries: list         # list[LibraryDependency] the active set needs
+    missing: list           # [(mod_id, version)] required by the server, unresolvable from
+                             # any repo the client has configured - blocks launching
+    needs_repo: list        # [(mod_id, version, source_repo)] resolvable, but only from a
+                             # repo the client hasn't added (principle 14) - not blocking on
+                             # its own; surfaced so the user can add the repo and re-check
+    pin_conflicts: list      # [(mod_id, pinned_version, server_version)] - a pinned mod's
+                             # exact version disagrees with what the server requires; the
+                             # user decides whether to unpin or accept the server's version
+
+    @property
+    def blocking(self):
+        """True if this plan can't safely be applied at all - some mod the
+        server actually requires isn't resolvable from anywhere the client
+        knows of. needs_repo alone never blocks (principle 14): it's
+        information for the user to act on, not a launch stopper by itself."""
+        return bool(self.missing)
+
+
+def plan_join(game_dir, server_mods, index, repo_bases, pinned=None):
+    """Computes active = required(server) UNION resolve_dependencies(required)
+    UNION pinned, and diffs it against what's cached/active - the render PLAN,
+    not the render itself.
+
+    server_mods: entries as returned by the ping/pong handshake's full list
+    (handshake_snapshot's mods_list, or the equivalent fetched over the wire) -
+    {"id","version","client_side","server_side","source_repo"}. Only
+    client_side entries are required of the client (every server mod with a
+    client side is required, at the server's exact version - the same version
+    the server itself enforces on join); server_side-only entries are ignored
+    here.
+    index: the client's own merged index (fetch_indexes(repo_bases)) - used to
+    pick each dependency's version within a major.
+    repo_bases: the client's configured repos (list_repos(cfg)) - the only
+    repos anything is actually fetched from (principle 14).
+    pinned: "id" / "id@version" strings (the launcher's always-on set) -
+    unioned in regardless of which server is being joined."""
+    pinned = pinned or []
+
+    required = {m["id"]: m["version"] for m in server_mods if m.get("client_side")}
+    hinted_repo = {m["id"]: m.get("source_repo") for m in server_mods if m.get("source_repo")}
+
+    roots = []
+    missing = []
+    needs_repo = []
+    reason = {}         # mod_id -> "required" | "pinned", first tag wins
+    exact_pin = {}      # mod_id -> pinned version (None if pinned to latest)
+
+    def resolve_root(mod_id, version, tag):
+        try:
+            manifest = _fetch_manifest(repo_bases, mod_id, version)
+        except ModManagerError:
+            hint = hinted_repo.get(mod_id)
+            if hint and _norm(hint) not in [_norm(b) for b in repo_bases]:
+                needs_repo.append((mod_id, version, hint))
+            else:
+                missing.append((mod_id, version))
+            return
+        roots.append(manifest)
+        reason[mod_id] = tag
+
+    for mod_id, version in required.items():
+        resolve_root(mod_id, version, "required")
+
+    for entry in pinned:
+        mod_id, version = _parse_pin_entry(entry)
+        exact_pin[mod_id] = version
+        if mod_id in reason:
+            continue     # already resolved as a required root
+        if version is None:
+            matches = [s for s in index if s.id == mod_id]
+            if not matches:
+                missing.append((mod_id, "latest"))
+                continue
+            version = max((v for s in matches for v in s.versions), key=_parse_version)
+        resolve_root(mod_id, version, "pinned")
+
+    pin_conflicts = [
+        (mod_id, pinned_version, required[mod_id])
+        for mod_id, pinned_version in exact_pin.items()
+        if mod_id in required and pinned_version and pinned_version != required[mod_id]
+    ]
+
+    def fetch_manifest(mod_id, version, source_repo):
+        return _fetch_manifest(repo_bases, mod_id, version, prefer_repo=source_repo)
+
+    dependencies = resolve_dependencies(roots, index, fetch_manifest) if roots else []
+    for dep in dependencies:
+        reason.setdefault(dep.id, "dependency")
+
+    all_mods = roots + dependencies
+    installed = {rec["id"]: rec for rec in list_installed_mods(game_dir)}
+
+    entries = []
+    for mod in all_mods:
+        cached = os.path.isdir(_cache_mod_dir(mod.id, mod.version))
+        rec = installed.get(mod.id)
+        active = bool(rec and rec.get("enabled") and rec.get("version") == mod.version)
+        entries.append(PlanEntry(mod_id=mod.id, version=mod.version, source_repo=mod.source_repo,
+                                  reason=reason.get(mod.id, "required"), cached=cached, active=active,
+                                  manifest=mod))
+
+    active_ids = {e.mod_id for e in entries}
+    to_deactivate = [mod_id for mod_id, rec in installed.items()
+                      if rec.get("enabled") and mod_id not in active_ids]
+
+    libraries = collect_library_dependencies(all_mods) if all_mods else []
+
+    return JoinPlan(entries=entries, to_deactivate=to_deactivate, libraries=libraries,
+                    missing=missing, needs_repo=needs_repo, pin_conflicts=pin_conflicts)
+
+
+def _prune_orphaned_libraries(game_dir):
+    """After the active set changes, removes any UserLibs/ library no longer
+    pinned by any currently-installed mod's record. Each library was already
+    cache_store_library'd when its owning mod was installed/adopted, so
+    nothing is lost - it just isn't present in UserLibs/ until something
+    needs it again."""
+    still_needed = set()
+    for rec in list_installed_mods(game_dir):
+        still_needed.update(rec.get("libraries", []))
+
+    libs_dir = _userlibs_dir(game_dir)
+    for name in os.listdir(libs_dir):
+        if not name.endswith(".meta.json"):
+            continue
+        filename = name[:-len(".meta.json")]
+        if filename in still_needed:
+            continue
+        cache_store_library(game_dir, filename)
+        for path in (os.path.join(libs_dir, filename), os.path.join(libs_dir, name)):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def render_active_set(game_dir, plan, on_progress=None):
+    """Applies a JoinPlan to disk - the actual render step. Restores from
+    cache wherever cached (a file move), downloads only what's
+    genuinely missing, then deactivates anything no longer needed - never
+    deleting a mod outright (it's cached first) and never re-downloading
+    something already cached. Raises ModManagerError immediately if
+    plan.blocking; callers must check that themselves before deciding whether
+    to show a plan at all, same as install_mod_closure surfaces resolution
+    errors before touching disk."""
+    if plan.blocking:
+        raise ModManagerError(
+            "This plan has required mods that couldn't be resolved from any "
+            "configured repo; fix that before applying it.")
+    progress = on_progress or (lambda *_a: None)
+
+    for entry in plan.entries:
+        if entry.active:
+            continue
+        if entry.cached:
+            progress(f"Activating {entry.mod_id} {entry.version} (cached)")
+            cache_restore_mod(game_dir, entry.mod_id, entry.version)
+        else:
+            progress(f"Downloading {entry.mod_id} {entry.version}")
+            install_mod(game_dir, entry.manifest, progress)
+            cache_store_mod(game_dir, entry.mod_id)
+
+    for lib in plan.libraries:
+        filename = _safe_basename(lib.filename)
+        dest = os.path.join(_userlibs_dir(game_dir), filename)
+        existing = _read_sidecar(_library_sidecar_path(game_dir, filename))
+        if os.path.isfile(dest) and existing and existing.get("sha256") == lib.sha256:
+            continue     # already active with the exact pinned content
+        if os.path.isdir(_cache_library_dir(filename, lib.sha256)):
+            progress(f"Activating library {filename} (cached)")
+            cache_restore_library(game_dir, filename, lib.sha256)
+        else:
+            progress(f"Downloading library {filename}")
+            install_library_dependency(game_dir, lib, progress)
+            cache_store_library(game_dir, filename)
+
+    for mod_id in plan.to_deactivate:
+        progress(f"Deactivating {mod_id}")
+        cache_store_mod(game_dir, mod_id)      # preserve it before removing
+        mod_dir = _mod_dir_path(game_dir, mod_id)
+        if os.path.isdir(mod_dir):
+            shutil.rmtree(mod_dir)
+
+    _prune_orphaned_libraries(game_dir)
+
+
+def resolve_missing_mods(missing, index, repo_bases):
+    """Resolves a rejection payload's `missing` entries
+    ({"id","version","source_repo"}) into installable manifests, for the
+    post-reject recovery flow: after a join is denied for a mod mismatch, the
+    launcher runs this to fetch exactly the mods+versions the server said
+    were wrong, installs them, and rejoins. `source_repo` is a HINT only
+    (principle 14): resolution always
+    goes through the client's own configured repos (repo_bases), never a URL
+    taken from the payload; an entry resolvable nowhere raises naming its
+    hint if it has one, same missing/needs_repo distinction plan_join uses.
+
+    Returns (roots, dependencies): roots is one ModManifest per resolved
+    missing entry, in order; dependencies is resolve_dependencies' closure
+    over all of them (the same shape install_mod_closure computes for a
+    single root, generalized to plan_join's multi-root case)."""
+    roots = []
+    unresolved = []
+    for entry in missing:
+        mod_id, version = entry["id"], entry["version"]
+        try:
+            roots.append(_fetch_manifest(repo_bases, mod_id, version))
+        except ModManagerError:
+            hint = entry.get("source_repo")
+            if hint and _norm(hint) not in [_norm(b) for b in repo_bases]:
+                unresolved.append(f"{mod_id} {version} (available from {hint}, "
+                                  f"which you haven't added as a source)")
+            else:
+                unresolved.append(f"{mod_id} {version} (not found in any of "
+                                  f"your configured sources)")
+
+    if unresolved:
+        raise ModManagerError("Could not resolve: " + "; ".join(unresolved))
+
+    def fetch_manifest(mod_id, version, source_repo):
+        return _fetch_manifest(repo_bases, mod_id, version, prefer_repo=source_repo)
+
+    dependencies = resolve_dependencies(roots, index, fetch_manifest) if roots else []
+    return roots, dependencies
+
+
+# Modlist import/export
+#
+# One {schema, repos, mods} shape serves three uses with zero conversion: a
+# launcher (client or launcher-run server) exports/imports it as a shareable
+# file; a headless server's /modlist config (TavernLib's ModsListConfig) IS
+# this same file. `repos` is always informational only
+# (principle 14) - a shorthand naming where the pack's author expects its
+# mods to come from, never resolved into a URL or added as a source by any
+# importer; resolution only ever uses the importer's OWN configured repos.
+
+MODLIST_SCHEMA = 1
+
+
+def export_modlist(game_dir, cfg, pin_versions=False):
+    """Every currently-ENABLED installed mod, in the canonical modlist shape.
+    pin_versions=False (default) writes each as a bare id, so importing it
+    later tracks whatever's latest at that point (a living "modpack"
+    reference); pin_versions=True writes "id@version" for every entry, an
+    exact reproducible snapshot of what's installed right now. `repos` is
+    list_repos_named(cfg)'s shorthands - this launcher's configured sources,
+    for a human reading the file or a pack curator documenting it."""
+    entries = []
+    for m in sorted(list_installed_mods(game_dir), key=lambda r: r["id"]):
+        if not m.get("enabled"):
+            continue
+        entries.append(f"{m['id']}@{m['version']}" if pin_versions else m["id"])
+    return {
+        "schema": MODLIST_SCHEMA,
+        "repos": sorted(list_repos_named(cfg).keys()),
+        "mods": entries,
+    }
+
+
+@dataclass
+class ImportPlan:
+    roots: list           # list[ModManifest], one per resolved modlist entry
+    dependencies: list     # list[ModManifest], resolve_dependencies' closure
+    unresolved: list       # [(mod_id, version_or_None)] - not found in any configured repo
+    hinted_repos: list     # the modlist's own informational `repos` field, for display
+
+    @property
+    def blocking(self):
+        """True if anything the modlist listed couldn't be found at all -
+        apply_import refuses to run until this is empty, same as plan_join's
+        `missing` blocks a join."""
+        return bool(self.unresolved)
+
+
+def import_modlist(modlist, index, repo_bases):
+    """Resolves a modlist's `mods` entries against the importer's OWN
+    configured repos only (repo_bases) - the file's `repos` field is never
+    treated as a source to fetch from or silently add (principle 14). Same
+    by-id / exact-version resolution install already uses. An entry not
+    resolvable from any configured repo is reported unresolved (with the
+    modlist's hinted `repos` surfaced alongside it, so the user knows what to
+    go add) rather than silently skipped or auto-added from its shorthand."""
+    if modlist.get("schema") != MODLIST_SCHEMA:
+        raise ModManagerError(
+            f"This modlist is schema {modlist.get('schema')!r}; this launcher "
+            f"only understands schema {MODLIST_SCHEMA}.")
+
+    roots = []
+    unresolved = []
+    for entry in modlist.get("mods", []):
+        mod_id, version = _parse_pin_entry(entry)
+        try:
+            roots.append(_fetch_manifest(repo_bases, mod_id, version) if version
+                        else resolve_mod_by_id(repo_bases, mod_id))
+        except ModManagerError:
+            unresolved.append((mod_id, version))
+
+    def fetch_manifest(mod_id, ver, source_repo):
+        return _fetch_manifest(repo_bases, mod_id, ver, prefer_repo=source_repo)
+
+    dependencies = resolve_dependencies(roots, index, fetch_manifest) if roots else []
+    return ImportPlan(roots=roots, dependencies=dependencies, unresolved=unresolved,
+                      hinted_repos=list(modlist.get("repos", [])))
+
+
+def apply_import(game_dir, plan, on_progress=None):
+    """Installs everything import_modlist resolved - every root plus their
+    dependency closure plus every collected library - in one confirmed batch
+    (install_mod_closure's flow, generalized to a modlist's many roots).
+    Raises if plan.blocking; callers must check that themselves first, same
+    as render_active_set does for a JoinPlan."""
+    if plan.blocking:
+        raise ModManagerError(
+            "This modlist has mods that couldn't be resolved from any "
+            "configured source; fix that before importing it.")
+    progress = on_progress or (lambda *_a: None)
+    all_mods = plan.roots + plan.dependencies
+    for mod in all_mods:
+        progress(f"Installing {mod.id} {mod.version}")
+        install_mod(game_dir, mod, progress)
+    for lib in collect_library_dependencies(all_mods):
+        progress(f"Installing library {lib.filename}")
+        install_library_dependency(game_dir, lib, progress)
+
+
+# Community-mods UI
 #
 # The Community Mods and Manage Sources windows. Both launchers import these, so
 # there's one copy instead of two. They take all their styling from the palette
@@ -1447,6 +2076,97 @@ class ModSourcesWindow(tk.Toplevel):
             self._on_change()
 
 
+class PinnedModsWindow(tk.Toplevel):
+    """Client-only: mods pinned always-on, unioned into whichever server's
+    active set is rendered at join regardless of what that server
+    actually requires. Same listbox/add/remove shape as ModSourcesWindow,
+    calling straight into list_pinned/add_pin/remove_pin."""
+    def __init__(self, parent, on_change=None):
+        super().__init__(parent)
+        self.title("Pinned Mods")
+        self.configure(bg=BG)
+        self.geometry("480x360")
+        self.resizable(False, False)
+        self._on_change = on_change
+        self._build()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        _enable_dark_titlebar(self)
+        self.transient(parent)
+
+    def _build(self):
+        h = tk.Frame(self, bg=SURF, height=44)
+        h.pack(fill="x"); h.pack_propagate(False)
+        tk.Label(h, text="Pinned Mods", bg=SURF, fg=AMBER,
+                 font=("Georgia",12,"bold")).pack(side="left", padx=16, pady=8)
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
+
+        tk.Label(self,
+            text="Mods that stay active no matter which server you join, on top "
+                 "of whatever that server itself requires. Pin just the mod id to "
+                 "always track its latest version, or id@version to pin an exact "
+                 "one (e.g. Acme.AdminTools@1.4.0). If the server you're joining "
+                 "requires a different exact version, you'll be asked which to use.",
+            bg=BG, fg=MUTED, font=("Segoe UI",9), wraplength=430, justify="left"
+        ).pack(anchor="w", padx=20, pady=(10,6))
+
+        lb_frame = tk.Frame(self, bg=BORDER, highlightbackground=BORDER, highlightthickness=1)
+        lb_frame.pack(fill="both", expand=True, padx=20, pady=(0,8))
+        self._listbox = tk.Listbox(lb_frame, bg=SURF, fg=PARCH, bd=0,
+                                   highlightthickness=0, selectbackground=AMBERDIM,
+                                   font=("Consolas",9), activestyle="none")
+        self._listbox.pack(fill="both", expand=True, padx=1, pady=1)
+
+        bar = tk.Frame(self, bg=BG)
+        bar.pack(fill="x", padx=20, pady=(0,12))
+        _btn(bar, "+ Add pin", self._on_add, style="primary",
+             font=("Segoe UI",9), pady=5, padx=12).pack(side="left")
+        _btn(bar, "- Remove selected", self._on_remove, style="danger",
+             font=("Segoe UI",9), pady=5, padx=12).pack(side="left", padx=8)
+
+        self._status = tk.StringVar(value="")
+        tk.Label(self, textvariable=self._status, bg=BG, fg=CYAN,
+                 font=("Segoe UI",8), wraplength=430, justify="left"
+        ).pack(anchor="w", padx=20, pady=(0,8))
+        self._reload()
+
+    def _reload(self):
+        self._pins = list_pinned(_load_cfg())
+        self._listbox.delete(0, tk.END)
+        for entry in self._pins:
+            self._listbox.insert(tk.END, entry)
+
+    def _on_add(self):
+        entry = simpledialog.askstring("Add pin",
+            "Mod id to pin (e.g. Acme.QuestGiver or Acme.AdminTools@1.4.0):",
+            parent=self)
+        if not entry:
+            return
+        try:
+            add_pin(_load_cfg(), entry.strip())
+        except Exception as e:
+            self._status.set(f"Couldn't add pin: {e}")
+            return
+        self._status.set("Pin added.")
+        self._reload()
+        if self._on_change:
+            self._on_change()
+
+    def _on_remove(self):
+        sel = self._listbox.curselection()
+        if not sel:
+            return
+        entry = self._pins[sel[0]]
+        try:
+            remove_pin(_load_cfg(), entry)
+        except Exception as e:
+            self._status.set(f"Couldn't remove: {e}")
+            return
+        self._status.set("Pin removed.")
+        self._reload()
+        if self._on_change:
+            self._on_change()
+
+
 class CommunityModsWindow(tk.Toplevel):
     """Table-based browser for community mods pulled from the configured sources.
     Lists every available mod, plus any installed mod that has dropped out of the
@@ -1494,6 +2214,21 @@ class CommunityModsWindow(tk.Toplevel):
                  font=("Georgia",12,"bold")).pack(side="left", padx=16, pady=8)
         _btn(h, "Manage Sources", self._open_sources, style="dim",
              font=("Segoe UI",9), pady=4, padx=10).pack(side="right", padx=12)
+        if self._side == "client":
+            # Pinning is a join-time concept - only the client renders a
+            # per-server active set at all; a launcher-run server just has one
+            # fixed Mods/, with nothing to pin against.
+            _btn(h, "Pinned Mods", self._open_pinned, style="dim",
+                 font=("Segoe UI",9), pady=4, padx=10).pack(side="right", padx=(12,0))
+        # Modlist import/export applies to both sides - a client's
+        # Mods/ and a launcher-run server's Mods/ are both real installed sets
+        # that can be exported, and either can import one (the same file a
+        # headless server's /modlist can point at directly, with zero
+        # conversion - see export_modlist/import_modlist).
+        _btn(h, "Import Modlist", self._on_import_modlist, style="dim",
+             font=("Segoe UI",9), pady=4, padx=10).pack(side="right", padx=(12,0))
+        _btn(h, "Export Modlist", self._on_export_modlist, style="dim",
+             font=("Segoe UI",9), pady=4, padx=10).pack(side="right", padx=(12,0))
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
 
         tk.Label(self,
@@ -1669,7 +2404,7 @@ class CommunityModsWindow(tk.Toplevel):
         installed = r["installed"] not in (None, "-")
         self._uninstall_btn.config(state="normal" if installed else "disabled")
         # Toggle: label reflects what the click will do; only an installed row
-        # (enabled True/False) can be toggled — a not-installed row (enabled None)
+        # (enabled True/False) can be toggled; a not-installed row (enabled None)
         # leaves the button disabled.
         enabled = r.get("enabled")
         self._toggle_btn.config(
@@ -1776,6 +2511,91 @@ class CommunityModsWindow(tk.Toplevel):
         if self._busy:
             return
         ModSourcesWindow(self, on_change=lambda: self._load(force=True))
+
+    def _open_pinned(self):
+        if self._busy:
+            return
+        PinnedModsWindow(self)
+
+    def _on_export_modlist(self):
+        if self._busy:
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self, title="Export Modlist", defaultextension=".json",
+            filetypes=[("Modlist JSON", "*.json")])
+        if not path:
+            return
+        pin = messagebox.askyesno("Pin exact versions?",
+            "Pin every mod to its exact currently-installed version?\n\n"
+            "Yes: a reproducible snapshot of this exact setup.\n"
+            "No: each mod tracks whatever's latest when this file is later "
+            "imported (a living modpack reference).", parent=self)
+        try:
+            modlist = export_modlist(self._game_dir, _load_cfg(), pin_versions=pin)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(modlist, f, indent=2)
+            self._status.set(f"Exported {len(modlist['mods'])} mod(s) to {os.path.basename(path)}.")
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e), parent=self)
+
+    def _on_import_modlist(self):
+        if self._busy:
+            return
+        path = filedialog.askopenfilename(parent=self, title="Import Modlist",
+            filetypes=[("Modlist JSON", "*.json")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                modlist = json.load(f)
+        except Exception as e:
+            messagebox.showerror("Import failed", f"Couldn't read that file: {e}", parent=self)
+            return
+
+        self._set_busy(True, "Resolving modlist...")
+        index = self._index
+        def worker():
+            try:
+                repos = list_repos(_load_cfg())
+                plan = import_modlist(modlist, index, repos)
+                self.after(0, lambda: self._confirm_import(plan))
+            except Exception as e:
+                self.after(0, lambda e=e: self._finish(f"Import failed: {e}"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _confirm_import(self, plan):
+        self._set_busy(False)
+        all_mods = plan.roots + plan.dependencies
+        lines = []
+        if all_mods:
+            lines.append("Will install:")
+            lines += [f"  • {m.id} {m.version}" for m in all_mods]
+        if plan.unresolved:
+            lines.append("Could not resolve (add the right source, then re-import):")
+            lines += [f"  • {mid}" + (f" {v}" if v else "") for mid, v in plan.unresolved]
+            if plan.hinted_repos:
+                lines.append("This modlist expects sources: " + ", ".join(plan.hinted_repos))
+        if plan.blocking:
+            messagebox.showerror("Modlist has unresolved mods", "\n".join(lines), parent=self)
+            return
+        if not all_mods:
+            messagebox.showinfo("Nothing to import",
+                "This modlist has nothing new to install.", parent=self)
+            return
+        if not messagebox.askyesno("Import modlist",
+                "\n".join(lines) + "\n\nInstall these now?", parent=self):
+            return
+
+        self._set_busy(True, "Installing...")
+        game_dir = self._game_dir
+        def worker():
+            try:
+                apply_import(game_dir, plan,
+                             lambda m: self.after(0, lambda: self._status.set(m)))
+                self.after(0, lambda: self._finish(f"Imported {len(plan.roots)} mod(s)."))
+            except Exception as e:
+                self.after(0, lambda e=e: self._finish(f"Import failed: {e}"))
+        threading.Thread(target=worker, daemon=True).start()
 
     def _set_busy(self, busy, msg=""):
         self._busy = busy

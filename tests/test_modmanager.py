@@ -26,7 +26,7 @@ DEFAULT = mm.DEFAULT_REPO
 OTHER = "https://raw.githubusercontent.com/someone/theirmods/main"
 
 
-# -- builders -----------------------------------------------------------------
+# builders
 
 def manifest_dict(mod_id, version, **over):
     author, repo = (mod_id.split(".", 1) + ["repo"])[:2]
@@ -179,6 +179,115 @@ class Collisions(unittest.TestCase):
         self.assertEqual(mm.fetch_indexes([DEFAULT], force=True), [])
 
 
+class RepoSourcesConfig(unittest.TestCase):
+    """list_repos/add_repo/remove_repo: user-added sources are stored keyed by
+    their 'Author/Repo' shorthand, but that shorthand is only ever produced by
+    add_repo's own fetch-and-validate check - never derived from, or accepted
+    from, a modlist's `repos` field."""
+
+    def setUp(self):
+        def fake(url, timeout=15):
+            if url == f"{OTHER}/repository.json":
+                return slim_index({})
+            raise mm.ModManagerError(f"no fake for {url}")
+        mm._get_json = fake
+
+    def test_shorthand_derived_from_url(self):
+        self.assertEqual(mm._repo_shorthand(OTHER), "someone/theirmods")
+        self.assertEqual(mm._repo_shorthand(mm.DEFAULT_REPO), "ChatonIsHere/CommunityMods")
+
+    def test_add_repo_stores_by_shorthand(self):
+        cfg = {}
+        mm.add_repo(cfg, OTHER)
+        self.assertEqual(cfg[mm.CFG_REPOS_KEY], {"someone/theirmods": OTHER})
+        self.assertIn(OTHER, mm.list_repos(cfg))
+        self.assertEqual(mm.list_repos_named(cfg)["someone/theirmods"], OTHER)
+
+    def test_add_repo_rejects_duplicate(self):
+        cfg = {}
+        mm.add_repo(cfg, OTHER)
+        with self.assertRaises(mm.ModManagerError):
+            mm.add_repo(cfg, OTHER)
+
+    def test_add_repo_rejects_shorthand_collision_with_different_url(self):
+        cfg = {mm.CFG_REPOS_KEY: {"someone/theirmods": "https://raw.githubusercontent.com/someone/theirmods/old-branch"}}
+        with self.assertRaises(mm.ModManagerError):
+            mm.add_repo(cfg, OTHER)
+
+    def test_legacy_list_shape_migrates_on_read(self):
+        cfg = {mm.CFG_REPOS_KEY: [OTHER]}
+        self.assertIn(OTHER, mm.list_repos(cfg))
+        self.assertEqual(mm.list_repos_named(cfg)["someone/theirmods"], OTHER)
+
+    def test_remove_repo_by_shorthand_or_url(self):
+        cfg = {}
+        mm.add_repo(cfg, OTHER)
+        mm.remove_repo(cfg, "someone/theirmods")
+        self.assertNotIn(OTHER, mm.list_repos(cfg))
+
+        mm.add_repo(cfg, OTHER)
+        mm.remove_repo(cfg, OTHER)
+        self.assertNotIn(OTHER, mm.list_repos(cfg))
+
+    def test_remove_repo_refuses_default_by_either_form(self):
+        cfg = {}
+        with self.assertRaises(mm.ModManagerError):
+            mm.remove_repo(cfg, mm.DEFAULT_REPO)
+        with self.assertRaises(mm.ModManagerError):
+            mm.remove_repo(cfg, "ChatonIsHere/CommunityMods")
+
+    def test_list_repos_named_never_grants_pull_access(self):
+        # A shorthand alone (e.g. lifted from an imported modlist) is not a URL
+        # and is never treated as one - list_repos()/fetch_indexes only ever see
+        # real URLs from the locally-maintained, add_repo-gated store.
+        cfg = {}
+        for url in mm.list_repos(cfg):
+            self.assertTrue(url.startswith("http://") or url.startswith("https://"))
+
+
+class PinnedModsConfig(unittest.TestCase):
+    """list_pinned/add_pin/remove_pin - the client's always-on pin list."""
+
+    def test_add_pin_stores_bare_id(self):
+        cfg = {}
+        mm.add_pin(cfg, "Acme.QuestGiver")
+        self.assertEqual(mm.list_pinned(cfg), ["Acme.QuestGiver"])
+
+    def test_add_pin_stores_exact_version(self):
+        cfg = {}
+        mm.add_pin(cfg, "Acme.AdminTools@1.4.0")
+        self.assertEqual(mm.list_pinned(cfg), ["Acme.AdminTools@1.4.0"])
+
+    def test_add_pin_replaces_existing_pin_for_same_id(self):
+        cfg = {}
+        mm.add_pin(cfg, "Acme.QuestGiver@1.0.0")
+        mm.add_pin(cfg, "Acme.QuestGiver@2.0.0")
+        self.assertEqual(mm.list_pinned(cfg), ["Acme.QuestGiver@2.0.0"])
+
+    def test_add_pin_rejects_empty(self):
+        with self.assertRaises(mm.ModManagerError):
+            mm.add_pin({}, "")
+        with self.assertRaises(mm.ModManagerError):
+            mm.add_pin({}, "   ")
+
+    def test_remove_pin_by_bare_id_or_pinned_form(self):
+        cfg = {}
+        mm.add_pin(cfg, "Acme.QuestGiver@1.0.0")
+        mm.remove_pin(cfg, "Acme.QuestGiver")
+        self.assertEqual(mm.list_pinned(cfg), [])
+
+        mm.add_pin(cfg, "Acme.QuestGiver")
+        mm.remove_pin(cfg, "Acme.QuestGiver@1.0.0")   # version suffix ignored on remove
+        self.assertEqual(mm.list_pinned(cfg), [])
+
+    def test_multiple_distinct_pins_coexist(self):
+        cfg = {}
+        mm.add_pin(cfg, "Acme.QuestGiver")
+        mm.add_pin(cfg, "Acme.AdminTools@1.4.0")
+        self.assertEqual(sorted(mm.list_pinned(cfg)),
+                         ["Acme.AdminTools@1.4.0", "Acme.QuestGiver"])
+
+
 class Resolution(unittest.TestCase):
     """resolve_dependencies takes summaries and a fetch_manifest callable."""
 
@@ -248,7 +357,11 @@ class Listing(unittest.TestCase):
         self.assertEqual([s.id for s in server], ["b.b"])
 
 
-class InstallEndToEnd(unittest.TestCase):
+class _FakeInstallFixture:
+    """Shared setUp/_publish for tests that need real installs against fake
+    download/hash helpers, without inheriting another TestCase's own test_*
+    methods. Mix this in alongside unittest.TestCase rather than subclassing
+    a concrete test case."""
     BASE = DEFAULT
 
     def setUp(self):
@@ -297,6 +410,8 @@ class InstallEndToEnd(unittest.TestCase):
         self.manifests[url] = d
         return d
 
+
+class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
     def test_full_closure_install_lands_files_and_sidecars(self):
         lib_url = "https://x/ExampleLib.dll"
         lib = {"name": "ExampleLib", "download_url": lib_url, "sha256": "", "filename": "ExampleLib.dll"}
@@ -449,6 +564,561 @@ class InstallEndToEnd(unittest.TestCase):
         self.assertTrue(self.dl_dirs)
         for d in self.dl_dirs:
             self.assertTrue(os.path.normcase(d).startswith(game_root))
+
+
+class HandshakeSnapshot(_FakeInstallFixture, unittest.TestCase):
+    """handshake_snapshot(game_dir) - the ping/pong mod-sync fingerprint.
+    Reuses the fake download/hash wiring to actually install mods, then
+    checks the snapshot it produces."""
+
+    def test_empty_mods_dir_gives_empty_snapshot(self):
+        mods_hash, count, entries = mm.handshake_snapshot(self.game)
+        self.assertEqual(count, 0)
+        self.assertEqual(entries, [])
+        self.assertEqual(mods_hash, hashlib.sha256(b"").hexdigest())
+
+    def test_installed_mods_appear_sorted_by_id(self):
+        self._publish("z.z", "1.0.0")
+        self._publish("a.a", "2.1.0")
+        mm.install_mod_closure(self.game, summary("z.z", ["1.0.0"]), [summary("z.z", ["1.0.0"])],
+                               [self.BASE], self.progress.append)
+        mm.install_mod_closure(self.game, summary("a.a", ["2.1.0"]), [summary("a.a", ["2.1.0"])],
+                               [self.BASE], self.progress.append)
+
+        mods_hash, count, entries = mm.handshake_snapshot(self.game)
+        self.assertEqual(count, 2)
+        self.assertEqual([e["id"] for e in entries], ["a.a", "z.z"])
+        self.assertEqual(entries[0]["version"], "2.1.0")
+        self.assertTrue(entries[0]["client_side"])
+        self.assertTrue(entries[0]["server_side"])
+
+        expected = hashlib.sha256(b"a.a@2.1.0\nz.z@1.0.0").hexdigest()
+        self.assertEqual(mods_hash, expected)
+
+    def test_disabled_mod_excluded_from_snapshot(self):
+        self._publish("d.d", "1.0.0")
+        mm.install_mod_closure(self.game, summary("d.d", ["1.0.0"]), [summary("d.d", ["1.0.0"])],
+                               [self.BASE], self.progress.append)
+        mm.disable_mod(self.game, "d.d")
+
+        mods_hash, count, entries = mm.handshake_snapshot(self.game)
+        self.assertEqual(count, 0)
+        self.assertEqual(entries, [])
+        self.assertEqual(mods_hash, hashlib.sha256(b"").hexdigest())
+
+    def test_hash_changes_when_a_version_changes(self):
+        self._publish("v.v", "1.0.0")
+        mm.install_mod_closure(self.game, summary("v.v", ["1.0.0"]), [summary("v.v", ["1.0.0"])],
+                               [self.BASE], self.progress.append)
+        before, _, _ = mm.handshake_snapshot(self.game)
+
+        self._publish("v.v", "1.1.0")
+        mm.install_mod_closure(self.game, summary("v.v", ["1.1.0"]), [summary("v.v", ["1.1.0"])],
+                               [self.BASE], self.progress.append)
+        after, _, _ = mm.handshake_snapshot(self.game)
+
+        self.assertNotEqual(before, after)
+
+
+class ClientModCache(_FakeInstallFixture, unittest.TestCase):
+    """The client mod cache: mod_cache/<id>/<version>/ and the library
+    equivalent, keyed by filename+sha256. Points _tavern_data_dir at a throwaway
+    temp dir so tests never touch the real %AppData%."""
+
+    def setUp(self):
+        super().setUp()
+        self.data_dir = tempfile.mkdtemp(prefix="tavern_appdata_")
+        self._saved_data_dir = mm._tavern_data_dir
+        mm._tavern_data_dir = lambda: self.data_dir
+        self.addCleanup(lambda: setattr(mm, "_tavern_data_dir", self._saved_data_dir))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data_dir, ignore_errors=True))
+
+    def _install(self, mod_id, version, **over):
+        self._publish(mod_id, version, **over)
+        mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
+                               [self.BASE], self.progress.append)
+
+    def test_store_then_restore_round_trip(self):
+        self._install("c.m", "1.0.0")
+        self.assertEqual(mm.cache_store_mod(self.game, "c.m"), "1.0.0")
+        self.assertTrue(os.path.isdir(mm._cache_mod_dir("c.m", "1.0.0")))
+
+        mm.uninstall_mod(self.game, "c.m")
+        self.assertFalse(os.path.exists(os.path.join(self.game, "Mods", "c.m")))
+
+        mm.cache_restore_mod(self.game, "c.m", "1.0.0")
+        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "c.m", "c.m.dll")))
+        restored = read_json(os.path.join(self.game, "Mods", "c.m", "manifest.json"))
+        self.assertEqual(restored["version"], "1.0.0")
+
+    def test_restoring_uncached_version_raises(self):
+        with self.assertRaises(mm.ModManagerError):
+            mm.cache_restore_mod(self.game, "never.installed", "9.9.9")
+
+    def test_store_is_idempotent(self):
+        self._install("i.m", "1.0.0")
+        self.assertEqual(mm.cache_store_mod(self.game, "i.m"), "1.0.0")
+        # A second call with the cached copy already present is a no-op, not
+        # an error (shutil.copytree onto an existing dir would raise).
+        self.assertEqual(mm.cache_store_mod(self.game, "i.m"), "1.0.0")
+
+    def test_disabled_mod_still_caches_and_normalizes_record_name(self):
+        self._install("dis.m", "1.0.0")
+        mm.disable_mod(self.game, "dis.m")
+        self.assertEqual(mm.cache_store_mod(self.game, "dis.m"), "1.0.0")
+        cached = mm._cache_mod_dir("dis.m", "1.0.0")
+        self.assertTrue(os.path.isfile(os.path.join(cached, "manifest.json")))
+        self.assertFalse(os.path.isfile(os.path.join(cached, "manifest.disabled.json")))
+
+    def test_multiple_versions_coexist_in_cache(self):
+        self._install("mv.m", "1.0.0")
+        mm.cache_store_mod(self.game, "mv.m")
+        self._install("mv.m", "2.0.0")
+        mm.cache_store_mod(self.game, "mv.m")
+        self.assertTrue(os.path.isdir(mm._cache_mod_dir("mv.m", "1.0.0")))
+        self.assertTrue(os.path.isdir(mm._cache_mod_dir("mv.m", "2.0.0")))
+
+    def test_library_store_and_restore_round_trip(self):
+        lib_url = "https://x/Shared.dll"
+        lib = {"name": "Shared", "download_url": lib_url, "sha256": "", "filename": "Shared.dll"}
+        self._install("lib.m", "1.0.0", library_dependencies=[dict(lib)])
+        sha = self._sha_for(lib_url)
+
+        self.assertEqual(mm.cache_store_library(self.game, "Shared.dll"), sha)
+        self.assertTrue(os.path.isdir(mm._cache_library_dir("Shared.dll", sha)))
+
+        os.remove(os.path.join(self.game, "UserLibs", "Shared.dll"))
+        os.remove(os.path.join(self.game, "UserLibs", "Shared.dll.meta.json"))
+
+        mm.cache_restore_library(self.game, "Shared.dll", sha)
+        self.assertTrue(os.path.isfile(os.path.join(self.game, "UserLibs", "Shared.dll")))
+        meta = read_json(os.path.join(self.game, "UserLibs", "Shared.dll.meta.json"))
+        self.assertEqual(meta["sha256"], sha)
+
+    def test_restoring_library_already_present_with_matching_hash_is_noop(self):
+        lib_url = "https://x/AlreadyThere.dll"
+        lib = {"name": "AlreadyThere", "download_url": lib_url, "sha256": "", "filename": "AlreadyThere.dll"}
+        self._install("lib2.m", "1.0.0", library_dependencies=[dict(lib)])
+        sha = self._sha_for(lib_url)
+        mm.cache_store_library(self.game, "AlreadyThere.dll")
+        # Already present with the right hash - must not raise even though
+        # nothing was ever removed from UserLibs/.
+        mm.cache_restore_library(self.game, "AlreadyThere.dll", sha)
+
+    def test_adopt_caches_mod_and_its_library_returns_newly_adopted_only(self):
+        lib_url = "https://x/Adopted.dll"
+        lib = {"name": "Adopted", "download_url": lib_url, "sha256": "", "filename": "Adopted.dll"}
+        self._install("ad.m", "1.0.0", library_dependencies=[dict(lib)])
+        self._install("ad2.m", "1.0.0")
+
+        adopted = mm.adopt_installed_mods(self.game)
+        self.assertEqual(sorted(adopted), ["ad.m", "ad2.m"])
+        self.assertTrue(os.path.isdir(mm._cache_mod_dir("ad.m", "1.0.0")))
+        self.assertTrue(os.path.isdir(mm._cache_mod_dir("ad2.m", "1.0.0")))
+        self.assertTrue(os.path.isdir(mm._cache_library_dir("Adopted.dll", self._sha_for(lib_url))))
+
+        # Re-running adopts nothing new - both mods are already cached.
+        self.assertEqual(mm.adopt_installed_mods(self.game), [])
+
+
+class PlanJoin(_FakeInstallFixture, unittest.TestCase):
+    """plan_join: the pure resolution core. Points _tavern_data_dir at a
+    throwaway temp dir (needed for the cached/active-entry checks) the same
+    way ClientModCache does."""
+
+    OTHER = OTHER
+
+    def setUp(self):
+        super().setUp()
+        self.data_dir = tempfile.mkdtemp(prefix="tavern_appdata_")
+        self._saved_data_dir = mm._tavern_data_dir
+        mm._tavern_data_dir = lambda: self.data_dir
+        self.addCleanup(lambda: setattr(mm, "_tavern_data_dir", self._saved_data_dir))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data_dir, ignore_errors=True))
+
+    def _install(self, mod_id, version, **over):
+        self._publish(mod_id, version, **over)
+        mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
+                               [self.BASE], self.progress.append)
+
+    def _entry(self, plan, mod_id):
+        return next(e for e in plan.entries if e.mod_id == mod_id)
+
+    def test_required_mod_becomes_active_entry(self):
+        self._publish("req.m", "1.0.0")
+        server_mods = [{"id": "req.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        index = [summary("req.m", ["1.0.0"])]
+
+        plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
+        self.assertFalse(plan.blocking)
+        self.assertEqual(plan.missing, [])
+        self.assertEqual(plan.needs_repo, [])
+        entry = self._entry(plan, "req.m")
+        self.assertEqual(entry.version, "1.0.0")
+        self.assertEqual(entry.reason, "required")
+        self.assertFalse(entry.cached)
+        self.assertFalse(entry.active)
+
+    def test_server_side_only_mod_not_required(self):
+        server_mods = [{"id": "srv.m", "version": "1.0.0", "client_side": False, "server_side": True}]
+        plan = mm.plan_join(self.game, server_mods, [], [self.BASE])
+        self.assertEqual(plan.entries, [])
+        self.assertEqual(plan.missing, [])
+
+    def test_dependency_pulled_in_with_reason_dependency(self):
+        self._publish("dep.k", "1.0.0")
+        self._publish("root.m", "1.0.0", dependencies={"dep.k": "1.0.0"})
+        server_mods = [{"id": "root.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        index = [summary("dep.k", ["1.0.0"]), summary("root.m", ["1.0.0"])]
+
+        plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
+        self.assertEqual({e.mod_id: e.reason for e in plan.entries},
+                         {"root.m": "required", "dep.k": "dependency"})
+
+    def test_missing_required_mod_blocks_with_no_hint(self):
+        server_mods = [{"id": "ghost.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        plan = mm.plan_join(self.game, server_mods, [], [self.BASE])
+        self.assertTrue(plan.blocking)
+        self.assertEqual(plan.missing, [("ghost.m", "1.0.0")])
+        self.assertEqual(plan.needs_repo, [])
+
+    def test_needs_repo_when_hint_names_unadded_repo_not_blocking(self):
+        server_mods = [{"id": "elsewhere.m", "version": "1.0.0", "client_side": True,
+                        "server_side": True, "source_repo": self.OTHER}]
+        plan = mm.plan_join(self.game, server_mods, [], [self.BASE])
+        self.assertFalse(plan.blocking)
+        self.assertEqual(plan.missing, [])
+        self.assertEqual(plan.needs_repo, [("elsewhere.m", "1.0.0", self.OTHER)])
+
+    def test_pinned_mod_with_no_version_resolves_to_index_highest(self):
+        self._publish("pin.m", "2.5.0")
+        index = [summary("pin.m", ["1.0.0", "2.5.0"])]
+        plan = mm.plan_join(self.game, [], index, [self.BASE], pinned=["pin.m"])
+        entry = self._entry(plan, "pin.m")
+        self.assertEqual(entry.version, "2.5.0")
+        self.assertEqual(entry.reason, "pinned")
+
+    def test_pinned_mod_with_exact_version(self):
+        self._publish("pin.m", "1.0.0")
+        self._publish("pin.m", "2.5.0")
+        index = [summary("pin.m", ["1.0.0", "2.5.0"])]
+        plan = mm.plan_join(self.game, [], index, [self.BASE], pinned=["pin.m@1.0.0"])
+        entry = self._entry(plan, "pin.m")
+        self.assertEqual(entry.version, "1.0.0")
+
+    def test_pin_conflict_when_server_requires_a_different_exact_version(self):
+        self._publish("conf.m", "2.0.0")
+        server_mods = [{"id": "conf.m", "version": "2.0.0", "client_side": True, "server_side": True}]
+        index = [summary("conf.m", ["1.0.0", "2.0.0"])]
+
+        plan = mm.plan_join(self.game, server_mods, index, [self.BASE], pinned=["conf.m@1.0.0"])
+        self.assertEqual(plan.pin_conflicts, [("conf.m", "1.0.0", "2.0.0")])
+        # The server's exact required version wins the single active entry -
+        # the pin conflict is surfaced, not silently overridden or duplicated.
+        self.assertEqual(len(plan.entries), 1)
+        self.assertEqual(self._entry(plan, "conf.m").version, "2.0.0")
+
+    def test_active_true_when_already_installed_at_matching_version(self):
+        self._install("act.m", "1.0.0")
+        server_mods = [{"id": "act.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        index = [summary("act.m", ["1.0.0"])]
+
+        plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
+        entry = self._entry(plan, "act.m")
+        self.assertTrue(entry.active)
+
+    def test_cached_true_when_version_cached_but_not_currently_active(self):
+        self._install("cch.m", "1.0.0")
+        mm.cache_store_mod(self.game, "cch.m")
+        mm.uninstall_mod(self.game, "cch.m")
+        server_mods = [{"id": "cch.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        index = [summary("cch.m", ["1.0.0"])]
+
+        plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
+        entry = self._entry(plan, "cch.m")
+        self.assertTrue(entry.cached)
+        self.assertFalse(entry.active)
+
+    def test_to_deactivate_lists_enabled_mod_no_longer_required(self):
+        self._install("old.m", "1.0.0")
+        plan = mm.plan_join(self.game, [], [], [self.BASE])
+        self.assertEqual(plan.to_deactivate, ["old.m"])
+
+    def test_already_disabled_mod_not_listed_to_deactivate(self):
+        self._install("dis.m", "1.0.0")
+        mm.disable_mod(self.game, "dis.m")
+        plan = mm.plan_join(self.game, [], [], [self.BASE])
+        self.assertEqual(plan.to_deactivate, [])
+
+    def test_libraries_collected_for_active_set(self):
+        lib_url = "https://x/PlanLib.dll"
+        lib = {"name": "PlanLib", "download_url": lib_url, "sha256": "", "filename": "PlanLib.dll"}
+        self._publish("root.m", "1.0.0", library_dependencies=[dict(lib)])
+        server_mods = [{"id": "root.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        index = [summary("root.m", ["1.0.0"])]
+
+        plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
+        self.assertEqual([l.filename for l in plan.libraries], ["PlanLib.dll"])
+
+
+class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
+    """render_active_set (4d): applying a JoinPlan to disk. Same throwaway
+    _tavern_data_dir patch as ClientModCache/PlanJoin."""
+
+    def setUp(self):
+        super().setUp()
+        self.data_dir = tempfile.mkdtemp(prefix="tavern_appdata_")
+        self._saved_data_dir = mm._tavern_data_dir
+        mm._tavern_data_dir = lambda: self.data_dir
+        self.addCleanup(lambda: setattr(mm, "_tavern_data_dir", self._saved_data_dir))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data_dir, ignore_errors=True))
+
+    def _install(self, mod_id, version, **over):
+        self._publish(mod_id, version, **over)
+        mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
+                               [self.BASE], self.progress.append)
+
+    def test_downloads_missing_required_mod_and_caches_it(self):
+        self._publish("dl.m", "1.0.0")
+        server_mods = [{"id": "dl.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        index = [summary("dl.m", ["1.0.0"])]
+        plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
+
+        mm.render_active_set(self.game, plan)
+        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "dl.m", "dl.m.dll")))
+        self.assertTrue(os.path.isdir(mm._cache_mod_dir("dl.m", "1.0.0")))
+
+    def test_restores_from_cache_without_redownload(self):
+        self._install("cch.m", "1.0.0")
+        mm.cache_store_mod(self.game, "cch.m")
+        mm.uninstall_mod(self.game, "cch.m")
+
+        server_mods = [{"id": "cch.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        index = [summary("cch.m", ["1.0.0"])]
+        plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
+        downloads_before = len(self.dl_dirs)
+
+        mm.render_active_set(self.game, plan)
+        self.assertEqual(len(self.dl_dirs), downloads_before)   # no new download
+        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "cch.m", "cch.m.dll")))
+
+    def test_already_active_entry_is_left_alone(self):
+        self._install("act.m", "1.0.0")
+        server_mods = [{"id": "act.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        index = [summary("act.m", ["1.0.0"])]
+        plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
+        downloads_before = len(self.dl_dirs)
+
+        mm.render_active_set(self.game, plan)
+        self.assertEqual(len(self.dl_dirs), downloads_before)
+        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "act.m", "act.m.dll")))
+
+    def test_deactivated_mod_removed_from_mods_but_stays_cached(self):
+        self._install("old.m", "1.0.0")
+        plan = mm.plan_join(self.game, [], [], [self.BASE])   # nothing required -> deactivate everything
+
+        mm.render_active_set(self.game, plan)
+        self.assertFalse(os.path.exists(os.path.join(self.game, "Mods", "old.m")))
+        self.assertTrue(os.path.isdir(mm._cache_mod_dir("old.m", "1.0.0")))
+
+        # Recoverable later with no re-download.
+        mm.cache_restore_mod(self.game, "old.m", "1.0.0")
+        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "old.m", "old.m.dll")))
+
+    def test_library_downloaded_then_orphan_pruned_after_deactivation(self):
+        lib_url = "https://x/Prune.dll"
+        lib = {"name": "Prune", "download_url": lib_url, "sha256": "", "filename": "Prune.dll"}
+        self._publish("lib.m", "1.0.0", library_dependencies=[dict(lib)])
+        server_mods = [{"id": "lib.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        index = [summary("lib.m", ["1.0.0"])]
+
+        plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
+        mm.render_active_set(self.game, plan)
+        self.assertTrue(os.path.isfile(os.path.join(self.game, "UserLibs", "Prune.dll")))
+        sha = self._sha_for(lib_url)
+        self.assertTrue(os.path.isdir(mm._cache_library_dir("Prune.dll", sha)))
+
+        # Now nothing requires lib.m any more - deactivating it should prune
+        # the now-orphaned library from UserLibs/ (it stays cached, though).
+        plan2 = mm.plan_join(self.game, [], [], [self.BASE])
+        mm.render_active_set(self.game, plan2)
+        self.assertFalse(os.path.exists(os.path.join(self.game, "UserLibs", "Prune.dll")))
+        self.assertTrue(os.path.isdir(mm._cache_library_dir("Prune.dll", sha)))
+
+    def test_library_restored_from_cache_without_redownload(self):
+        lib_url = "https://x/Reuse.dll"
+        lib = {"name": "Reuse", "download_url": lib_url, "sha256": "", "filename": "Reuse.dll"}
+        self._publish("lib2.m", "1.0.0", library_dependencies=[dict(lib)])
+        server_mods = [{"id": "lib2.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        index = [summary("lib2.m", ["1.0.0"])]
+        plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
+        mm.render_active_set(self.game, plan)
+
+        # Deactivate, then reactivate - the library should come back from
+        # cache, not a fresh download.
+        plan_off = mm.plan_join(self.game, [], [], [self.BASE])
+        mm.render_active_set(self.game, plan_off)
+        downloads_before = len(self.dl_dirs)
+
+        plan_on = mm.plan_join(self.game, server_mods, index, [self.BASE])
+        mm.render_active_set(self.game, plan_on)
+        self.assertEqual(len(self.dl_dirs), downloads_before)
+        self.assertTrue(os.path.isfile(os.path.join(self.game, "UserLibs", "Reuse.dll")))
+
+    def test_blocking_plan_raises_and_changes_nothing(self):
+        server_mods = [{"id": "ghost.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        plan = mm.plan_join(self.game, server_mods, [], [self.BASE])
+        self.assertTrue(plan.blocking)
+        with self.assertRaises(mm.ModManagerError):
+            mm.render_active_set(self.game, plan)
+        self.assertFalse(os.path.exists(os.path.join(self.game, "Mods")))
+
+
+class ResolveMissingMods(_FakeInstallFixture, unittest.TestCase):
+    """resolve_missing_mods: turns a rejection payload's `missing` entries
+    into installable manifests, via the client's own configured repos
+    only; source_repo is never trusted directly (principle 14)."""
+
+    def test_resolves_missing_entries_to_manifests(self):
+        self._publish("miss.m", "1.4.0")
+        missing = [{"id": "miss.m", "version": "1.4.0", "source_repo": self.BASE}]
+        roots, deps = mm.resolve_missing_mods(missing, [], [self.BASE])
+        self.assertEqual([(m.id, m.version) for m in roots], [("miss.m", "1.4.0")])
+        self.assertEqual(deps, [])
+
+    def test_pulls_in_dependencies(self):
+        self._publish("dep.k", "1.0.0")
+        self._publish("root.m", "1.0.0", dependencies={"dep.k": "1.0.0"})
+        missing = [{"id": "root.m", "version": "1.0.0", "source_repo": self.BASE}]
+        index = [summary("dep.k", ["1.0.0"])]
+        roots, deps = mm.resolve_missing_mods(missing, index, [self.BASE])
+        self.assertEqual([m.id for m in roots], ["root.m"])
+        self.assertEqual([m.id for m in deps], ["dep.k"])
+
+    def test_unresolvable_entry_names_unadded_hint_repo(self):
+        missing = [{"id": "elsewhere.m", "version": "1.0.0", "source_repo": OTHER}]
+        with self.assertRaises(mm.ModManagerError) as ctx:
+            mm.resolve_missing_mods(missing, [], [self.BASE])
+        self.assertIn("elsewhere.m", str(ctx.exception))
+        self.assertIn(OTHER, str(ctx.exception))
+
+    def test_unresolvable_entry_with_no_hint_reports_not_found(self):
+        missing = [{"id": "ghost.m", "version": "1.0.0"}]
+        with self.assertRaises(mm.ModManagerError) as ctx:
+            mm.resolve_missing_mods(missing, [], [self.BASE])
+        self.assertIn("ghost.m", str(ctx.exception))
+        self.assertIn("not found", str(ctx.exception))
+
+    def test_multiple_missing_entries_all_resolved(self):
+        self._publish("a.a", "1.0.0")
+        self._publish("b.b", "2.0.0")
+        missing = [{"id": "a.a", "version": "1.0.0"}, {"id": "b.b", "version": "2.0.0"}]
+        roots, deps = mm.resolve_missing_mods(missing, [], [self.BASE])
+        self.assertEqual(sorted(m.id for m in roots), ["a.a", "b.b"])
+
+
+class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
+    """export_modlist/import_modlist/apply_import: the shared
+    {schema, repos, mods} shape, reused as-is by a headless server's modlist."""
+
+    def _install(self, mod_id, version, **over):
+        self._publish(mod_id, version, **over)
+        mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
+                               [self.BASE], self.progress.append)
+
+    def _publish_latest(self, mod_id, version, **over):
+        """Like _publish, but also serves it at latest.json, so bare-id
+        (non-pinned) modlist entries can resolve via resolve_mod_by_id."""
+        d = self._publish(mod_id, version, **over)
+        author, repo = mod_id.split(".", 1)
+        self.manifests[f"{self.BASE}/manifests/{author}/{repo}/latest.json"] = d
+        return d
+
+    def test_export_lists_only_enabled_mods_as_bare_ids(self):
+        self._install("en.m", "1.0.0")
+        self._install("dis.m", "1.0.0")
+        mm.disable_mod(self.game, "dis.m")
+
+        out = mm.export_modlist(self.game, {})
+        self.assertEqual(out["schema"], mm.MODLIST_SCHEMA)
+        self.assertEqual(out["mods"], ["en.m"])
+
+    def test_export_pin_versions_writes_exact_versions(self):
+        self._install("pin.m", "1.4.0")
+        out = mm.export_modlist(self.game, {}, pin_versions=True)
+        self.assertEqual(out["mods"], ["pin.m@1.4.0"])
+
+    def test_export_repos_are_informational_shorthands(self):
+        cfg = {}
+        self.manifests[f"{OTHER}/repository.json"] = slim_index({})
+        mm.add_repo(cfg, OTHER)
+        out = mm.export_modlist(self.game, cfg)
+        self.assertIn("someone/theirmods", out["repos"])
+        self.assertIn("ChatonIsHere/CommunityMods", out["repos"])
+
+    def test_import_resolves_bare_id_via_latest(self):
+        self._publish_latest("lat.m", "2.0.0")
+        modlist = {"schema": 1, "repos": [], "mods": ["lat.m"]}
+        plan = mm.import_modlist(modlist, [], [self.BASE])
+        self.assertFalse(plan.blocking)
+        self.assertEqual([(m.id, m.version) for m in plan.roots], [("lat.m", "2.0.0")])
+
+    def test_import_resolves_pinned_exact_version(self):
+        self._publish("pin.m", "1.0.0")
+        self._publish("pin.m", "2.0.0")
+        modlist = {"schema": 1, "repos": [], "mods": ["pin.m@1.0.0"]}
+        plan = mm.import_modlist(modlist, [], [self.BASE])
+        self.assertEqual([(m.id, m.version) for m in plan.roots], [("pin.m", "1.0.0")])
+
+    def test_import_pulls_in_dependencies(self):
+        self._publish("dep.k", "1.0.0")
+        self._publish_latest("root.m", "1.0.0", dependencies={"dep.k": "1.0.0"})
+        index = [summary("dep.k", ["1.0.0"])]
+        modlist = {"schema": 1, "repos": [], "mods": ["root.m"]}
+        plan = mm.import_modlist(modlist, index, [self.BASE])
+        self.assertEqual([m.id for m in plan.roots], ["root.m"])
+        self.assertEqual([m.id for m in plan.dependencies], ["dep.k"])
+
+    def test_import_unresolved_entry_blocks(self):
+        modlist = {"schema": 1, "repos": ["Some/Pack"], "mods": ["ghost.m@1.0.0"]}
+        plan = mm.import_modlist(modlist, [], [self.BASE])
+        self.assertTrue(plan.blocking)
+        self.assertEqual(plan.unresolved, [("ghost.m", "1.0.0")])
+        self.assertEqual(plan.hinted_repos, ["Some/Pack"])
+
+    def test_import_rejects_unsupported_schema(self):
+        modlist = {"schema": 2, "repos": [], "mods": []}
+        with self.assertRaises(mm.ModManagerError):
+            mm.import_modlist(modlist, [], [self.BASE])
+
+    def test_apply_import_installs_roots_and_dependencies(self):
+        self._publish("dep.k", "1.0.0")
+        self._publish_latest("root.m", "1.0.0", dependencies={"dep.k": "1.0.0"})
+        index = [summary("dep.k", ["1.0.0"])]
+        modlist = {"schema": 1, "repos": [], "mods": ["root.m"]}
+        plan = mm.import_modlist(modlist, index, [self.BASE])
+
+        mm.apply_import(self.game, plan, self.progress.append)
+        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "root.m", "root.m.dll")))
+        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "dep.k", "dep.k.dll")))
+
+    def test_apply_import_blocking_plan_raises_without_installing(self):
+        modlist = {"schema": 1, "repos": [], "mods": ["ghost.m"]}
+        plan = mm.import_modlist(modlist, [], [self.BASE])
+        with self.assertRaises(mm.ModManagerError):
+            mm.apply_import(self.game, plan)
+        self.assertFalse(os.path.exists(os.path.join(self.game, "Mods")))
+
+    def test_export_then_import_round_trip(self):
+        self._install("rt.m", "1.0.0")
+        exported = mm.export_modlist(self.game, {})
+        # Re-serve rt.m at latest.json so the bare-id export entry resolves
+        # on import, same as a real repo would.
+        self.manifests[f"{self.BASE}/manifests/rt/m/latest.json"] = self.manifests[
+            f"{self.BASE}/manifests/rt/m/1.0.0.json"]
+        plan = mm.import_modlist(exported, [], [self.BASE])
+        self.assertFalse(plan.blocking)
+        self.assertEqual([m.id for m in plan.roots], ["rt.m"])
 
 
 class ZipBundleInstall(unittest.TestCase):

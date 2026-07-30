@@ -809,7 +809,16 @@ def _ticket_close(username, req):
     return {"status":"error","message":"Ticket not found."}
 
 
-def _handle_auth(conn, addr, log_fn):
+def _send_framed(conn, obj):
+    """Length-prefixed write: a 4-byte big-endian byte count, then the JSON
+    body. Used only for responses that can genuinely grow past a single
+    recv's buffer (the full mods list); everything else here still fits the
+    plain single-recv exchange the rest of this protocol relies on."""
+    body = json.dumps(obj).encode()
+    conn.sendall(len(body).to_bytes(4, "big") + body)
+
+
+def _handle_auth(conn, addr, log_fn, game_dir):
     ip = addr[0] if addr else "?"
     try:
         conn.settimeout(5)
@@ -836,7 +845,24 @@ def _handle_auth(conn, addr, log_fn):
             live_count, live_limit = _read_live_player_status()
             if live_count is not None: resp["player_count"] = live_count
             if live_limit is not None and live_limit > 0: resp["player_limit"] = live_limit
+            try:
+                mods_hash, mods_count, _ = _modmanager.handshake_snapshot(game_dir)
+                resp["mods_hash"]  = mods_hash
+                resp["mods_count"] = mods_count
+            except Exception as e:
+                log_fn(f"mod handshake: couldn't build ping fingerprint ({e})", "warn")
             conn.sendall(json.dumps(resp).encode())
+            return
+
+        # full mod list only sent on request (a client's mods_hash cache
+        # miss, or right before a join), and length-prefixed since a mods list
+        # can outgrow a single recv unlike everything else on this port
+        if req.get("mods_list"):
+            try:
+                _, _, mods_list = _modmanager.handshake_snapshot(game_dir)
+                _send_framed(conn, {"status": "ok", "mods": mods_list})
+            except Exception as e:
+                _send_framed(conn, {"status": "error", "message": str(e)})
             return
 
         # ── support tickets — isolated from the main join flow below, so
@@ -968,7 +994,7 @@ def _handle_auth(conn, addr, log_fn):
         try: conn.close()
         except: pass
 
-def start_auth_service(log_fn, port=AUTH_PORT):
+def start_auth_service(log_fn, game_dir, port=AUTH_PORT):
     def serve():
         try:
             s = socket.socket()
@@ -978,7 +1004,7 @@ def start_auth_service(log_fn, port=AUTH_PORT):
             while True:
                 conn, addr = s.accept()
                 threading.Thread(target=_handle_auth,
-                                  args=(conn,addr,log_fn), daemon=True).start()
+                                  args=(conn,addr,log_fn,game_dir), daemon=True).start()
         except Exception as e:
             log_fn(f"Auth service failed: {e}", "err")
     threading.Thread(target=serve, daemon=True).start()
@@ -3996,7 +4022,7 @@ class ServerLauncher(tk.Tk):
                 f.write(console_token)
         except: pass
         if not self._auth_on:
-            start_auth_service(self._print)
+            start_auth_service(self._print, os.path.dirname(exe))
             self._auth_on = True
         args = [exe, "/force_offline",
                 "/access_token", access, "/refresh_token", refresh,
