@@ -57,7 +57,6 @@ import zipfile
 import tempfile
 import threading
 import contextlib
-import subprocess
 import urllib.request
 import urllib.error
 import tkinter as tk
@@ -84,12 +83,6 @@ DEFAULT_REPO = "https://raw.githubusercontent.com/ChatonIsHere/CommunityMods/mai
 # (e.g. in a modlist's `repos` field) and is never enough on its own to add a
 # new pullable source.
 CFG_REPOS_KEY = "mod_repos"
-
-# Config key for the optional local antivirus scan on install (see
-# _local_av_scan). Defaults to True/on; a user who trusts their sources (or whose
-# AV false-positives on modded DLLs) can set it False. Stored in the same dict
-# load_cfg()/save_cfg() already manage. No separate file.
-CFG_SCAN_KEY = "scan_downloads"
 
 # Config key for the client's always-on pin list: a flat list of
 # "id" (track latest) / "id@version" (pin exact) strings, unioned into every
@@ -214,8 +207,8 @@ def _warn(msg):
 # Version + path primitives
 
 def _parse_version(v):
-    """SemVer comparison is load-bearing for major-lock resolution, and the
-    stdlib has no semver, so this is the one place versions become comparable.
+    """Major-lock resolution compares versions constantly and the stdlib has no
+    semver, so this is the one place versions become comparable.
     Splits "MAJOR.MINOR.PATCH" into an int tuple so ordering is numeric, not
     lexical. The trap this closes is that "1.10.0" < "1.9.0" as strings but
     1.10 > 1.9 as versions.
@@ -864,98 +857,26 @@ def _write_sidecar(path, data):
         json.dump(data, f, indent=2)
 
 
-# Optional local antivirus scan (best-effort, Windows Defender)
-# Defense-in-depth on TOP of sha256 verification. The server-side VirusTotal scan
-# (see CommunityMods/tools/modindex.py) only guards the default repo; this scan
-# runs on the user's own machine at install time, so it also covers *unverified*
-# user-added sources, the ones with no review at all. Best-effort by design: if
-# Defender isn't present/enabled, or this isn't Windows, the scan is skipped and
-# the install proceeds. A *detection*, however, aborts the install.
-
-def _scan_enabled():
-    if _load_cfg is None:
-        return True
-    try:
-        return bool(_load_cfg().get(CFG_SCAN_KEY, True))
-    except Exception:
-        return True
-
-
-def _find_defender_cli():
-    """Locate MpCmdRun.exe. The versioned copy under ProgramData\\...\\Platform is
-    newer than the stock one under Program Files when present, so prefer it.
-    Returns a path or None (not Windows / not installed)."""
-    if os.name != "nt":
-        return None
-    candidates = []
-    pd = os.environ.get("ProgramData")
-    if pd:
-        plat = os.path.join(pd, "Microsoft", "Windows Defender", "Platform")
-        try:
-            versions = sorted(
-                (os.path.join(plat, d) for d in os.listdir(plat)),
-                reverse=True)   # newest platform version dir first
-            candidates.extend(os.path.join(d, "MpCmdRun.exe") for d in versions)
-        except Exception:
-            pass
-    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
-    candidates.append(os.path.join(pf, "Windows Defender", "MpCmdRun.exe"))
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-    return None
-
-
-def _local_av_scan(path):
-    """Scan one file. Returns None when clean OR unable to scan (skipped), or a
-    short reason string when a threat is detected. Never raises; a scan that
-    can't run must not block a hash-verified install."""
-    if not _scan_enabled():
-        return None
-    cli = _find_defender_cli()
-    if cli is None:
-        return None
-    try:
-        proc = subprocess.run(
-            [cli, "-Scan", "-ScanType", "3", "-File", path, "-DisableRemediation"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    except Exception as e:
-        _warn(f"local AV scan could not run ({e}); "
-              f"installing {os.path.basename(path)} unscanned")
-        return None
-    out = (proc.stdout or b"").decode("utf-8", "replace").strip()
-    low = out.lower()
-
-    # Exit code 2 is overloaded: MpCmdRun returns it both for a real detection AND
-    # for a scan that never ran (service disabled, another AV present, needs
-    # elevation, all of which print "failed with hr=0x..."). So an error marker in
-    # the output ALWAYS means "unable to scan" (skip), never a detection. Otherwise
-    # a machine without an active Defender would falsely block every install. Only
-    # a clean exit-2 with no failure marker is a genuine threat.
-    if any(mark in low for mark in ("failed with hr", "cmdtool: failed", "0x8")):
-        _warn(f"local AV scan unavailable ({out.splitlines()[-1].strip() if out else 'unknown error'}); "
-              f"installing {os.path.basename(path)} unscanned")
-        return None
-    if proc.returncode == 2:
-        last = out.splitlines()[-1].strip() if out else ""
-        return last or "threat detected"
-    if proc.returncode != 0:
-        _warn(f"local AV scan returned {proc.returncode}; "
-              f"treating {os.path.basename(path)} as unscanned")
-    return None
+# Malware scanning happens at the source, not on each user's machine.
+# CommunityMods/tools/modindex.py VirusTotal-scans every submitted file, and
+# every code-bearing member of a zip bundle, before it can merge into the index,
+# backed by human PR review. The sha256 check below is what ties the bytes on
+# this disk to the ones that were scanned and reviewed.
+#
+# A repo the user added themselves is covered by that hash check and the
+# add-time warning only. Nothing scans it, which is the trade the
+# unverified-source warning exists to state plainly.
 
 
 @contextlib.contextmanager
 def _verified_download(url, sha256, work_dir, on_progress):
-    """Download `url` to a temp file inside `work_dir`, verify its sha256, and
-    scan it with the local antivirus, then hand the temp path to the caller to
-    move (single file) or extract (zip). The temp is always created in work_dir,
-    never the system temp dir, so a follow-up os.replace within the same tree is a
-    same-volume atomic rename; routing through %TEMP% (usually C:) would make that
-    a cross-volume move, which fails with WinError 17 when the game is on another
-    drive. The temp is always cleaned up, so a failed verify/scan/move leaves
-    nothing behind."""
+    """Download `url` to a temp file inside `work_dir` and verify its sha256,
+    then hand the temp path to the caller to move (single file) or extract
+    (zip). The temp is always created in work_dir, never the system temp dir, so
+    a follow-up os.replace within the same tree is a same-volume atomic rename;
+    routing through %TEMP% (usually C:) would make that a cross-volume move,
+    which fails with WinError 17 when the game is on another drive. The temp is
+    always cleaned up, so a failed verify/move leaves nothing behind."""
     download = _require(_download_with_progress, "_download_with_progress")
     hashfn = _require(_sha256_file, "_sha256_file")
 
@@ -970,14 +891,6 @@ def _verified_download(url, sha256, work_dir, on_progress):
                 f"Downloaded file failed its checksum: expected {sha256}, got "
                 f"{actual}. The file may be corrupted or tampered with; nothing "
                 f"was installed.")
-        threat = _local_av_scan(tmp)
-        if threat is not None:
-            raise ModManagerError(
-                f"Your local antivirus flagged the downloaded file as unsafe "
-                f"({threat}). Nothing was installed. If you're certain this is a "
-                f"false positive (common for game mods that patch memory) you "
-                f"can turn off the install scan in settings, but only for a "
-                f"source you trust.")
         yield tmp
     finally:
         if os.path.exists(tmp):
@@ -988,9 +901,9 @@ def _verified_download(url, sha256, work_dir, on_progress):
 
 
 def _download_verify_move(url, sha256, dest_path, on_progress):
-    """Download, verify, scan, then atomically move one file into dest_path.
-    Never leaves a half-written, unverified, or flagged file behind. The temp
-    lives in dest_path's own directory so the move is a same-volume rename."""
+    """Download, verify, then atomically move one file into dest_path. Never
+    leaves a half-written or unverified file behind. The temp lives in
+    dest_path's own directory so the move is a same-volume rename."""
     dest_dir = os.path.dirname(dest_path)
     with _verified_download(url, sha256, dest_dir, on_progress) as tmp:
         os.replace(tmp, dest_path)
@@ -1395,8 +1308,8 @@ def handshake_snapshot(game_dir):
       client can sanity-check its cache without decoding anything.
     - mods_list: every entry as {"id", "version", "client_side", "server_side",
       "source_repo"}, sorted by id: what the separate, length-prefixed
-      "mods_list" request sends on a cache miss. source_repo is a HINT only
-      (principle 14): plan_join uses it to tell a client which repo a required
+      "mods_list" request sends on a cache miss. source_repo is a HINT only:
+      plan_join uses it to tell a client which repo a required
       mod not resolvable from any of the client's configured repos would come
       from, so the user can add it explicitly; it's never resolved into a
       pull on its own, same rule as everywhere else this field appears (the
@@ -1419,7 +1332,7 @@ def handshake_snapshot(game_dir):
 #
 # A single client joins many servers with different required mods, so with
 # the render step wired in, Mods/ stops being permanent storage and becomes a
-# per-launch rendering of one server's required set (principle 15).
+# per-launch rendering of one server's required set.
 # Downloaded mods live here instead, keyed by id+version so multiple versions
 # of the same mod coexist - switching servers moves files instead of
 # re-downloading. Libraries are keyed by filename+sha256, not filename alone,
@@ -1493,13 +1406,18 @@ def cache_store_library(game_dir, filename):
 
 def adopt_installed_mods(game_dir):
     """Copies everything currently installed in Mods/ (and the UserLibs/
-    libraries they pin) into the cache, without touching Mods/ itself. Safe to
-    call on every launcher startup - already-cached versions are skipped. This
-    is what lets the first run after upgrading from a launcher without a cache
-    recognize its older, direct-to-Mods/ installs as already-cached, rather
-    than treating them as needing a fresh download the first time an active
-    set is rendered. Returns the list of mod ids newly adopted (already-cached
-    ones don't count)."""
+    libraries they pin) into the cache, without touching Mods/ itself.
+    Idempotent - already-cached versions are skipped - so it's safe to call on
+    every join; att_client calls it from _reconcile_mods_before_launch, before
+    any plan is computed or applied.
+
+    Running it before a render is what makes the cache's "switching servers is
+    a file move, never a re-download" promise actually hold. Anything that
+    installed straight to Mods/ (the Community Mods window, or an older
+    launcher with no cache) is otherwise unknown to the cache, so rendering a
+    different version over it destroys the only copy of the version that was
+    there. Returns the list of mod ids newly adopted (already-cached ones don't
+    count)."""
     adopted = []
     for rec in list_installed_mods(game_dir):
         version = rec.get("version")
@@ -1623,7 +1541,7 @@ class JoinPlan:
     missing: list           # [(mod_id, version)] required by the server, unresolvable from
                              # any repo the client has configured - blocks launching
     needs_repo: list        # [(mod_id, version, source_repo)] resolvable, but only from a
-                             # repo the client hasn't added (principle 14) - not blocking on
+                             # repo the client hasn't added - not blocking on
                              # its own; surfaced so the user can add the repo and re-check
     pin_conflicts: list      # [(mod_id, pinned_version, server_version)] - a pinned mod's
                              # exact version disagrees with what the server requires; the
@@ -1633,7 +1551,7 @@ class JoinPlan:
     def blocking(self):
         """True if this plan can't safely be applied at all - some mod the
         server actually requires isn't resolvable from anywhere the client
-        knows of. needs_repo alone never blocks (principle 14): it's
+        knows of. needs_repo alone never blocks: it's
         information for the user to act on, not a launch stopper by itself."""
         return bool(self.missing)
 
@@ -1653,7 +1571,7 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None):
     index: the client's own merged index (fetch_indexes(repo_bases)) - used to
     pick each dependency's version within a major.
     repo_bases: the client's configured repos (list_repos(cfg)) - the only
-    repos anything is actually fetched from (principle 14).
+    repos anything is actually fetched from.
     pinned: "id" / "id@version" strings (the launcher's always-on set) -
     unioned in regardless of which server is being joined."""
     pinned = pinned or []
@@ -1811,9 +1729,9 @@ def resolve_missing_mods(missing, index, repo_bases):
     ({"id","version","source_repo"}) into installable manifests, for the
     post-reject recovery flow: after a join is denied for a mod mismatch, the
     launcher runs this to fetch exactly the mods+versions the server said
-    were wrong, installs them, and rejoins. `source_repo` is a HINT only
-    (principle 14): resolution always
-    goes through the client's own configured repos (repo_bases), never a URL
+    were wrong, installs them, and rejoins. `source_repo` is a HINT only:
+    resolution always goes through the client's own configured repos
+    (repo_bases), never a URL
     taken from the payload; an entry resolvable nowhere raises naming its
     hint if it has one, same missing/needs_repo distinction plan_join uses.
 
@@ -1851,8 +1769,8 @@ def resolve_missing_mods(missing, index, repo_bases):
 # One {schema, repos, mods} shape serves three uses with zero conversion: a
 # launcher (client or launcher-run server) exports/imports it as a shareable
 # file; a headless server's /modlist config (TavernLib's ModsListConfig) IS
-# this same file. `repos` is always informational only
-# (principle 14) - a shorthand naming where the pack's author expects its
+# this same file. `repos` is always informational only, a shorthand naming
+# where the pack's author expects its
 # mods to come from, never resolved into a URL or added as a source by any
 # importer; resolution only ever uses the importer's OWN configured repos.
 
@@ -1897,7 +1815,7 @@ class ImportPlan:
 def import_modlist(modlist, index, repo_bases):
     """Resolves a modlist's `mods` entries against the importer's OWN
     configured repos only (repo_bases) - the file's `repos` field is never
-    treated as a source to fetch from or silently add (principle 14). Same
+    treated as a source to fetch from or silently add. Same
     by-id / exact-version resolution install already uses. An entry not
     resolvable from any configured repo is reported unresolved (with the
     modlist's hinted `repos` surfaced alongside it, so the user knows what to
