@@ -366,6 +366,20 @@ def _tavern_data_dir():
     except Exception: pass
     return path
 
+
+def _last_rejection_path():
+    """Same path TavernLib's TavernDirectories.LastRejection writes to:
+    %AppData%/TheModdingTavern/last_rejection.json."""
+    return os.path.join(_tavern_data_dir(), "last_rejection.json")
+
+
+def _delete_last_rejection_file():
+    """Called right before every launch so a file present after THIS
+    process exits was written by THIS attempt, not a leftover from an
+    earlier one."""
+    try: os.remove(_last_rejection_path())
+    except OSError: pass
+
 def _migrate_legacy_file(old_path, new_path):
     """One-time move from before file storage was unified into
     _tavern_data_dir(). Safe to call every startup — a no-op once the file
@@ -487,7 +501,10 @@ def ticket_request(host, action, username, token, timeout=10, **kwargs):
     return json.loads(raw.decode())
 
 def ping_server(host, timeout=5):
-    """Returns (info_dict, latency_ms) or raises."""
+    """Returns (info_dict, latency_ms) or raises. info_dict carries mods_hash/
+    mods_count alongside the existing fields when the server supports it. An
+    older server without them just omits those keys, so callers must use
+    .get(), not [] indexing, for either."""
     t0 = time.time()
     s  = socket.socket()
     s.settimeout(timeout)
@@ -497,6 +514,47 @@ def ping_server(host, timeout=5):
     ms  = int((time.time() - t0) * 1000)
     s.close()
     return json.loads(raw.decode()), ms
+
+
+def _recv_framed(s, timeout):
+    """Reads one length-prefixed message: a 4-byte big-endian byte count, then
+    exactly that many bytes, looping recv() since a single call can return a
+    partial read no matter the buffer size. Raises on a short/closed stream."""
+    s.settimeout(timeout)
+    header = b""
+    while len(header) < 4:
+        chunk = s.recv(4 - len(header))
+        if not chunk:
+            raise ConnectionError("Connection closed while reading length header.")
+        header += chunk
+    length = int.from_bytes(header, "big")
+    body = bytearray()
+    while len(body) < length:
+        chunk = s.recv(min(65536, length - len(body)))
+        if not chunk:
+            raise ConnectionError("Connection closed while reading message body.")
+        body += chunk
+    return bytes(body)
+
+
+def fetch_server_mods(host, timeout=10):
+    """Fetches the server's full installed-mods list: every currently-enabled
+    mod as {"id","version","client_side","server_side"}.
+    Only called on a mods_hash cache miss (or right before a join); the
+    ordinary ping/pong stays a single small recv, this is the one request that
+    needs proper length-prefixed framing since a large mod list can genuinely
+    exceed one recv's buffer. Raises on any connection/parse failure or a
+    server that doesn't understand the request (older TavernLib/launcher)."""
+    s = socket.socket()
+    s.settimeout(timeout)
+    s.connect((host, AUTH_PORT))
+    s.sendall(json.dumps({"mods_list": True}).encode())
+    body = _recv_framed(s, timeout)
+    s.close()
+    resp = json.loads(body.decode())
+    if resp.get("status") != "ok":
+        raise Exception(resp.get("message", "Server rejected the mods list request."))
+    return resp.get("mods", [])
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  JWT
@@ -534,7 +592,7 @@ def _valid_port(value, default=1757):
         return default
 
 
-def build_tokens(user_id, username, tavern_token=""):
+def build_tokens(user_id, username, tavern_token="", mods_claim=""):
     """tavern_token is our OWN internal secret (the same one _get_or_create_token
     already tracks per server+username) — embedded here as an extra custom
     claim purely for a server-side mod to verify independently. UserId and
@@ -546,7 +604,15 @@ def build_tokens(user_id, username, tavern_token=""):
     that's only ever handed out after actually passing the auth handshake
     (password, whitelist, blacklist all included), so a mod checking it
     against the server's own records closes that gap regardless of what
-    else the presented JWT claims to be."""
+    else the presented JWT claims to be.
+
+    mods_claim is a JSON object string of {mod_id: version} for every
+    community mod currently enabled on this machine, the client's own
+    side of TavernLib's exact-version mod-parity check (PlayerJoinFilter /
+    ModParity.ValidateClient), read off the same "TavernMods" claim. Empty
+    string when there's nothing to report (no mods enabled, or the caller
+    didn't compute one); a server with no client_side-required mods ignores
+    it either way."""
     exp, uid = 9999999999, str(user_id)
     a = _jwt({"UserId":uid,"Username":username,"role":"Access","is_verified":"True",
               "is_member":"True","Policy":["offline","play_offline","server_access_pre_alpha",
@@ -554,7 +620,7 @@ def build_tokens(user_id, username, tavern_token=""):
               "server_access_development","server_access_testing","game_access_testing",
               "server_owner","debug_features","admin_vr_modes","database_admin",
               "server_create_development","reuse_refresh_tokens"],
-              "TavernToken":tavern_token,
+              "TavernToken":tavern_token,"TavernMods":mods_claim,
               "exp":exp,"iss":"AltaWebAPI","aud":"AltaClient"})
     r = _jwt({"UserId":uid,"role":"Refresh","exp":exp,"iss":"AltaWebAPI","aud":"AltaClient"})
     i = _jwt({"UserId":uid,"Username":username,"role":"Identity","is_member":"True",
@@ -4335,6 +4401,10 @@ class ClientLauncher(tk.Tk):
         self._patch_anim_job   = None
         self._patch_anim_phase = 0
         self._exe_check_job   = None
+        # Join-time mod reconciliation cache: host -> (mods_hash, mods_list),
+        # so rejoining a server whose mods haven't changed since last time
+        # skips the extra "mods_list" round trip entirely (see _get_server_mods).
+        self._mods_list_cache = {}
         self._build_ui()
         self._load()
         # Start at exactly the size the fully-built layout needs, then set
@@ -4971,11 +5041,14 @@ class ClientLauncher(tk.Tk):
                 pw_req  = resp.get("password_required", False)
                 wl      = resp.get("whitelist_enabled", False)
                 game_port = resp.get("game_port")
+                mods_count = resp.get("mods_count")
                 lines   = [f"✔  {sv_name}  —  {ms} ms"]
                 flags   = []
                 if pw_req: flags.append("🔒 Password required")
                 if wl:     flags.append("📋 Whitelist active")
                 if game_port: flags.append(f"Port {game_port}")
+                if mods_count is not None:
+                    flags.append(f"🧩 {mods_count} mod{'s' if mods_count != 1 else ''}")
                 if flags:  lines.append("  ".join(flags))
                 msg = "\n".join(lines)
                 self.after(0, lambda: self._check_ok(host, msg, game_port))
@@ -5040,6 +5113,135 @@ class ClientLauncher(tk.Tk):
                 return True
 
         return False
+
+    # Pre-join mod reconciliation
+
+    def _get_server_mods(self, host):
+        """The server's full installed-mods list, for plan_join. Uses the
+        ping/pong's mods_hash as a cache key (self._mods_list_cache) so
+        rejoining a server whose mods haven't changed since the last check
+        skips the extra "mods_list" round trip entirely. Returns [] if the
+        server doesn't send mods_hash at all (an older TavernLib/launcher) -
+        reconciliation is then a no-op, same as a server with no mods."""
+        try:
+            resp, _ms = ping_server(host)
+        except Exception:
+            return []
+        mods_hash = resp.get("mods_hash")
+        if not mods_hash:
+            return []
+        cached = self._mods_list_cache.get(host)
+        if cached and cached[0] == mods_hash:
+            return cached[1]
+        try:
+            mods = fetch_server_mods(host)
+        except Exception as e:
+            self._print(f"Could not fetch the server's mod list: {e}", "warn")
+            return []
+        self._mods_list_cache[host] = (mods_hash, mods)
+        return mods
+
+    def _confirm_join_plan(self, plan):
+        """Shows what plan_join computed and asks the player to confirm before
+        anything is actually installed, uninstalled, or moved; never applied
+        silently."""
+        lines = []
+        to_change = [e for e in plan.entries if not e.active]
+        if to_change:
+            lines.append("Will install/activate:")
+            lines += [f"  • {e.mod_id} {e.version}" + (" (cached, no download)" if e.cached else "")
+                     for e in to_change]
+        if plan.to_deactivate:
+            lines.append("Will deactivate (kept in your local cache, not deleted):")
+            lines += [f"  • {mid}" for mid in plan.to_deactivate]
+        if plan.needs_repo:
+            lines.append("Not resolvable from any of your added sources, add the "
+                        "source below (⚙ Manage Sources in Community Mods) and retry:")
+            lines += [f"  • {mid} {v} (from {repo})" for mid, v, repo in plan.needs_repo]
+        if plan.pin_conflicts:
+            lines.append("Your pin disagrees with what this server requires "
+                        "(the server's version is used for this join):")
+            lines += [f"  • {mid}: pinned {pv}, server needs {sv}"
+                     for mid, pv, sv in plan.pin_conflicts]
+        lines.append("\nApply these mod changes and join?")
+        return messagebox.askyesno("Mod changes needed", "\n".join(lines), parent=self)
+
+    def _reconcile_mods_before_launch(self, host, exe):
+        """Computes and, with confirmation, applies the active-set render
+        before actually launching, so Mods/ matches what this server
+        needs, then verifies that it actually does before returning True,
+        rather than trusting the render blindly, so a mismatch is caught and
+        the launch refused here instead of only surfacing as an in-game
+        rejection later. Returns False (having already printed/shown why) if
+        the join should not proceed: a required mod couldn't be resolved
+        from anywhere, the player declined the plan, or mods still don't
+        match after applying it. Returns True (having done nothing) if the
+        server sent no mod info, or MelonLoader/TavernLib aren't installed
+        here, since a community mod is inert without them, same gate the
+        Community Mods install flow already uses."""
+        game_dir = os.path.dirname(exe)
+        if not (_melonloader_installed(game_dir) and _tavernlib_installed(game_dir)):
+            return True
+
+        server_mods = self._get_server_mods(host)
+        if not server_mods:
+            return True
+
+        cfg = load_cfg()
+        repo_bases = _modmanager.list_repos(cfg)
+        try:
+            index = _modmanager.fetch_indexes(repo_bases)
+        except Exception as e:
+            self._print(f"Could not check the community mod index: {e}", "warn")
+            return True   # fail open - don't block a join over an index outage
+
+        pinned = _modmanager.list_pinned(cfg)
+        try:
+            plan = _modmanager.plan_join(game_dir, server_mods, index, repo_bases, pinned)
+        except _modmanager.ModManagerError as e:
+            self._print(f"Could not resolve this server's required mods: {e}", "err")
+            return False
+
+        if plan.blocking:
+            missing = "\n".join(f"  • {mid} {v}" for mid, v in plan.missing)
+            messagebox.showerror("Missing mods",
+                "This server requires mods that couldn't be found in any of your "
+                f"configured mod sources:\n\n{missing}\n\n"
+                "Add the right source (⚙ Manage Sources in Community Mods) or "
+                "ask the server owner, then try again.", parent=self)
+            return False
+
+        changed = [e for e in plan.entries if not e.active]
+        if changed or plan.to_deactivate or plan.needs_repo or plan.pin_conflicts:
+            if not self._confirm_join_plan(plan):
+                return False
+            try:
+                _modmanager.render_active_set(game_dir, plan,
+                    lambda msg: self._print(msg, "dim"))
+            except _modmanager.ModManagerError as e:
+                self._print(f"Applying the mod changes failed: {e}", "err")
+                return False
+
+        # Final verification, not just trusting the render above: every mod
+        # the server actually requires of the client must now be installed
+        # at EXACTLY the right version (same exact-version rule the server
+        # enforces on join). Catches a partial/fail-soft render, an accepted
+        # pin conflict, or anything else that would otherwise only surface as
+        # an in-game rejection; refuse to launch here instead.
+        required = {m["id"]: m["version"] for m in server_mods if m.get("client_side")}
+        _, _, installed_mods = _modmanager.handshake_snapshot(game_dir)
+        have = {m["id"]: m["version"] for m in installed_mods}
+        mismatched = [(mid, ver, have.get(mid)) for mid, ver in required.items()
+                     if have.get(mid) != ver]
+        if mismatched:
+            lines = "\n".join(f"  • {mid}: need {ver}, have {have_ver or 'nothing installed'}"
+                              for mid, ver, have_ver in mismatched)
+            messagebox.showerror("Mods still mismatched",
+                "Your mods still don't match what this server requires, even "
+                f"after applying the changes above:\n\n{lines}\n\n"
+                "Joining would be rejected, not launching.", parent=self)
+            return False
+        return True
 
     def _do_launch(self, password, _token_state=None):
         exe      = self.v_exe.get().strip()
@@ -5132,7 +5334,21 @@ class ClientLauncher(tk.Tk):
         cfg["recent_servers"] = recent[:20]
         save_cfg(cfg)
 
-        access, refresh, identity = build_tokens(user_id, username, token)
+        if not self._reconcile_mods_before_launch(host, exe):
+            self._action_btn.config(state="normal")
+            return
+
+        # Report what's actually enabled in Mods/ (after the render above) so
+        # the server's exact-version parity check has something to compare
+        # against; see build_tokens' mods_claim.
+        mods_claim = ""
+        try:
+            _, _, mods_list = _modmanager.handshake_snapshot(os.path.dirname(exe))
+            mods_claim = json.dumps({m["id"]: m["version"] for m in mods_list})
+        except Exception as e:
+            self._print(f"Could not read installed mods for the join handshake: {e}", "warn")
+
+        access, refresh, identity = build_tokens(user_id, username, token, mods_claim)
         args = [exe, "/force_offline",
                 "/access_token", access, "/refresh_token", refresh,
                 "/identity_token", identity, "/join_local_server"]
@@ -5149,6 +5365,12 @@ class ClientLauncher(tk.Tk):
         if self.v_debug_helper.get():
             args.append("/debug_helper")
 
+        # Delete any stale rejection file before launching, so a file present
+        # after THIS process exits was written by THIS attempt (the actual
+        # staleness guard is that we wait for this exact process and nothing
+        # else runs in between; see _watch_for_rejection).
+        _delete_last_rejection_file()
+
         self._print(f"Launching on {platform or 'default'}…", "warn")
         try:
             # Whether MelonLoader's own console window shows up is controlled
@@ -5158,9 +5380,81 @@ class ClientLauncher(tk.Tk):
             proc = subprocess.Popen(args, cwd=os.path.dirname(exe),
                                     **self._popen_console_kwargs())
             self._print(f"Game running (PID {proc.pid})", "ok")
+            threading.Thread(target=self._watch_for_rejection,
+                             args=(proc, host), daemon=True).start()
         except Exception as e:
             self._print(f"Launch failed: {e}", "err")
         self._action_btn.config(state="normal")
+
+    def _watch_for_rejection(self, proc, host):
+        """Runs on a background thread once the game process is launched.
+        Waits for it to exit, then checks for TavernLib's
+        last_rejection.json, written by this same client's own TavernLib
+        instance right before exiting, if (and only if) the server denied the
+        join for a mod-mismatch reason. _do_launch already deleted any stale
+        copy before this process started, so a file present now was written
+        by this exact attempt."""
+        proc.wait()
+        path = _last_rejection_path()
+        if not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as e:
+            self.after(0, lambda: self._print(f"Could not read the rejection file: {e}", "warn"))
+            return
+        finally:
+            try: os.remove(path)   # consumed either way, never re-act on it twice
+            except OSError: pass
+
+        if payload.get("schema") != 1:
+            return
+        server = payload.get("server") or {}
+        # Extra cross-check beyond the delete-before-launch guard above: a
+        # host mismatch means this file wasn't actually about the server we
+        # just tried to join.
+        if server.get("host") and server.get("host") != host:
+            return
+        missing = payload.get("missing") or []
+        if not missing:
+            return
+        self.after(0, lambda: self._offer_rejection_recovery(payload))
+
+    def _offer_rejection_recovery(self, payload):
+        """The server rejected the join over exact mods the client didn't
+        have. Offers to fetch exactly those (and their dependencies), same
+        confirm-before-install and never-auto-add-a-repo rules as everywhere
+        else, then rejoins."""
+        missing = payload.get("missing") or []
+        names = "\n".join(f"  • {m['id']} {m['version']}" for m in missing)
+        if not messagebox.askyesno("Mods needed to rejoin",
+                f"That server rejected the join because these mods didn't "
+                f"match:\n\n{names}\n\nInstall the exact versions it needs "
+                f"and try rejoining?", parent=self):
+            return
+
+        exe = self.v_exe.get().strip()
+        game_dir = os.path.dirname(exe)
+        cfg = load_cfg()
+        repo_bases = _modmanager.list_repos(cfg)
+        try:
+            index = _modmanager.fetch_indexes(repo_bases)
+            roots, dependencies = _modmanager.resolve_missing_mods(missing, index, repo_bases)
+            libraries = _modmanager.collect_library_dependencies(roots + dependencies)
+            for mod in roots + dependencies:
+                _modmanager.install_mod(game_dir, mod, lambda *_: None)
+            for lib in libraries:
+                _modmanager.install_library_dependency(game_dir, lib, lambda *_: None)
+        except _modmanager.ModManagerError as e:
+            messagebox.showerror("Recovery failed", str(e), parent=self)
+            return
+        except Exception as e:
+            messagebox.showerror("Recovery failed", f"Unexpected error: {e}", parent=self)
+            return
+
+        self._print("Recovered the missing mods, rejoining…", "ok")
+        self._do_launch(password=None)
 
     def _do_launch_headless(self):
         """Same launch as _do_launch, minus the port-1762 handshake entirely —
