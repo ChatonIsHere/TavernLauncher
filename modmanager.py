@@ -164,7 +164,7 @@ _sha256_file = None
 _load_cfg = None
 _save_cfg = None
 BG = SURF = BORDER = AMBER = AMBERDIM = PARCH = MUTED = GREEN = RED = CYAN = None
-_btn = _mk_tree = _enable_dark_titlebar = None
+_btn = _mk_tree = _mk_scrollbar = _enable_dark_titlebar = None
 
 # Attribute names read off the host, as (host attr, our global). Most match; the
 # config pair is public on the host but private here.
@@ -176,7 +176,7 @@ _HOST_ATTRS = (
     ("BG", "BG"), ("SURF", "SURF"), ("BORDER", "BORDER"),
     ("AMBER", "AMBER"), ("AMBERDIM", "AMBERDIM"), ("PARCH", "PARCH"),
     ("MUTED", "MUTED"), ("GREEN", "GREEN"), ("RED", "RED"), ("CYAN", "CYAN"),
-    ("_btn", "_btn"), ("_mk_tree", "_mk_tree"),
+    ("_btn", "_btn"), ("_mk_tree", "_mk_tree"), ("_mk_scrollbar", "_mk_scrollbar"),
     ("_enable_dark_titlebar", "_enable_dark_titlebar"),
 )
 
@@ -1480,6 +1480,20 @@ def cache_store_library(game_dir, filename):
     return sha256
 
 
+def clear_mod_cache():
+    """Deletes the entire client mod cache (every cached mod version and
+    library). Mods/ itself is untouched - this only resets the
+    switch-servers-without-redownloading optimization, forcing the next
+    install or join to fetch fresh from source instead of reusing a local
+    copy. The fix for a cache entry that's gone stale, e.g. one written
+    before a manifest field parity_required() now requires existed - since
+    the cache is keyed on id+version alone, a version bump upstream is the
+    only thing that normally invalidates an entry."""
+    base = _cache_base()
+    if os.path.isdir(base):
+        shutil.rmtree(base)
+
+
 def adopt_installed_mods(game_dir):
     """Copies everything currently installed in Mods/ (and the UserLibs/
     libraries they pin) into the cache, without touching Mods/ itself.
@@ -1834,6 +1848,8 @@ class DiffRow:
     note: str = ""          # extra detail, e.g. a pin disagreeing with the server
     cached: bool = False     # this exact version is already in the local cache, so
                              # applying it is a file move rather than a download
+    name: str = ""           # display name; falls back to mod_id wherever no
+                             # manifest or install record was around to supply one
 
     @property
     def recommended(self):
@@ -1900,7 +1916,8 @@ def build_mod_diff(game_dir, server_mods, plan):
             mod_id=e.mod_id, server_version=required.get(e.mod_id, ""),
             client_version=cv, client_enabled=enabled, action=action,
             reason=e.reason, optional=recommended and not e.active,
-            source_repo=e.source_repo, note=note, cached=e.cached))
+            source_repo=e.source_repo, note=note, cached=e.cached,
+            name=e.manifest.name))
 
     for mod_id in plan.to_deactivate:
         rec = installed.get(mod_id, {})
@@ -1908,7 +1925,8 @@ def build_mod_diff(game_dir, server_mods, plan):
             mod_id=mod_id, server_version="", client_version=rec.get("version", ""),
             client_enabled=True, action=ACTION_DEACTIVATE, reason="", optional=True,
             source_repo=rec.get("source_repo", ""),
-            note="this server doesn't run it; keeping it on won't block your join"))
+            note="this server doesn't run it; keeping it on won't block your join",
+            name=rec.get("name", mod_id)))
 
     seen = {r.mod_id for r in rows}
     for mod_id, version in plan.declined:
@@ -1921,7 +1939,8 @@ def build_mod_diff(game_dir, server_mods, plan):
             client_enabled=bool(rec.get("enabled")), action=ACTION_SKIPPED,
             reason="recommended", optional=True,
             source_repo=rec.get("source_repo", ""),
-            note="you've chosen not to install this one for this server"))
+            note="you've chosen not to install this one for this server",
+            name=rec.get("name", mod_id)))
         seen.add(mod_id)
 
     for m in server_mods:
@@ -1931,7 +1950,7 @@ def build_mod_diff(game_dir, server_mods, plan):
             mod_id=m["id"], server_version=m.get("version", ""), client_version="",
             client_enabled=False, action=ACTION_SERVER_ONLY, reason="",
             optional=False, source_repo=m.get("source_repo", ""),
-            note="runs on the server only"))
+            note="runs on the server only", name=m.get("name", m["id"])))
         seen.add(m["id"])
 
     for mod_id, version in plan.missing:
@@ -1942,20 +1961,25 @@ def build_mod_diff(game_dir, server_mods, plan):
             mod_id=mod_id, server_version=version, client_version=rec.get("version", ""),
             client_enabled=bool(rec.get("enabled")), action=ACTION_MISSING,
             reason="required", optional=False, source_repo="",
-            note="not in any source you've added"))
+            note="not in any source you've added", name=rec.get("name", mod_id)))
         seen.add(mod_id)
 
     for mod_id, version, repo in plan.needs_repo:
         if mod_id in seen:
             continue
+        rec = installed.get(mod_id, {})
         rows.append(DiffRow(
             mod_id=mod_id, server_version=version, client_version="",
             client_enabled=False, action=ACTION_NEEDS_REPO, reason="required",
             optional=False, source_repo=repo,
-            note=f"add {_repo_shorthand(repo)} as a source, then check again"))
+            note=f"add {_repo_shorthand(repo)} as a source, then check again",
+            name=rec.get("name", mod_id)))
         seen.add(mod_id)
 
-    return sorted(rows, key=lambda r: (_ACTION_ORDER.get(r.action, 9), r.mod_id.lower()))
+    # Sorted by display name, not id, so the on-screen order matches what's
+    # actually shown - a mod_id-sorted list would look shuffled once the
+    # window renders names instead of ids.
+    return sorted(rows, key=lambda r: (_ACTION_ORDER.get(r.action, 9), r.name.lower()))
 
 
 def _prune_orphaned_libraries(game_dir):
@@ -2034,7 +2058,7 @@ def render_active_set(game_dir, plan, on_progress=None, on_step=None):
             progress(f"Enabling {entry.mod_id} {entry.version}")
             enable_mod(game_dir, entry.mod_id)
         elif entry.cached:
-            progress(f"Activating {entry.mod_id} {entry.version} (cached)")
+            progress(f"Installing {entry.mod_id} {entry.version} (cached)")
             cache_restore_mod(game_dir, entry.mod_id, entry.version)
         else:
             progress(f"Downloading {entry.mod_id} {entry.version}")
@@ -2051,7 +2075,7 @@ def render_active_set(game_dir, plan, on_progress=None, on_step=None):
             step(filename, "done")
             continue     # already active with the exact pinned content
         if os.path.isdir(_cache_library_dir(filename, lib.sha256)):
-            progress(f"Activating library {filename} (cached)")
+            progress(f"Installing library {filename} (cached)")
             cache_restore_library(game_dir, filename, lib.sha256)
         else:
             progress(f"Downloading library {filename}")
@@ -2435,6 +2459,56 @@ class PinnedModsWindow(tk.Toplevel):
             self._on_change()
 
 
+_tooltip_state = {"after_id": None, "win": None, "owner": None}
+
+
+def _hide_tooltip():
+    if _tooltip_state["after_id"] is not None and _tooltip_state["owner"] is not None:
+        _tooltip_state["owner"].after_cancel(_tooltip_state["after_id"])
+    _tooltip_state["after_id"] = None
+    if _tooltip_state["win"] is not None:
+        _tooltip_state["win"].destroy()
+    _tooltip_state["win"] = None
+    _tooltip_state["owner"] = None
+
+
+def _attach_tooltip(widget, text):
+    """A small delayed popup on hover - tk has no built-in tooltip, so this is
+    the minimal version: appears after a beat over the widget, gone the
+    instant the pointer leaves. The pending timer and the popup itself live
+    in shared module state rather than a per-widget closure, so entering any
+    tooltip-bound widget always clears whatever another one left behind
+    first. That matters because several widgets can cover the exact same
+    row (a fixed-width cell and the label filling it, say) - each tracking
+    its own popup independently let a fast Enter/Leave between them show two
+    at once or leave one stuck open."""
+    def _show():
+        _tooltip_state["after_id"] = None
+        win = tk.Toplevel(widget)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        x = widget.winfo_rootx()
+        y = widget.winfo_rooty() + widget.winfo_height() + 4
+        win.geometry(f"+{x}+{y}")
+        tk.Label(win, text=text, bg=SURF, fg=PARCH, font=("Segoe UI", 8),
+                 wraplength=260, justify="left", padx=8, pady=5,
+                 highlightbackground=BORDER, highlightthickness=1
+        ).pack()
+        _tooltip_state["win"] = win
+
+    def _enter(_event):
+        _hide_tooltip()
+        _tooltip_state["owner"] = widget
+        _tooltip_state["after_id"] = widget.after(400, _show)
+
+    def _leave(_event):
+        if _tooltip_state["owner"] is widget:
+            _hide_tooltip()
+
+    widget.bind("<Enter>", _enter)
+    widget.bind("<Leave>", _leave)
+
+
 class ModDiffWindow(tk.Toplevel):
     """Side-by-side comparison of what a server runs against what's installed
     here, shown before anything is applied. Replaces a flat "will install / will
@@ -2461,11 +2535,12 @@ class ModDiffWindow(tk.Toplevel):
     `.apply_attempted` there to tell a plain decline from a close after a
     failure that has already been reported."""
 
-    _COLS   = ("mod", "server", "you", "action_needed")
-    _WIDTHS = (290,   100,      100,   160)
+    _WIDTHS = (280, 90, 90, 190)   # mod, server, you, action
 
-    # Row colour per action. Reads as a diff at a glance: additions green,
-    # removals red, version changes amber, problems red, quiet rows muted.
+    # Row colour per action, keyed by an abstract tag name resolved to an
+    # actual colour in _build (once the host's palette is wired in via
+    # set_helpers). Reads as a diff at a glance: additions green, removals
+    # red, version changes amber, problems red, quiet rows muted.
     _TAGS = {
         ACTION_INSTALL:     "add",   ACTION_ACTIVATE: "add",  ACTION_ENABLE: "add",
         ACTION_UPDATE:      "chg",   ACTION_DOWNGRADE: "chg",
@@ -2474,7 +2549,7 @@ class ModDiffWindow(tk.Toplevel):
         ACTION_MISSING:     "bad",   ACTION_NEEDS_REPO: "bad",
     }
     _VERB = {
-        ACTION_INSTALL:  "Download",   ACTION_ACTIVATE:  "Activate",
+        ACTION_INSTALL:  "Download",   ACTION_ACTIVATE:  "Install",
         ACTION_ENABLE:   "Enable",     ACTION_UPDATE:    "Update",
         ACTION_DOWNGRADE:"Downgrade",  ACTION_DEACTIVATE:"Deactivate",
         ACTION_MATCH:    "Up to date", ACTION_SERVER_ONLY:"Not needed",
@@ -2484,7 +2559,7 @@ class ModDiffWindow(tk.Toplevel):
     # What a row says while it's being worked on, so the table reads as live
     # progress instead of a static proposal.
     _VERB_ING = {
-        ACTION_INSTALL:  "Downloading", ACTION_ACTIVATE:  "Activating",
+        ACTION_INSTALL:  "Downloading", ACTION_ACTIVATE:  "Installing",
         ACTION_ENABLE:   "Enabling",    ACTION_UPDATE:    "Updating",
         ACTION_DOWNGRADE:"Downgrading", ACTION_DEACTIVATE:"Deactivating",
     }
@@ -2517,6 +2592,11 @@ class ModDiffWindow(tk.Toplevel):
         self._progress   = {}     # mod id -> "start" | "done", during an apply
         self._steps_done = 0
         self._steps_total = 0
+        # mod id -> (action_cell, action_label, toggle_frame_or_None); the
+        # toggle is None for a non-optional row, which never had a choice.
+        self._action_widgets = {}
+        self._name_labels    = {}     # mod id -> its coloured name label
+        self._segment_labels = {}     # mod id -> {option text: its segment label}
 
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
@@ -2534,33 +2614,57 @@ class ModDiffWindow(tk.Toplevel):
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
 
         tk.Label(self,
-            text="'Server' is the version this server runs, 'You' is what's installed here, "
-                 "and 'Action Needed' is what applying this would do. Rows the server "
-                 "requires can't be changed: without them it refuses the join. Rows marked "
-                 "(recommended) it runs but won't insist on, so you can skip them, and rows "
-                 "set to Deactivate are yours alone. Select a row and use the button below "
-                 "to change your mind about either.",
+            text="Server / You / Action: what this server runs, what's installed here, and "
+                 "what applying would do. A toggle means it's your call; no toggle means the "
+                 "server decides. Hover a mod name or its Action for more detail.",
             bg=BG, fg=MUTED, font=("Segoe UI",9), wraplength=720, justify="left"
         ).pack(anchor="w", padx=16, pady=(10,6))
 
+        # Colour per abstract tag, resolved now that the host's palette is
+        # wired in (set_helpers ran before this window could ever open).
+        self._tag_colors = {
+            "add": GREEN, "chg": AMBER, "del": RED, "same": MUTED, "bad": RED,
+            "kept": CYAN, "working": AMBER, "done": GREEN,
+        }
+
         table_wrap = tk.Frame(self, bg=BG)
         table_wrap.pack(fill="both", expand=True, padx=16)
-        self._tree = _mk_tree(table_wrap, self._COLS, self._WIDTHS, height=11)
-        self._tree.tag_configure("add",  foreground=GREEN)
-        self._tree.tag_configure("del",  foreground=RED)
-        self._tree.tag_configure("chg",  foreground=AMBER)
-        self._tree.tag_configure("bad",  foreground=RED)
-        self._tree.tag_configure("same", foreground=MUTED)
-        self._tree.tag_configure("kept", foreground=CYAN)
-        self._tree.tag_configure("working", foreground=AMBER)
-        self._tree.tag_configure("done", foreground=GREEN)
-        self._tree.bind("<<TreeviewSelect>>", lambda e: self._sync_buttons())
-        self._tree.bind("<Double-1>", lambda e: self._on_toggle())
 
-        self._detail = tk.StringVar(value="")
-        tk.Label(self, textvariable=self._detail, bg=BG, fg=CYAN,
-                 font=("Segoe UI",8), wraplength=720, justify="left", anchor="w"
-        ).pack(anchor="w", fill="x", padx=16, pady=(6,0))
+        header = tk.Frame(table_wrap, bg=SURF)
+        header.pack(fill="x")
+        for text, width in zip(("Mod", "Server", "You", "Action"), self._WIDTHS):
+            cell = tk.Frame(header, bg=SURF, width=width, height=26)
+            cell.pack(side="left", fill="y"); cell.pack_propagate(False)
+            tk.Label(cell, text=text, bg=SURF, fg=AMBER, font=("Segoe UI",9,"bold"),
+                     anchor="w").pack(fill="both", padx=6)
+
+        # A Treeview can't host a live control per row, so the table itself is
+        # a scrollable stack of row frames instead - each optional row gets
+        # its own two-way toggle rather than a shared button whose meaning
+        # changes depending what's selected.
+        canvas_frame = tk.Frame(table_wrap, bg=BG)
+        canvas_frame.pack(fill="both", expand=True)
+        canvas = tk.Canvas(canvas_frame, bg=BG, highlightthickness=0)
+        vsb = _mk_scrollbar(canvas_frame, canvas.yview)
+        vsb.pack(side="right", fill="y")
+        canvas.config(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        self._canvas = canvas
+        self._rows_frame = tk.Frame(canvas, bg=BG)
+        window = canvas.create_window((0, 0), window=self._rows_frame, anchor="nw")
+        self._rows_frame.bind("<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(window, width=e.width))
+        def _mousewheel(event):
+            # Without this guard the canvas will still happily scroll a
+            # screenful of nothing - scrollregion can end up briefly stale
+            # (e.g. mid-rebuild), and yview_scroll doesn't check content
+            # height on its own before moving the view.
+            if self._rows_frame.winfo_height() <= canvas.winfo_height():
+                return
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind("<MouseWheel>", _mousewheel)
+        self._rows_frame.bind("<MouseWheel>", _mousewheel)
 
         # Progress line and bar. Built now so they keep their place in the
         # layout, packed only once an apply starts (see _begin_apply).
@@ -2574,9 +2678,6 @@ class ModDiffWindow(tk.Toplevel):
 
         self._btn_bar = tk.Frame(self, bg=BG)
         self._btn_bar.pack(fill="x", padx=16, pady=(8,12))
-        self._toggle_btn = _btn(self._btn_bar, "Keep this one", self._on_toggle,
-                                font=("Segoe UI",9), pady=5, padx=12)
-        self._toggle_btn.pack(side="left")
         self._apply_btn = _btn(self._btn_bar, "Apply changes", self._on_apply,
                                style="primary", font=("Segoe UI",9), pady=5, padx=14)
         self._apply_btn.pack(side="right")
@@ -2591,32 +2692,27 @@ class ModDiffWindow(tk.Toplevel):
         frac = (self._steps_done / self._steps_total) if self._steps_total else 0.0
         self._bar.coords(self._bar_fill, 0, 0, int(width * min(1.0, frac)), 6)
 
-    def _values(self, mod_id):
+    def _action_text(self, mod_id):
         r = self._rows[mod_id]
         state = self._progress.get(mod_id)
         if state == "done":
-            verb = "Done"
-        elif state == "start":
-            verb = self._VERB_ING.get(r.action, "Working") + "…"
-        elif mod_id in self._keep:
-            verb = "Keep active"
-        elif r.recommended and mod_id in self._skip:
-            verb = "Skip"
-        elif r.action == ACTION_SKIPPED:
-            verb = "Install"          # was skipped, user has just turned it back on
-        else:
-            verb = self._VERB.get(r.action, r.action)
-            # Say which rows cost a download and which are just a file move out
-            # of the cache: it's the difference between a moment and a wait.
-            if r.action in (ACTION_INSTALL, ACTION_ACTIVATE,
-                            ACTION_UPDATE, ACTION_DOWNGRADE):
-                verb += "" if r.downloads else " (cached)"
-        tail = (f"  ({r.reason})"
-                if r.reason in ("dependency", "pinned", "recommended") else "")
-        return (r.mod_id + tail, r.server_version or "-",
-                r.client_version or "-", verb)
+            return "Done"
+        if state == "start":
+            return self._VERB_ING.get(r.action, "Working") + "…"
+        if mod_id in self._keep:
+            return "Keep active"
+        if r.recommended and mod_id in self._skip:
+            return "Skip"
+        if r.action == ACTION_SKIPPED:
+            return "Install"          # was skipped, user has just turned it back on
+        verb = self._VERB.get(r.action, r.action)
+        # Say which rows cost a download and which are just a file move out
+        # of the cache: it's the difference between a moment and a wait.
+        if r.action in (ACTION_INSTALL, ACTION_ACTIVATE, ACTION_UPDATE, ACTION_DOWNGRADE):
+            verb += "" if r.downloads else " (cached)"
+        return verb
 
-    def _tag(self, mod_id):
+    def _row_tag(self, mod_id):
         state = self._progress.get(mod_id)
         if state:
             return "done" if state == "done" else "working"
@@ -2630,54 +2726,135 @@ class ModDiffWindow(tk.Toplevel):
             return "add" if r.action == ACTION_SKIPPED else self._TAGS.get(r.action, "same")
         return self._TAGS.get(r.action, "same")
 
-    def _populate(self):
-        keep_sel = self._selected()
-        self._tree.delete(*self._tree.get_children())
-        for mod_id in self._order:
-            self._tree.insert("", "end", iid=mod_id, values=self._values(mod_id),
-                              tags=(self._tag(mod_id),))
-        if keep_sel and self._tree.exists(keep_sel):
-            self._tree.selection_set(keep_sel)
-        self._sync_buttons()
+    def _row_color(self, mod_id):
+        return self._tag_colors.get(self._row_tag(mod_id), MUTED)
 
-    def _selected(self):
-        sel = self._tree.selection()
-        return sel[0] if sel else None
-
-    def _sync_buttons(self):
-        # Nothing here is choosable while the render is running: the rows are a
-        # report at that point, not a proposal.
-        if self._applying:
-            return
-        mod_id = self._selected()
-        r = self._rows.get(mod_id) if mod_id else None
-        self._detail.set(r.note if r and r.note else "")
-        if r is None or not r.optional:
-            self._toggle_btn.config(state="disabled", text="Keep this one")
-        elif r.recommended:
-            # The choice runs the other way here: the default is to install, and
-            # the button offers to do without.
-            self._toggle_btn.config(
-                state="normal",
-                text="Install it" if mod_id in self._skip else "Skip this one")
+    def _choice_options(self, mod_id):
+        """(values, current) for an optional row's two-way toggle. 'included'
+        is whichever option the plan proposes by default - install for a
+        recommendation, deactivate for an extra the server doesn't use;
+        'current' is the separate, actual pending choice."""
+        r = self._rows[mod_id]
+        if r.recommended:
+            if r.action == ACTION_SKIPPED:
+                included = "Install"
+            else:
+                included = self._VERB.get(r.action, r.action)
+                if r.action in (ACTION_INSTALL, ACTION_ACTIVATE,
+                                ACTION_UPDATE, ACTION_DOWNGRADE):
+                    included += "" if r.downloads else " (cached)"
+            values = (included, "Skip")
+            current = "Skip" if mod_id in self._skip else included
         else:
-            self._toggle_btn.config(
-                state="normal",
-                text="Deactivate it" if mod_id in self._keep else "Keep this one")
-        # A required mod nobody can supply can't be resolved by pressing Apply,
-        # so the button says so rather than failing after the fact.
-        blocked = any(r2.blocking for r2 in self._rows.values())
+            values = ("Deactivate", "Keep")
+            current = "Keep" if mod_id in self._keep else "Deactivate"
+        return values, current
+
+    def _populate(self):
+        for child in self._rows_frame.winfo_children():
+            child.destroy()
+        self._action_widgets = {}
+        self._name_labels = {}
+        self._segment_labels = {}
+        for mod_id in self._order:
+            self._mk_row(mod_id)
+        # The <Configure> binding usually keeps the scrollregion current, but
+        # it fires off Tk's own idle loop - forcing it here too means a
+        # rebuild never leaves a stale, too-tall region behind that would let
+        # the wheel/scrollbar move the view into empty space.
+        self._rows_frame.update_idletasks()
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+        # A required mod nobody can supply can't be resolved by pressing
+        # Apply, so the button says so rather than failing after the fact.
+        blocked = any(r.blocking for r in self._rows.values())
         self._apply_btn.config(state="disabled" if blocked else "normal",
                                text="Can't apply" if blocked else "Apply changes")
 
-    def _on_toggle(self):
-        mod_id = self._selected()
-        r = self._rows.get(mod_id) if mod_id else None
-        if self._applying or r is None or not r.optional:
-            return
-        target = self._skip if r.recommended else self._keep
-        target.discard(mod_id) if mod_id in target else target.add(mod_id)
-        self._populate()
+    def _mk_row(self, mod_id):
+        r = self._rows[mod_id]
+        row = tk.Frame(self._rows_frame, bg=BG)
+        row.pack(fill="x")
+
+        name_cell = tk.Frame(row, bg=BG, width=self._WIDTHS[0], height=26)
+        name_cell.pack(side="left", fill="y"); name_cell.pack_propagate(False)
+        name_lbl = tk.Label(name_cell, text=r.name or r.mod_id, bg=BG,
+                            fg=self._row_color(mod_id), font=("Segoe UI",9), anchor="w")
+        name_lbl.pack(fill="both", padx=6)
+        self._name_labels[mod_id] = name_lbl
+        # The display name is friendlier; the id is what you'd actually need
+        # to go looking for it (a manifest file, a repo listing), so it's a
+        # hover away rather than gone.
+        _attach_tooltip(name_cell, r.mod_id)
+        _attach_tooltip(name_lbl, r.mod_id)
+
+        for text, width in ((r.server_version or "-", self._WIDTHS[1]),
+                            (r.client_version or "-", self._WIDTHS[2])):
+            cell = tk.Frame(row, bg=BG, width=width, height=26)
+            cell.pack(side="left", fill="y"); cell.pack_propagate(False)
+            tk.Label(cell, text=text, bg=BG, fg=MUTED, font=("Segoe UI",9),
+                     anchor="w").pack(fill="both", padx=6)
+
+        action_cell = tk.Frame(row, bg=BG, width=self._WIDTHS[3], height=26)
+        action_cell.pack(side="left", fill="y"); action_cell.pack_propagate(False)
+        action_lbl = tk.Label(action_cell, bg=BG, font=("Segoe UI",9), anchor="w")
+        toggle = None
+        hover = [action_cell, action_lbl]
+        if r.optional:
+            toggle = self._mk_toggle(action_cell, mod_id)
+            toggle.pack(fill="both")
+            hover.append(toggle)
+            hover.extend(self._segment_labels[mod_id].values())
+        else:
+            action_lbl.config(text=self._action_text(mod_id), fg=self._row_color(mod_id))
+            action_lbl.pack(fill="both", padx=6)
+        self._action_widgets[mod_id] = (action_cell, action_lbl, toggle)
+        # r.note is the longer explanation (why it's listed, a pin conflict,
+        # etc.) that used to sit under the row as its own line - now a hover
+        # away over Action instead, on whichever widget is actually visible
+        # there (a toggle's segments included, since they cover the cell).
+        if r.note:
+            for w in hover:
+                _attach_tooltip(w, r.note)
+
+    def _mk_toggle(self, parent, mod_id):
+        """A two-way toggle for an optional row, in place of a dropdown: two
+        small labels side by side, the live choice lit and the other dim -
+        click either to switch. Nothing pops open, so there's no separate
+        listbox popup fighting the dark theme, and the current choice reads
+        without needing to click anything first."""
+        values, current = self._choice_options(mod_id)
+        wrap = tk.Frame(parent, bg=BG)
+        segs = {}
+        for text in values:
+            lbl = tk.Label(wrap, text=text, font=("Segoe UI",8),
+                           padx=6, pady=3, cursor="hand2")
+            lbl.pack(side="left", padx=(0,4))
+            lbl.bind("<Button-1>",
+                    lambda e, mid=mod_id, t=text: self._on_choice_changed(mid, t))
+            segs[text] = lbl
+        self._segment_labels[mod_id] = segs
+        self._paint_toggle(mod_id, current)
+        return wrap
+
+    def _paint_toggle(self, mod_id, current):
+        for text, lbl in self._segment_labels[mod_id].items():
+            active = text == current
+            lbl.config(bg=(AMBERDIM if active else SURF),
+                      fg=(AMBER if active else MUTED))
+
+    def _on_choice_changed(self, mod_id, choice):
+        r = self._rows[mod_id]
+        # The override literal is always the second _choice_options value
+        # (Skip for a recommendation, Keep for an extra); picking it means
+        # "override the plan's default", picking the other means "don't".
+        target_set = self._skip if r.recommended else self._keep
+        override_literal = "Skip" if r.recommended else "Keep"
+        if choice == override_literal:
+            target_set.add(mod_id)
+        else:
+            target_set.discard(mod_id)
+        self._name_labels[mod_id].config(fg=self._row_color(mod_id))
+        self._paint_toggle(mod_id, choice)
 
     def _on_apply(self):
         if self._applying or any(r.blocking for r in self._rows.values()):
@@ -2707,23 +2884,27 @@ class ModDiffWindow(tk.Toplevel):
     def _begin_apply(self):
         """Turn the proposal into a progress view. Closing is off for the
         duration: render_active_set has no abort, and a Mods/ folder caught
-        half-rendered is worse than waiting."""
+        half-rendered is worse than waiting. Every row's toggle (if it had
+        one) is swapped for the same static, colour-coded label a required
+        row always had - set_step keeps that label live as things happen."""
         self._applying = True
         self.apply_attempted = True
         self._steps_done = 0
         self._steps_total = render_plan_steps(self._plan)
-        self._toggle_btn.config(state="disabled")
+        for mod_id, (cell, label, toggle) in self._action_widgets.items():
+            if toggle is not None:
+                toggle.pack_forget()
+            label.config(text=self._action_text(mod_id), fg=self._row_color(mod_id))
+            label.pack(fill="both", padx=6)
         self._apply_btn.config(state="disabled", text="Applying…")
         self._cancel_btn.config(state="disabled")
         self.protocol("WM_DELETE_WINDOW", lambda: None)
-        self._detail.set("")
         self._status_lbl.config(fg=MUTED)
         self._status.set("Starting…")
         self._status_lbl.pack(anchor="w", fill="x", padx=16, pady=(6,2),
                               before=self._btn_bar)
         self._bar.pack(fill="x", padx=16, pady=(0,4), before=self._btn_bar)
         self._draw_bar()
-        self._populate()
 
     # Driven by whoever runs the render, from the UI thread.
 
@@ -2744,9 +2925,9 @@ class ModDiffWindow(tk.Toplevel):
             self._draw_bar()
         if item_id in self._rows:
             self._progress[item_id] = state
-            if self._tree.exists(item_id):
-                self._tree.item(item_id, values=self._values(item_id),
-                                tags=(self._tag(item_id),))
+            if item_id in self._action_widgets:
+                _, label, _ = self._action_widgets[item_id]
+                label.config(text=self._action_text(item_id), fg=self._row_color(item_id))
 
     def apply_finished(self, ok, message=""):
         """The render is over. On success with close_on_success the window gets
@@ -2795,8 +2976,8 @@ class CommunityModsWindow(tk.Toplevel):
     the selected row. All network and disk work runs off the UI thread; the parent
     Mods window is refreshed through on_change after anything changes."""
 
-    _COLS   = ("status", "mod", "author", "installed", "latest", "source")
-    _WIDTHS = (100,      170,   120,      84,          80,       120)
+    _COLS   = ("status", "author", "mod", "installed", "latest", "source")
+    _WIDTHS = (100,      120,      170,   84,          80,       120)
     _STATE_WORD = {
         "missing":  "Available",
         "current":  "Installed",
@@ -2886,6 +3067,10 @@ class CommunityModsWindow(tk.Toplevel):
         self._refresh_btn = _btn(bar, "Refresh", lambda: self._load(force=True),
                                  style="dim", font=("Segoe UI",9), pady=5, padx=12)
         self._refresh_btn.pack(side="right")
+        if self._side == "client":
+            self._clear_cache_btn = _btn(bar, "Clear Mod Cache", self._on_clear_cache,
+                                         style="dim", font=("Segoe UI",9), pady=5, padx=12)
+            self._clear_cache_btn.pack(side="right", padx=(0,8))
 
         self._status = tk.StringVar(value="Loading community mods...")
         tk.Label(self, textvariable=self._status, bg=BG, fg=CYAN,
@@ -2967,7 +3152,7 @@ class CommunityModsWindow(tk.Toplevel):
 
     def _row_values(self, mod_id):
         r = self._rows[mod_id]
-        return (self._status_word(r), r["name"], r["author"],
+        return (self._status_word(r), r["author"], r["name"],
                 r["installed"] or "-", r["latest"], r["source"])
 
     def _populate_tree(self):
@@ -3108,6 +3293,25 @@ class CommunityModsWindow(tk.Toplevel):
                 self.after(0, lambda: self._finish(msg))
             except Exception as e:
                 self.after(0, lambda e=e: self._finish(f"Toggle failed: {e}"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_clear_cache(self):
+        if self._busy:
+            return
+        if not messagebox.askyesno("Clear mod cache",
+                "Delete every cached mod and library version on this machine?\n\n"
+                "Nothing currently installed in Mods/ is touched - this only clears "
+                "the local copies kept so switching servers doesn't re-download. "
+                "The next install or server join will fetch fresh from source.",
+                parent=self):
+            return
+        self._set_busy(True, "Clearing mod cache...")
+        def worker():
+            try:
+                clear_mod_cache()
+                self.after(0, lambda: self._finish("Mod cache cleared."))
+            except Exception as e:
+                self.after(0, lambda e=e: self._finish(f"Clear cache failed: {e}"))
         threading.Thread(target=worker, daemon=True).start()
 
     def _finish(self, msg):
