@@ -794,6 +794,7 @@ def _btn(parent, text, cmd, style="normal", **kw):
     }[style]
     return tk.Button(parent, text=text, bg=colors[0], fg=colors[1],
                      activebackground=colors[2], activeforeground=colors[3],
+                     disabledforeground=MUTED,
                      relief="flat", bd=0, cursor="hand2", command=cmd, **kw)
 
 def _mk_combobox(parent, var, values):

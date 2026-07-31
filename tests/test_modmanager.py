@@ -1838,7 +1838,8 @@ class SetHelpersHostHandoff(unittest.TestCase):
             BG="#bg", SURF="#surf", BORDER="#border", AMBER="#amber",
             AMBERDIM="#amberdim", PARCH="#parch", MUTED="#muted", GREEN="#green",
             RED="#red", CYAN="#cyan",
-            _btn="BTN", _mk_tree="TREE", _enable_dark_titlebar="DARK",
+            _btn="BTN", _mk_tree="TREE", _mk_scrollbar="SCROLL",
+            _enable_dark_titlebar="DARK",
         )
         mm.set_helpers(host)
         self.assertEqual(mm._download_with_progress, "DL")
@@ -1849,8 +1850,9 @@ class SetHelpersHostHandoff(unittest.TestCase):
         self.assertEqual(mm.BG, "#bg")
         self.assertEqual(mm.AMBERDIM, "#amberdim")
         self.assertEqual(mm.CYAN, "#cyan")
-        self.assertEqual((mm._btn, mm._mk_tree, mm._enable_dark_titlebar),
-                         ("BTN", "TREE", "DARK"))
+        self.assertEqual(
+            (mm._btn, mm._mk_tree, mm._mk_scrollbar, mm._enable_dark_titlebar),
+            ("BTN", "TREE", "SCROLL", "DARK"))
 
     def test_partial_host_leaves_unmentioned_globals_untouched(self):
         mm.BG = "#keep"
