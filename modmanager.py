@@ -90,6 +90,14 @@ CFG_REPOS_KEY = "mod_repos"
 # dict load_cfg()/save_cfg() already manage; see list_pinned/add_pin/remove_pin.
 CFG_PINNED_KEY = "pinned_mods"
 
+# Config key for recommended mods the user has said no to, as
+# {server host: [mod id, ...]}. Only ever holds mods a server marks
+# parity_required false, and only
+# for the server they were declined on - a mod not wanted on one server is
+# routinely wanted on another. Per host rather than per host:port, matching how
+# tokens are keyed: one machine serving one community is one server.
+CFG_DECLINED_KEY = "declined_mods"
+
 # A backstop distinct from cycle detection: a real cycle (A -> B -> A) is caught
 # regardless of this number, but a long strictly-acyclic chain would still
 # recurse once per link, and a broken/adversarial chain doesn't have to be a
@@ -269,6 +277,38 @@ class LibraryDependency:
     filename: str        # required; no id to default a name from
 
 
+def parity_required(d):
+    """Whether a client joining a server that runs this mod must match its exact
+    version. Read off a manifest, an install record, an index entry, or a
+    handshake entry - every shape the field travels in, so one place decides
+    what it means.
+
+    True is what the server enforces (TavernLib's ModParity.ValidateClient), for
+    mods whose two halves are one system: a voice codec, a network protocol,
+    anything where both sides exchange data they have to agree on. False means
+    the server won't block a join over it, so the client is offered the mod,
+    defaulted to installing, and may decline - for mods whose halves work
+    independently, like a client performance tweak that happens to ship a server
+    piece.
+
+    Mandatory, with no default: every shape that carries this field is written
+    by tooling that knows about it, so a missing one means the data predates the
+    field or came from something that doesn't implement it, and guessing on its
+    behalf is exactly what would let a required mod be silently treated as
+    optional. Callers decide what to do with the error - a manifest becomes
+    unresolvable, an index entry or an install record is skipped with a warning.
+
+    Only a literal False relaxes it, so a present-but-malformed value (a string,
+    a None, a 0) still reads as required rather than being trusted."""
+    if "parity_required" not in d:
+        raise ModManagerError(
+            f"'{d.get('id', '?')}' has no parity_required field. It's required: "
+            f"true if a client joining a server running this mod must have this "
+            f"exact version, false if the server shouldn't block the join over "
+            f"it. A mod installed before this field existed needs reinstalling.")
+    return d["parity_required"] is not False
+
+
 @dataclass
 class ModManifest:
     manifest_version: int                   # schema version; unknown-major is skipped at parse
@@ -285,6 +325,7 @@ class ModManifest:
     sha256: str
     source_repo: str                        # injected by fetch_indexes, NOT read from the file
     package: str = "dll"                    # "dll" (single file) or "zip" (extracted bundle)
+    parity_required: bool = True            # see parity_required() above
 
     def install_name(self):
         """The basename this mod's single .dll lands under in Mods/<id>/. Nothing
@@ -321,6 +362,8 @@ class ModSummary:
     server_side: bool
     versions: list                          # every version string in THIS major
     source_repo: str                        # injected by fetch_indexes
+    parity_required: bool = True            # carried here too, so browsing can tell
+                                             # a required mod from a recommended one
 
     def highest(self):
         return max(self.versions, key=_parse_version)
@@ -380,6 +423,7 @@ def _manifest_from_dict(d, source_repo):
             sha256=str(d["sha256"]).lower(),
             source_repo=source_repo,
             package=package,
+            parity_required=parity_required(d),
         )
     except KeyError as e:
         raise ModManagerError(f"manifest for {d.get('id', '?')} is missing field {e}.")
@@ -546,6 +590,13 @@ def _summary_from_dict(d, mod_id, source_repo):
             _warn(f"index entry for {mod_id} lists a bad version {v!r}, ignored.")
     if not versions:
         return None
+    try:
+        required = parity_required(d)
+    except ModManagerError:
+        # One malformed entry shouldn't cost the whole index. Skipped rather
+        # than guessed at, same as an entry with no usable versions.
+        _warn(f"index entry for {mod_id} has no parity_required field, skipped.")
+        return None
     return ModSummary(
         id=mod_id,
         name=str(d.get("name", mod_id)),
@@ -555,6 +606,7 @@ def _summary_from_dict(d, mod_id, source_repo):
         server_side=bool(d.get("server_side", False)),
         versions=versions,
         source_repo=source_repo,
+        parity_required=required,
     )
 
 
@@ -986,6 +1038,9 @@ def _mod_record(mod):
         "description": mod.description,
         "client_side": mod.client_side,
         "server_side": mod.server_side,
+        # Recorded so a server can report it in the handshake without re-fetching
+        # the manifest, and so the client can tell what a mod it already has is.
+        "parity_required": mod.parity_required,
         "dependencies": dict(mod.dependencies or {}),
         "library_dependencies": [
             {"name": l.name, "download_url": l.download_url,
@@ -1266,14 +1321,21 @@ def list_mods(index, side):
 def list_installed_mods(game_dir):
     """Every installed mod's record, in both enabled/disabled states: the per-mod
     folders (enabled Mods/<id>/manifest.json or disabled
-    Mods/<id>/manifest.disabled.json). Only records carrying an "id" count, so a
-    library sidecar or a bare marker is ignored. Each returned record gains an
-    in-memory "enabled" value, not written to disk: True (loaded) or False
+    Mods/<id>/manifest.disabled.json). A record counts only if it carries an "id"
+    and a "parity_required", so a library sidecar, a bare marker, or a record
+    written before parity_required existed is ignored. Each returned record gains
+    an in-memory "enabled" value, not written to disk: True (loaded) or False
     (disabled). Every installed mod's client_side/server_side flags are available
     from these records, so this is the read side for both the UI's status refresh
     and whatever assembles the server's mod list for the pre-join check.
     uninstall_mod also uses it to see which libraries the remaining mods still
-    pin."""
+    pin.
+
+    A pre-parity_required record is skipped rather than assumed required,
+    because assuming is what would let a mod the server actually requires be
+    reported as something a client may decline. Skipping is recoverable: the mod
+    reads as not installed, so the next plan reinstalls it and the new record
+    carries the field."""
     out = {}     # id -> record
     mods_dir = _mods_base(game_dir)
     if not os.path.isdir(mods_dir):
@@ -1291,6 +1353,11 @@ def list_installed_mods(game_dir):
             rec = _read_sidecar(os.path.join(full, DISABLED_RECORD_NAME))
             enabled = False
         if rec and rec.get("id"):
+            if "parity_required" not in rec:
+                _warn(f"installed mod {rec['id']} has a record with no "
+                      f"parity_required field, so it predates that field and is "
+                      f"being ignored; reinstall it to fix.")
+                continue
             rec["enabled"] = enabled       # in-memory only; not on disk
             out[rec["id"]] = rec
     return list(out.values())
@@ -1307,7 +1374,8 @@ def handshake_snapshot(game_dir):
     - mods_count: len(mods_list), sent alongside the hash in the pong so a
       client can sanity-check its cache without decoding anything.
     - mods_list: every entry as {"id", "version", "client_side", "server_side",
-      "source_repo"}, sorted by id: what the separate, length-prefixed
+      "parity_required", "source_repo"}, sorted by id: what the separate,
+      length-prefixed
       "mods_list" request sends on a cache miss. source_repo is a HINT only:
       plan_join uses it to tell a client which repo a required
       mod not resolvable from any of the client's configured repos would come
@@ -1316,12 +1384,20 @@ def handshake_snapshot(game_dir):
       modlist's `repos`, the rejection payload's `missing` entries)."""
     mods = sorted((m for m in list_installed_mods(game_dir) if m.get("enabled")),
                   key=lambda m: m["id"])
-    fingerprint = "\n".join(f"{m['id']}@{m.get('version', '')}" for m in mods)
+    # parity_required is part of the fingerprint, not just the list. A server
+    # can flip a mod between required and recommended without its version
+    # moving, and a client caches this whole list against this hash - so leaving
+    # it out would let a client keep planning against the old answer until it
+    # restarted, and skip a mod that had since become mandatory.
+    fingerprint = "\n".join(
+        f"{m['id']}@{m.get('version', '')}@{'req' if parity_required(m) else 'opt'}"
+        for m in mods)
     mods_hash = hashlib.sha256(fingerprint.encode()).hexdigest()
     mods_list = [
         {"id": m["id"], "version": m.get("version", ""),
          "client_side": bool(m.get("client_side", False)),
          "server_side": bool(m.get("server_side", False)),
+         "parity_required": parity_required(m),
          "source_repo": m.get("source_repo", "")}
         for m in mods
     ]
@@ -1494,6 +1570,30 @@ def list_pinned(cfg):
     return list(cfg.get(CFG_PINNED_KEY, []))
 
 
+def list_declined(cfg, host):
+    """Recommended mods the user has turned off for one server. Empty for a
+    server never seen before, which is what makes installing the default."""
+    return list((cfg.get(CFG_DECLINED_KEY) or {}).get(host, []))
+
+
+def set_declined(cfg, host, mod_ids):
+    """Records this server's declined set, replacing whatever was there - the
+    window hands back the whole set each time, including choices taken back, so
+    it's a write not a merge. Saves via the injected save_cfg, same convention
+    as add_repo/add_pin. A server with nothing declined drops out entirely
+    rather than leaving an empty list behind."""
+    save = _require(_save_cfg, "save_cfg")
+    table = dict(cfg.get(CFG_DECLINED_KEY) or {})
+    ids = sorted(set(mod_ids or []))
+    if ids:
+        table[host] = ids
+    else:
+        table.pop(host, None)
+    cfg[CFG_DECLINED_KEY] = table
+    save(cfg)
+    return ids
+
+
 def add_pin(cfg, entry):
     """Adds (or updates) a pin. entry is "id" or "id@version" - see
     _parse_pin_entry. Replaces any existing pin for the same mod id rather
@@ -1546,6 +1646,14 @@ class JoinPlan:
     pin_conflicts: list      # [(mod_id, pinned_version, server_version)] - a pinned mod's
                              # exact version disagrees with what the server requires; the
                              # user decides whether to unpin or accept the server's version
+    declined: list = None    # [(mod_id, version)] mods this server runs and doesn't require
+                             # that the user has already said no to. Not in the active set
+                             # and not touched on disk; carried so the comparison can show
+                             # them and let the choice be taken back
+
+    def __post_init__(self):
+        if self.declined is None:
+            self.declined = []
 
     @property
     def blocking(self):
@@ -1556,33 +1664,52 @@ class JoinPlan:
         return bool(self.missing)
 
 
-def plan_join(game_dir, server_mods, index, repo_bases, pinned=None):
-    """Computes active = required(server) UNION resolve_dependencies(required)
-    UNION pinned, and diffs it against what's cached/active - the render PLAN,
-    not the render itself.
+def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=None):
+    """Computes active = required(server) UNION recommended(server, not declined)
+    UNION resolve_dependencies(those) UNION pinned, and diffs it against what's
+    cached/active - the render PLAN, not the render itself.
 
     server_mods: entries as returned by the ping/pong handshake's full list
     (handshake_snapshot's mods_list, or the equivalent fetched over the wire) -
-    {"id","version","client_side","server_side","source_repo"}. Only
-    client_side entries are required of the client (every server mod with a
-    client side is required, at the server's exact version - the same version
-    the server itself enforces on join); server_side-only entries are ignored
-    here.
+    {"id","version","client_side","server_side","parity_required","source_repo"}.
+    Only client_side entries concern the client at all; server_side-only entries
+    are ignored here. Of those, parity_required splits them two ways:
+
+      true   the server enforces this exact version on join, so it goes in the
+             active set and a client that can't resolve it is blocked.
+      false  the server won't block over it. Still planned in by default, at the
+             server's version, so the common case is that everyone matches - but
+             the user can decline, and a declined mod is left out entirely
+             rather than installed, updated, or deactivated.
+
     index: the client's own merged index (fetch_indexes(repo_bases)) - used to
     pick each dependency's version within a major.
     repo_bases: the client's configured repos (list_repos(cfg)) - the only
     repos anything is actually fetched from.
     pinned: "id" / "id@version" strings (the launcher's always-on set) -
-    unioned in regardless of which server is being joined."""
+    unioned in regardless of which server is being joined.
+    declined: mod ids the user has already said no to for THIS server. Only a
+    mod the server marks parity_required false can be declined; a declined id
+    the server actually requires is ignored, since no client-side choice can
+    make that join work."""
     pinned = pinned or []
+    declined = set(declined or [])
 
-    required = {m["id"]: m["version"] for m in server_mods if m.get("client_side")}
+    client_mods = [m for m in server_mods if m.get("client_side")]
+    required = {m["id"]: m["version"] for m in client_mods
+                if parity_required(m)}
+    recommended = {m["id"]: m["version"] for m in client_mods
+                   if not parity_required(m)}
     hinted_repo = {m["id"]: m.get("source_repo") for m in server_mods if m.get("source_repo")}
+
+    # A decline only ever applies to a mod the server marks optional. Declining
+    # something required would just move the rejection from here to the server.
+    skipped = [(mid, ver) for mid, ver in recommended.items() if mid in declined]
 
     roots = []
     missing = []
     needs_repo = []
-    reason = {}         # mod_id -> "required" | "pinned", first tag wins
+    reason = {}         # mod_id -> "required" | "recommended" | "pinned", first tag wins
     exact_pin = {}      # mod_id -> pinned version (None if pinned to latest)
 
     def resolve_root(mod_id, version, tag):
@@ -1592,6 +1719,11 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None):
             hint = hinted_repo.get(mod_id)
             if hint and _norm(hint) not in [_norm(b) for b in repo_bases]:
                 needs_repo.append((mod_id, version, hint))
+            elif tag == "recommended":
+                # Unresolvable and not actually required: silently doing without
+                # it beats blocking or nagging over a mod the server allows the
+                # client not to have.
+                pass
             else:
                 missing.append((mod_id, version))
             return
@@ -1600,6 +1732,10 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None):
 
     for mod_id, version in required.items():
         resolve_root(mod_id, version, "required")
+
+    for mod_id, version in recommended.items():
+        if mod_id not in declined:
+            resolve_root(mod_id, version, "recommended")
 
     for entry in pinned:
         mod_id, version = _parse_pin_entry(entry)
@@ -1640,24 +1776,202 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None):
                                   manifest=mod))
 
     active_ids = {e.mod_id for e in entries}
+    # Declining is "don't add it", never "take it away". A mod the user already
+    # chose to have and the server doesn't require stays exactly as it is.
     to_deactivate = [mod_id for mod_id, rec in installed.items()
-                      if rec.get("enabled") and mod_id not in active_ids]
+                      if rec.get("enabled") and mod_id not in active_ids
+                      and mod_id not in declined]
 
     libraries = collect_library_dependencies(all_mods) if all_mods else []
 
     return JoinPlan(entries=entries, to_deactivate=to_deactivate, libraries=libraries,
-                    missing=missing, needs_repo=needs_repo, pin_conflicts=pin_conflicts)
+                    missing=missing, needs_repo=needs_repo, pin_conflicts=pin_conflicts,
+                    declined=skipped)
+
+
+# Client-vs-server comparison
+#
+# A JoinPlan says what to DO. This says what the two sides currently look like
+# and how each mod differs, which is what a person actually needs to see before
+# agreeing to it. Pure: derived from a plan plus what's on disk, no display and
+# no network, so it's testable on its own and the window below only renders it.
+
+# What will happen to each mod. The first six change the client; the rest are
+# informational or blocking.
+ACTION_INSTALL     = "install"      # not here at all, needs downloading
+ACTION_ACTIVATE    = "activate"     # in the local cache at this version, a file move
+ACTION_UPDATE      = "update"       # installed at a lower version
+ACTION_DOWNGRADE   = "downgrade"    # installed higher; the server pins an exact version
+ACTION_ENABLE      = "enable"       # installed at the right version, currently disabled
+ACTION_DEACTIVATE  = "deactivate"   # active here, not part of this server's set
+ACTION_MATCH       = "match"        # already correct, nothing to do
+ACTION_SKIPPED     = "skipped"      # recommended, and the user has said no to it here
+ACTION_SERVER_ONLY = "server-only"  # the server runs it, clients never need it
+ACTION_MISSING     = "missing"      # required, and no configured repo has it
+ACTION_NEEDS_REPO  = "needs-repo"   # resolvable, but only from a repo not added here
+
+# Sort weight: problems first, then real changes, then the quiet rows.
+_ACTION_ORDER = {
+    ACTION_MISSING: 0, ACTION_NEEDS_REPO: 0,
+    ACTION_INSTALL: 1, ACTION_ACTIVATE: 1, ACTION_UPDATE: 1,
+    ACTION_DOWNGRADE: 1, ACTION_ENABLE: 1,
+    ACTION_DEACTIVATE: 2, ACTION_MATCH: 3,
+    ACTION_SKIPPED: 4, ACTION_SERVER_ONLY: 5,
+}
+
+
+@dataclass
+class DiffRow:
+    """One mod, as it stands on each side and what would change."""
+    mod_id: str
+    server_version: str     # "" when the server doesn't run this mod
+    client_version: str     # "" when it isn't installed here
+    client_enabled: bool    # only meaningful when client_version is set
+    action: str             # one of the ACTION_* values above
+    reason: str             # "required" | "recommended" | "dependency" | "pinned" | ""
+    optional: bool          # True when the user may overrule this row
+    source_repo: str
+    note: str = ""          # extra detail, e.g. a pin disagreeing with the server
+    cached: bool = False     # this exact version is already in the local cache, so
+                             # applying it is a file move rather than a download
+
+    @property
+    def recommended(self):
+        """A mod this server runs but doesn't require. The user's call in either
+        direction, and the reason a row can be overruled towards NOT installing
+        something, rather than only towards keeping something."""
+        return self.reason == "recommended" or self.action == ACTION_SKIPPED
+
+    @property
+    def downloads(self):
+        """True when applying this row actually fetches bytes. The only part of
+        a plan that takes real time, so it's what the summary counts and what
+        each row is labelled with."""
+        return (not self.cached) and self.action in (
+            ACTION_INSTALL, ACTION_UPDATE, ACTION_DOWNGRADE)
+
+    @property
+    def blocking(self):
+        return self.action == ACTION_MISSING
+
+
+def build_mod_diff(game_dir, server_mods, plan):
+    """The full comparison behind a JoinPlan: one DiffRow per mod on either
+    side, sorted problems-first. server_mods is the handshake list; plan is what
+    plan_join computed from it.
+
+    Two kinds of row are marked optional, both because the server's parity check
+    can't fail over them. Deactivations: a mod the server doesn't run at all can
+    stay active here without affecting the join. Recommendations: a mod the
+    server does run but doesn't require, which it won't block over either
+    way. Everything else is what the server actually enforces, so it isn't
+    presented as a choice."""
+    installed = {r["id"]: r for r in list_installed_mods(game_dir)}
+    required = {m["id"]: m.get("version", "") for m in server_mods if m.get("client_side")}
+    conflicts = {mid: (pv, sv) for mid, pv, sv in plan.pin_conflicts}
+
+    rows = []
+    for e in plan.entries:
+        rec = installed.get(e.mod_id)
+        cv = rec.get("version", "") if rec else ""
+        enabled = bool(rec.get("enabled")) if rec else False
+        if e.active:
+            action = ACTION_MATCH
+        elif rec is None:
+            action = ACTION_ACTIVATE if e.cached else ACTION_INSTALL
+        elif cv == e.version:
+            action = ACTION_ENABLE          # right version on disk, just switched off
+        else:
+            try:
+                older = _parse_version(cv) < _parse_version(e.version)
+            except ModManagerError:
+                older = True                # unparseable installed version: treat as stale
+            action = ACTION_UPDATE if older else ACTION_DOWNGRADE
+        pv_sv = conflicts.get(e.mod_id)
+        recommended = e.reason == "recommended"
+        if pv_sv:
+            note = f"your pin says {pv_sv[0]}, the server requires {pv_sv[1]}"
+        elif recommended:
+            note = ("this server recommends it but doesn't require it; skipping "
+                    "it won't stop you joining")
+        else:
+            note = ""
+        rows.append(DiffRow(
+            mod_id=e.mod_id, server_version=required.get(e.mod_id, ""),
+            client_version=cv, client_enabled=enabled, action=action,
+            reason=e.reason, optional=recommended and not e.active,
+            source_repo=e.source_repo, note=note, cached=e.cached))
+
+    for mod_id in plan.to_deactivate:
+        rec = installed.get(mod_id, {})
+        rows.append(DiffRow(
+            mod_id=mod_id, server_version="", client_version=rec.get("version", ""),
+            client_enabled=True, action=ACTION_DEACTIVATE, reason="", optional=True,
+            source_repo=rec.get("source_repo", ""),
+            note="this server doesn't run it; keeping it on won't block your join"))
+
+    seen = {r.mod_id for r in rows}
+    for mod_id, version in plan.declined:
+        if mod_id in seen:
+            continue
+        rec = installed.get(mod_id, {})
+        rows.append(DiffRow(
+            mod_id=mod_id, server_version=version,
+            client_version=rec.get("version", ""),
+            client_enabled=bool(rec.get("enabled")), action=ACTION_SKIPPED,
+            reason="recommended", optional=True,
+            source_repo=rec.get("source_repo", ""),
+            note="you've chosen not to install this one for this server"))
+        seen.add(mod_id)
+
+    for m in server_mods:
+        if m["id"] in seen or m.get("client_side"):
+            continue
+        rows.append(DiffRow(
+            mod_id=m["id"], server_version=m.get("version", ""), client_version="",
+            client_enabled=False, action=ACTION_SERVER_ONLY, reason="",
+            optional=False, source_repo=m.get("source_repo", ""),
+            note="runs on the server only"))
+        seen.add(m["id"])
+
+    for mod_id, version in plan.missing:
+        if mod_id in seen:
+            continue
+        rec = installed.get(mod_id, {})
+        rows.append(DiffRow(
+            mod_id=mod_id, server_version=version, client_version=rec.get("version", ""),
+            client_enabled=bool(rec.get("enabled")), action=ACTION_MISSING,
+            reason="required", optional=False, source_repo="",
+            note="not in any source you've added"))
+        seen.add(mod_id)
+
+    for mod_id, version, repo in plan.needs_repo:
+        if mod_id in seen:
+            continue
+        rows.append(DiffRow(
+            mod_id=mod_id, server_version=version, client_version="",
+            client_enabled=False, action=ACTION_NEEDS_REPO, reason="required",
+            optional=False, source_repo=repo,
+            note=f"add {_repo_shorthand(repo)} as a source, then check again"))
+        seen.add(mod_id)
+
+    return sorted(rows, key=lambda r: (_ACTION_ORDER.get(r.action, 9), r.mod_id.lower()))
 
 
 def _prune_orphaned_libraries(game_dir):
     """After the active set changes, removes any UserLibs/ library no longer
-    pinned by any currently-installed mod's record. Each library was already
+    pinned by a currently-ENABLED mod's record. Each library was already
     cache_store_library'd when its owning mod was installed/adopted, so
     nothing is lost - it just isn't present in UserLibs/ until something
-    needs it again."""
+    needs it again.
+
+    Enabled rather than merely installed, because a disabled mod isn't loading
+    and neither should its libraries be. Enabling it again restores them: the
+    library pass runs over the whole active set, after the pass that enables."""
     still_needed = set()
     for rec in list_installed_mods(game_dir):
-        still_needed.update(rec.get("libraries", []))
+        if rec.get("enabled"):
+            still_needed.update(rec.get("libraries", []))
 
     libs_dir = _userlibs_dir(game_dir)
     for name in os.listdir(libs_dir):
@@ -1674,7 +1988,16 @@ def _prune_orphaned_libraries(game_dir):
                 pass
 
 
-def render_active_set(game_dir, plan, on_progress=None):
+def render_plan_steps(plan):
+    """How many items render_active_set will work through for this plan: one per
+    mod it changes, per library it checks, and per mod it deactivates. Exactly
+    the set that reports through on_step, so a caller can size a progress bar
+    before starting and have it end full."""
+    return (len([e for e in plan.entries if not e.active])
+            + len(plan.libraries) + len(plan.to_deactivate))
+
+
+def render_active_set(game_dir, plan, on_progress=None, on_step=None):
     """Applies a JoinPlan to disk - the actual render step. Restores from
     cache wherever cached (a file move), downloads only what's
     genuinely missing, then deactivates anything no longer needed - never
@@ -1682,29 +2005,50 @@ def render_active_set(game_dir, plan, on_progress=None):
     something already cached. Raises ModManagerError immediately if
     plan.blocking; callers must check that themselves before deciding whether
     to show a plan at all, same as install_mod_closure surfaces resolution
-    errors before touching disk."""
+    errors before touching disk.
+
+    on_progress takes a line of human-readable detail. on_step brackets each
+    item with on_step(item_id, "start") and on_step(item_id, "done"): mod ids
+    for mods, filenames for libraries, one pair per item counted by
+    render_plan_steps. A library already active at the pinned content still
+    reports both, so the count a caller sized against is always reached."""
     if plan.blocking:
         raise ModManagerError(
             "This plan has required mods that couldn't be resolved from any "
             "configured repo; fix that before applying it.")
     progress = on_progress or (lambda *_a: None)
+    step = on_step or (lambda *_a: None)
 
     for entry in plan.entries:
         if entry.active:
             continue
-        if entry.cached:
+        step(entry.mod_id, "start")
+        rec = _read_mod_record(game_dir, entry.mod_id)
+        disabled_here = (bool(rec) and rec.get("version") == entry.version
+                         and os.path.isfile(_disabled_record_path(game_dir, entry.mod_id)))
+        if disabled_here:
+            # Already on disk at exactly this version, just switched off. Renaming
+            # the record back is the whole job: no copy out of the cache, no
+            # download, and it works with no network at all. The counterpart to
+            # deactivating by disabling below.
+            progress(f"Enabling {entry.mod_id} {entry.version}")
+            enable_mod(game_dir, entry.mod_id)
+        elif entry.cached:
             progress(f"Activating {entry.mod_id} {entry.version} (cached)")
             cache_restore_mod(game_dir, entry.mod_id, entry.version)
         else:
             progress(f"Downloading {entry.mod_id} {entry.version}")
             install_mod(game_dir, entry.manifest, progress)
             cache_store_mod(game_dir, entry.mod_id)
+        step(entry.mod_id, "done")
 
     for lib in plan.libraries:
         filename = _safe_basename(lib.filename)
+        step(filename, "start")
         dest = os.path.join(_userlibs_dir(game_dir), filename)
         existing = _read_sidecar(_library_sidecar_path(game_dir, filename))
         if os.path.isfile(dest) and existing and existing.get("sha256") == lib.sha256:
+            step(filename, "done")
             continue     # already active with the exact pinned content
         if os.path.isdir(_cache_library_dir(filename, lib.sha256)):
             progress(f"Activating library {filename} (cached)")
@@ -1713,13 +2057,19 @@ def render_active_set(game_dir, plan, on_progress=None):
             progress(f"Downloading library {filename}")
             install_library_dependency(game_dir, lib, progress)
             cache_store_library(game_dir, filename)
+        step(filename, "done")
 
     for mod_id in plan.to_deactivate:
+        step(mod_id, "start")
         progress(f"Deactivating {mod_id}")
-        cache_store_mod(game_dir, mod_id)      # preserve it before removing
-        mod_dir = _mod_dir_path(game_dir, mod_id)
-        if os.path.isdir(mod_dir):
-            shutil.rmtree(mod_dir)
+        # Disabled, not uninstalled: the record is renamed so MelonLoader skips
+        # the folder, and every file stays exactly where it is. The mod keeps its
+        # place in the installed list and comes back on with a rename rather than
+        # a download. Cached first all the same, so a later version switch is a
+        # file move whichever way it goes.
+        cache_store_mod(game_dir, mod_id)
+        disable_mod(game_dir, mod_id)
+        step(mod_id, "done")
 
     _prune_orphaned_libraries(game_dir)
 
@@ -2083,6 +2433,359 @@ class PinnedModsWindow(tk.Toplevel):
         self._reload()
         if self._on_change:
             self._on_change()
+
+
+class ModDiffWindow(tk.Toplevel):
+    """Side-by-side comparison of what a server runs against what's installed
+    here, shown before anything is applied. Replaces a flat "will install / will
+    deactivate" list with the actual two sides and a per-mod verdict, so it's
+    clear WHY each change is proposed and what the server is actually asking for.
+
+    Also where applying happens. Given an apply_action, pressing Apply turns the
+    same table into a progress view - each row saying what's happening to it,
+    a bar underneath - and the window stays up until the work is done. The
+    outcome is reported in the window rather than a popup: with
+    close_on_success it disappears and the caller carries on (the join case),
+    otherwise it stays with the result on screen (the sync case).
+
+    Without an apply_action it's a plain confirm dialog: the caller waits, then
+    reads `.result` (True to apply).
+
+    The plan is edited to match the screen before anything is rendered, so what
+    gets applied is what was shown: a deactivation the user keeps is dropped from
+    plan.to_deactivate, and a recommended mod the user skips is dropped from
+    plan.entries. `declined` afterwards is the full set of recommended mods
+    turned off for this server, for the caller to remember.
+    on_cancel(window) fires exactly once if the window closes without a
+    successful apply, so a caller waiting on it isn't left hanging. Check
+    `.apply_attempted` there to tell a plain decline from a close after a
+    failure that has already been reported."""
+
+    _COLS   = ("mod", "server", "you", "action_needed")
+    _WIDTHS = (290,   100,      100,   160)
+
+    # Row colour per action. Reads as a diff at a glance: additions green,
+    # removals red, version changes amber, problems red, quiet rows muted.
+    _TAGS = {
+        ACTION_INSTALL:     "add",   ACTION_ACTIVATE: "add",  ACTION_ENABLE: "add",
+        ACTION_UPDATE:      "chg",   ACTION_DOWNGRADE: "chg",
+        ACTION_DEACTIVATE:  "del",   ACTION_MATCH:    "same",
+        ACTION_SERVER_ONLY: "same",  ACTION_SKIPPED:  "same",
+        ACTION_MISSING:     "bad",   ACTION_NEEDS_REPO: "bad",
+    }
+    _VERB = {
+        ACTION_INSTALL:  "Download",   ACTION_ACTIVATE:  "Activate",
+        ACTION_ENABLE:   "Enable",     ACTION_UPDATE:    "Update",
+        ACTION_DOWNGRADE:"Downgrade",  ACTION_DEACTIVATE:"Deactivate",
+        ACTION_MATCH:    "Up to date", ACTION_SERVER_ONLY:"Not needed",
+        ACTION_SKIPPED:  "Skipped",
+        ACTION_MISSING:  "Unavailable",ACTION_NEEDS_REPO:"Source missing",
+    }
+    # What a row says while it's being worked on, so the table reads as live
+    # progress instead of a static proposal.
+    _VERB_ING = {
+        ACTION_INSTALL:  "Downloading", ACTION_ACTIVATE:  "Activating",
+        ACTION_ENABLE:   "Enabling",    ACTION_UPDATE:    "Updating",
+        ACTION_DOWNGRADE:"Downgrading", ACTION_DEACTIVATE:"Deactivating",
+    }
+
+    def __init__(self, parent, rows, plan, server_label="this server",
+                 apply_action=None, close_on_success=True, on_cancel=None):
+        super().__init__(parent)
+        self.title("Mod Comparison")
+        self.configure(bg=BG)
+        self.geometry("760x560")
+        self.minsize(660, 440)
+        self._rows   = {r.mod_id: r for r in rows}
+        self._order  = [r.mod_id for r in rows]
+        self._plan   = plan
+        self._label  = server_label
+        # Both directions a row can be overruled. _keep: deactivations the user
+        # wants to hold on to. _skip: recommended mods the user doesn't want.
+        # A row starts in _skip if it came in already declined for this server.
+        self._keep   = set()
+        self._skip   = {r.mod_id for r in rows if r.action == ACTION_SKIPPED}
+        self.result  = False
+
+        self._apply_action     = apply_action
+        self._close_on_success = close_on_success
+        self._on_cancel_cb     = on_cancel
+        self._applying   = False
+        self._closed     = False
+        self.apply_attempted = False   # Apply was pressed; a close isn't a decline
+        self.declined = list(self._skip)   # kept current on every apply
+        self._progress   = {}     # mod id -> "start" | "done", during an apply
+        self._steps_done = 0
+        self._steps_total = 0
+
+        self._build()
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        _enable_dark_titlebar(self)
+        self.transient(parent)
+        self.grab_set()
+
+    def _build(self):
+        h = tk.Frame(self, bg=SURF, height=44)
+        h.pack(fill="x"); h.pack_propagate(False)
+        tk.Label(h, text="Mod Comparison", bg=SURF, fg=AMBER,
+                 font=("Georgia",12,"bold")).pack(side="left", padx=16, pady=8)
+        tk.Label(h, text=self._label, bg=SURF, fg=MUTED,
+                 font=("Segoe UI",9)).pack(side="left", pady=8)
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
+
+        tk.Label(self,
+            text="'Server' is the version this server runs, 'You' is what's installed here, "
+                 "and 'Action Needed' is what applying this would do. Rows the server "
+                 "requires can't be changed: without them it refuses the join. Rows marked "
+                 "(recommended) it runs but won't insist on, so you can skip them, and rows "
+                 "set to Deactivate are yours alone. Select a row and use the button below "
+                 "to change your mind about either.",
+            bg=BG, fg=MUTED, font=("Segoe UI",9), wraplength=720, justify="left"
+        ).pack(anchor="w", padx=16, pady=(10,6))
+
+        table_wrap = tk.Frame(self, bg=BG)
+        table_wrap.pack(fill="both", expand=True, padx=16)
+        self._tree = _mk_tree(table_wrap, self._COLS, self._WIDTHS, height=11)
+        self._tree.tag_configure("add",  foreground=GREEN)
+        self._tree.tag_configure("del",  foreground=RED)
+        self._tree.tag_configure("chg",  foreground=AMBER)
+        self._tree.tag_configure("bad",  foreground=RED)
+        self._tree.tag_configure("same", foreground=MUTED)
+        self._tree.tag_configure("kept", foreground=CYAN)
+        self._tree.tag_configure("working", foreground=AMBER)
+        self._tree.tag_configure("done", foreground=GREEN)
+        self._tree.bind("<<TreeviewSelect>>", lambda e: self._sync_buttons())
+        self._tree.bind("<Double-1>", lambda e: self._on_toggle())
+
+        self._detail = tk.StringVar(value="")
+        tk.Label(self, textvariable=self._detail, bg=BG, fg=CYAN,
+                 font=("Segoe UI",8), wraplength=720, justify="left", anchor="w"
+        ).pack(anchor="w", fill="x", padx=16, pady=(6,0))
+
+        # Progress line and bar. Built now so they keep their place in the
+        # layout, packed only once an apply starts (see _begin_apply).
+        self._status = tk.StringVar(value="")
+        self._status_lbl = tk.Label(self, textvariable=self._status, bg=BG, fg=MUTED,
+                                    font=("Segoe UI",9), wraplength=720,
+                                    justify="left", anchor="w")
+        self._bar = tk.Canvas(self, bg=SURF, height=6, highlightthickness=0, bd=0)
+        self._bar_fill = self._bar.create_rectangle(0, 0, 0, 6, fill=GREEN, width=0)
+        self._bar.bind("<Configure>", lambda e: self._draw_bar())
+
+        self._btn_bar = tk.Frame(self, bg=BG)
+        self._btn_bar.pack(fill="x", padx=16, pady=(8,12))
+        self._toggle_btn = _btn(self._btn_bar, "Keep this one", self._on_toggle,
+                                font=("Segoe UI",9), pady=5, padx=12)
+        self._toggle_btn.pack(side="left")
+        self._apply_btn = _btn(self._btn_bar, "Apply changes", self._on_apply,
+                               style="primary", font=("Segoe UI",9), pady=5, padx=14)
+        self._apply_btn.pack(side="right")
+        self._cancel_btn = _btn(self._btn_bar, "Cancel", self._on_cancel, style="dim",
+                                font=("Segoe UI",9), pady=5, padx=14)
+        self._cancel_btn.pack(side="right", padx=8)
+
+        self._populate()
+
+    def _draw_bar(self):
+        width = max(self._bar.winfo_width(), 1)
+        frac = (self._steps_done / self._steps_total) if self._steps_total else 0.0
+        self._bar.coords(self._bar_fill, 0, 0, int(width * min(1.0, frac)), 6)
+
+    def _values(self, mod_id):
+        r = self._rows[mod_id]
+        state = self._progress.get(mod_id)
+        if state == "done":
+            verb = "Done"
+        elif state == "start":
+            verb = self._VERB_ING.get(r.action, "Working") + "…"
+        elif mod_id in self._keep:
+            verb = "Keep active"
+        elif r.recommended and mod_id in self._skip:
+            verb = "Skip"
+        elif r.action == ACTION_SKIPPED:
+            verb = "Install"          # was skipped, user has just turned it back on
+        else:
+            verb = self._VERB.get(r.action, r.action)
+            # Say which rows cost a download and which are just a file move out
+            # of the cache: it's the difference between a moment and a wait.
+            if r.action in (ACTION_INSTALL, ACTION_ACTIVATE,
+                            ACTION_UPDATE, ACTION_DOWNGRADE):
+                verb += "" if r.downloads else " (cached)"
+        tail = (f"  ({r.reason})"
+                if r.reason in ("dependency", "pinned", "recommended") else "")
+        return (r.mod_id + tail, r.server_version or "-",
+                r.client_version or "-", verb)
+
+    def _tag(self, mod_id):
+        state = self._progress.get(mod_id)
+        if state:
+            return "done" if state == "done" else "working"
+        r = self._rows[mod_id]
+        if mod_id in self._keep:
+            return "kept"
+        if r.recommended:
+            # Overruled either way reads as a deliberate choice, not a change.
+            if mod_id in self._skip:
+                return "same" if r.action == ACTION_SKIPPED else "kept"
+            return "add" if r.action == ACTION_SKIPPED else self._TAGS.get(r.action, "same")
+        return self._TAGS.get(r.action, "same")
+
+    def _populate(self):
+        keep_sel = self._selected()
+        self._tree.delete(*self._tree.get_children())
+        for mod_id in self._order:
+            self._tree.insert("", "end", iid=mod_id, values=self._values(mod_id),
+                              tags=(self._tag(mod_id),))
+        if keep_sel and self._tree.exists(keep_sel):
+            self._tree.selection_set(keep_sel)
+        self._sync_buttons()
+
+    def _selected(self):
+        sel = self._tree.selection()
+        return sel[0] if sel else None
+
+    def _sync_buttons(self):
+        # Nothing here is choosable while the render is running: the rows are a
+        # report at that point, not a proposal.
+        if self._applying:
+            return
+        mod_id = self._selected()
+        r = self._rows.get(mod_id) if mod_id else None
+        self._detail.set(r.note if r and r.note else "")
+        if r is None or not r.optional:
+            self._toggle_btn.config(state="disabled", text="Keep this one")
+        elif r.recommended:
+            # The choice runs the other way here: the default is to install, and
+            # the button offers to do without.
+            self._toggle_btn.config(
+                state="normal",
+                text="Install it" if mod_id in self._skip else "Skip this one")
+        else:
+            self._toggle_btn.config(
+                state="normal",
+                text="Deactivate it" if mod_id in self._keep else "Keep this one")
+        # A required mod nobody can supply can't be resolved by pressing Apply,
+        # so the button says so rather than failing after the fact.
+        blocked = any(r2.blocking for r2 in self._rows.values())
+        self._apply_btn.config(state="disabled" if blocked else "normal",
+                               text="Can't apply" if blocked else "Apply changes")
+
+    def _on_toggle(self):
+        mod_id = self._selected()
+        r = self._rows.get(mod_id) if mod_id else None
+        if self._applying or r is None or not r.optional:
+            return
+        target = self._skip if r.recommended else self._keep
+        target.discard(mod_id) if mod_id in target else target.add(mod_id)
+        self._populate()
+
+    def _on_apply(self):
+        if self._applying or any(r.blocking for r in self._rows.values()):
+            return
+        # Bring the plan in line with the screen, so what gets rendered is what
+        # was shown. Kept mods come out of to_deactivate and stay where they are;
+        # skipped recommendations come out of entries and are never fetched.
+        #
+        # A skipped mod's own dependencies stay planned in, since nothing here
+        # knows which root pulled which dependency. They're harmless (installed
+        # and enabled, just unused) and the next join drops them on its own,
+        # having resolved the active set without that root in the first place.
+        self._plan.to_deactivate = [m for m in self._plan.to_deactivate
+                                    if m not in self._keep]
+        self._plan.entries = [e for e in self._plan.entries
+                              if e.mod_id not in self._skip]
+        # What the caller should remember for this server, including choices
+        # taken back: a row toggled off _skip drops out of here too.
+        self.declined = sorted(self._skip)
+        if self._apply_action is None:
+            self.result = True
+            self.destroy()
+            return
+        self._begin_apply()
+        self._apply_action(self)
+
+    def _begin_apply(self):
+        """Turn the proposal into a progress view. Closing is off for the
+        duration: render_active_set has no abort, and a Mods/ folder caught
+        half-rendered is worse than waiting."""
+        self._applying = True
+        self.apply_attempted = True
+        self._steps_done = 0
+        self._steps_total = render_plan_steps(self._plan)
+        self._toggle_btn.config(state="disabled")
+        self._apply_btn.config(state="disabled", text="Applying…")
+        self._cancel_btn.config(state="disabled")
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
+        self._detail.set("")
+        self._status_lbl.config(fg=MUTED)
+        self._status.set("Starting…")
+        self._status_lbl.pack(anchor="w", fill="x", padx=16, pady=(6,2),
+                              before=self._btn_bar)
+        self._bar.pack(fill="x", padx=16, pady=(0,4), before=self._btn_bar)
+        self._draw_bar()
+        self._populate()
+
+    # Driven by whoever runs the render, from the UI thread.
+
+    def set_status(self, message):
+        """The line of detail under the table: which file, how far into it."""
+        if self._closed:
+            return
+        self._status.set(message)
+
+    def set_step(self, item_id, state):
+        """One item starting or finishing, as render_active_set reports them.
+        Ids with no row of their own (libraries) still move the bar; they just
+        have nothing to mark."""
+        if self._closed:
+            return
+        if state == "done":
+            self._steps_done += 1
+            self._draw_bar()
+        if item_id in self._rows:
+            self._progress[item_id] = state
+            if self._tree.exists(item_id):
+                self._tree.item(item_id, values=self._values(item_id),
+                                tags=(self._tag(item_id),))
+
+    def apply_finished(self, ok, message=""):
+        """The render is over. On success with close_on_success the window gets
+        out of the way so the caller can carry on; otherwise the outcome stays
+        on screen, which is the whole point of not using a popup."""
+        if self._closed:
+            return
+        self._applying = False
+        self.result = bool(ok)
+        if ok:
+            self._steps_done = self._steps_total
+            self._draw_bar()
+        if ok and self._close_on_success:
+            self.destroy()
+            return
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._status_lbl.config(fg=GREEN if ok else RED)
+        self._status.set(message or ("Done." if ok else "Couldn't apply the changes."))
+        self._apply_btn.config(state="disabled", text="Applied" if ok else "Not applied")
+        self._cancel_btn.config(state="normal", text="Close")
+
+    def _on_cancel(self):
+        if self._applying:
+            return
+        self.result = False
+        self.destroy()
+
+    def _on_close(self):
+        self.destroy()
+
+    def destroy(self):
+        # on_cancel means "the caller isn't getting an applied plan", so it
+        # fires for a cancel, the X, and closing after a failed apply, but never
+        # after a successful one. Once only, whichever of those happens.
+        first = not self._closed
+        self._closed = True
+        super().destroy()
+        if first and not self.result and self._on_cancel_cb:
+            self._on_cancel_cb(self)
 
 
 class CommunityModsWindow(tk.Toplevel):

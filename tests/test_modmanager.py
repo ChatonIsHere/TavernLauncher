@@ -39,6 +39,7 @@ def manifest_dict(mod_id, version, **over):
         "description": "",
         "client_side": True,
         "server_side": True,
+        "parity_required": True,
         "dependencies": {},
         "library_dependencies": [],
         "download_url": f"https://github.com/{author}/{repo}/releases/download/v{version}/{mod_id}.dll",
@@ -60,9 +61,11 @@ def summary(mod_id, versions, client=True, server=True, source=DEFAULT, name=Non
         versions=list(versions), source_repo=source)
 
 
-def slim_entry(versions, name="M", author="a", description="", client=True, server=True):
+def slim_entry(versions, name="M", author="a", description="", client=True, server=True,
+               parity_required=True):
     return {"name": name, "author": author, "description": description,
-            "client_side": client, "server_side": server, "versions": list(versions)}
+            "client_side": client, "server_side": server,
+            "parity_required": parity_required, "versions": list(versions)}
 
 
 def slim_index(mods):
@@ -591,8 +594,32 @@ class HandshakeSnapshot(_FakeInstallFixture, unittest.TestCase):
         self.assertTrue(entries[0]["client_side"])
         self.assertTrue(entries[0]["server_side"])
 
-        expected = hashlib.sha256(b"a.a@2.1.0\nz.z@1.0.0").hexdigest()
+        expected = hashlib.sha256(b"a.a@2.1.0@req\nz.z@1.0.0@req").hexdigest()
         self.assertEqual(mods_hash, expected)
+
+    def test_hash_changes_when_only_parity_changes(self):
+        """The client caches the whole mod list against this hash, so a server
+        flipping a mod between required and recommended - which needs no version
+        bump - has to invalidate that cache. Otherwise a client keeps planning
+        against the old answer and can skip a mod that became mandatory."""
+        self._publish("p.p", "1.0.0")
+        mm.install_mod_closure(self.game, summary("p.p", ["1.0.0"]), [summary("p.p", ["1.0.0"])],
+                               [self.BASE], self.progress.append)
+        before, _, entries = mm.handshake_snapshot(self.game)
+        self.assertIs(entries[0]["parity_required"], True)
+
+        # Same mod, same version, parity relaxed - exactly the case a version
+        # comparison can't see.
+        record_path = mm._mod_record_path(self.game, "p.p")
+        with io.open(record_path, encoding="utf-8") as f:
+            record = json.load(f)
+        record["parity_required"] = False
+        with io.open(record_path, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+
+        after, _, entries = mm.handshake_snapshot(self.game)
+        self.assertIs(entries[0]["parity_required"], False)
+        self.assertNotEqual(before, after)
 
     def test_disabled_mod_excluded_from_snapshot(self):
         self._publish("d.d", "1.0.0")
@@ -745,7 +772,7 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
 
     def test_required_mod_becomes_active_entry(self):
         self._publish("req.m", "1.0.0")
-        server_mods = [{"id": "req.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        server_mods = [{"id": "req.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
         index = [summary("req.m", ["1.0.0"])]
 
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
@@ -759,7 +786,7 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
         self.assertFalse(entry.active)
 
     def test_server_side_only_mod_not_required(self):
-        server_mods = [{"id": "srv.m", "version": "1.0.0", "client_side": False, "server_side": True}]
+        server_mods = [{"id": "srv.m", "version": "1.0.0", "client_side": False, "server_side": True, "parity_required": True}]
         plan = mm.plan_join(self.game, server_mods, [], [self.BASE])
         self.assertEqual(plan.entries, [])
         self.assertEqual(plan.missing, [])
@@ -767,7 +794,7 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
     def test_dependency_pulled_in_with_reason_dependency(self):
         self._publish("dep.k", "1.0.0")
         self._publish("root.m", "1.0.0", dependencies={"dep.k": "1.0.0"})
-        server_mods = [{"id": "root.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        server_mods = [{"id": "root.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
         index = [summary("dep.k", ["1.0.0"]), summary("root.m", ["1.0.0"])]
 
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
@@ -775,7 +802,7 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
                          {"root.m": "required", "dep.k": "dependency"})
 
     def test_missing_required_mod_blocks_with_no_hint(self):
-        server_mods = [{"id": "ghost.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        server_mods = [{"id": "ghost.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
         plan = mm.plan_join(self.game, server_mods, [], [self.BASE])
         self.assertTrue(plan.blocking)
         self.assertEqual(plan.missing, [("ghost.m", "1.0.0")])
@@ -783,7 +810,8 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
 
     def test_needs_repo_when_hint_names_unadded_repo_not_blocking(self):
         server_mods = [{"id": "elsewhere.m", "version": "1.0.0", "client_side": True,
-                        "server_side": True, "source_repo": self.OTHER}]
+                        "server_side": True, "parity_required": True,
+                        "source_repo": self.OTHER}]
         plan = mm.plan_join(self.game, server_mods, [], [self.BASE])
         self.assertFalse(plan.blocking)
         self.assertEqual(plan.missing, [])
@@ -807,7 +835,7 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
 
     def test_pin_conflict_when_server_requires_a_different_exact_version(self):
         self._publish("conf.m", "2.0.0")
-        server_mods = [{"id": "conf.m", "version": "2.0.0", "client_side": True, "server_side": True}]
+        server_mods = [{"id": "conf.m", "version": "2.0.0", "client_side": True, "server_side": True, "parity_required": True}]
         index = [summary("conf.m", ["1.0.0", "2.0.0"])]
 
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE], pinned=["conf.m@1.0.0"])
@@ -819,7 +847,7 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
 
     def test_active_true_when_already_installed_at_matching_version(self):
         self._install("act.m", "1.0.0")
-        server_mods = [{"id": "act.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        server_mods = [{"id": "act.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
         index = [summary("act.m", ["1.0.0"])]
 
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
@@ -830,7 +858,7 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
         self._install("cch.m", "1.0.0")
         mm.cache_store_mod(self.game, "cch.m")
         mm.uninstall_mod(self.game, "cch.m")
-        server_mods = [{"id": "cch.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        server_mods = [{"id": "cch.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
         index = [summary("cch.m", ["1.0.0"])]
 
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
@@ -853,11 +881,156 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
         lib_url = "https://x/PlanLib.dll"
         lib = {"name": "PlanLib", "download_url": lib_url, "sha256": "", "filename": "PlanLib.dll"}
         self._publish("root.m", "1.0.0", library_dependencies=[dict(lib)])
-        server_mods = [{"id": "root.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        server_mods = [{"id": "root.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
         index = [summary("root.m", ["1.0.0"])]
 
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
         self.assertEqual([l.filename for l in plan.libraries], ["PlanLib.dll"])
+
+
+class ModDiff(_FakeInstallFixture, unittest.TestCase):
+    """build_mod_diff: the client-vs-server comparison the diff window renders.
+    Pure, so none of this needs a display."""
+
+    def setUp(self):
+        super().setUp()
+        self.data_dir = tempfile.mkdtemp(prefix="tavern_appdata_")
+        self._saved_data_dir = mm._tavern_data_dir
+        mm._tavern_data_dir = lambda: self.data_dir
+        self.addCleanup(lambda: setattr(mm, "_tavern_data_dir", self._saved_data_dir))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data_dir, ignore_errors=True))
+
+    def _install(self, mod_id, version, **over):
+        self._publish(mod_id, version, **over)
+        mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
+                               [self.BASE], self.progress.append)
+
+    def _diff(self, server_mods, index):
+        plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
+        return {r.mod_id: r for r in mm.build_mod_diff(self.game, server_mods, plan)}, plan
+
+    @staticmethod
+    def _srv(mod_id, version, client=True, server=True, required=None):
+        return {"id": mod_id, "version": version,
+                "client_side": client, "server_side": server,
+                "parity_required": True if required is None else required}
+
+    def test_not_installed_is_an_install(self):
+        self._publish("d.new", "1.0.0")
+        rows, _ = self._diff([self._srv("d.new", "1.0.0")], [summary("d.new", ["1.0.0"])])
+        self.assertEqual(rows["d.new"].action, mm.ACTION_INSTALL)
+        self.assertEqual(rows["d.new"].server_version, "1.0.0")
+        self.assertEqual(rows["d.new"].client_version, "")
+
+    def test_matching_version_is_a_match(self):
+        self._install("d.same", "1.0.0")
+        rows, _ = self._diff([self._srv("d.same", "1.0.0")], [summary("d.same", ["1.0.0"])])
+        self.assertEqual(rows["d.same"].action, mm.ACTION_MATCH)
+        self.assertEqual(rows["d.same"].client_version, "1.0.0")
+
+    def test_older_installed_is_an_update_newer_is_a_downgrade(self):
+        index = [summary("d.up", ["1.0.0"]), summary("d.up", ["2.0.0"])]
+        self._install("d.up", "1.0.0")
+        self._publish("d.up", "2.0.0")
+        rows, _ = self._diff([self._srv("d.up", "2.0.0")], index)
+        self.assertEqual(rows["d.up"].action, mm.ACTION_UPDATE)
+
+        # The same pair the other way round: the client is ahead and the server
+        # pins the older build, which parity makes mandatory rather than optional.
+        self._install("d.up", "2.0.0")
+        rows, _ = self._diff([self._srv("d.up", "1.0.0")], index)
+        self.assertEqual(rows["d.up"].action, mm.ACTION_DOWNGRADE)
+        self.assertEqual(rows["d.up"].client_version, "2.0.0")
+        self.assertEqual(rows["d.up"].server_version, "1.0.0")
+        self.assertFalse(rows["d.up"].optional)
+
+    def test_installed_but_disabled_is_an_enable(self):
+        self._install("d.off", "1.0.0")
+        mm.disable_mod(self.game, "d.off")
+        rows, _ = self._diff([self._srv("d.off", "1.0.0")], [summary("d.off", ["1.0.0"])])
+        self.assertEqual(rows["d.off"].action, mm.ACTION_ENABLE)
+        self.assertFalse(rows["d.off"].client_enabled)
+
+    def test_cached_version_activates_rather_than_downloads(self):
+        self._install("d.cch", "1.0.0")
+        mm.cache_store_mod(self.game, "d.cch")
+        mm.uninstall_mod(self.game, "d.cch")
+        rows, _ = self._diff([self._srv("d.cch", "1.0.0")], [summary("d.cch", ["1.0.0"])])
+        row = rows["d.cch"]
+        self.assertEqual(row.action, mm.ACTION_ACTIVATE)
+        self.assertTrue(row.cached)
+        self.assertFalse(row.downloads)     # a file move, no bytes fetched
+
+    def test_downloads_flag_marks_only_rows_that_fetch_bytes(self):
+        self._publish("d.dl", "1.0.0")
+        rows, _ = self._diff([self._srv("d.dl", "1.0.0")], [summary("d.dl", ["1.0.0"])])
+        self.assertTrue(rows["d.dl"].downloads)      # not here and not cached
+
+        # An uncached update fetches; a match or a deactivate never does.
+        self._install("d.upd", "1.0.0")
+        self._publish("d.upd", "2.0.0")
+        rows, _ = self._diff([self._srv("d.upd", "2.0.0")],
+                             [summary("d.upd", ["1.0.0"]), summary("d.upd", ["2.0.0"])])
+        self.assertTrue(rows["d.upd"].downloads)
+
+        self._install("d.ok", "1.0.0")
+        rows, _ = self._diff([self._srv("d.ok", "1.0.0")], [summary("d.ok", ["1.0.0"])])
+        self.assertFalse(rows["d.ok"].downloads)
+
+    def test_extra_client_mod_is_an_optional_deactivate(self):
+        self._install("d.mine", "1.0.0")
+        self._publish("d.theirs", "1.0.0")
+        rows, _ = self._diff([self._srv("d.theirs", "1.0.0")],
+                             [summary("d.theirs", ["1.0.0"])])
+        mine = rows["d.mine"]
+        self.assertEqual(mine.action, mm.ACTION_DEACTIVATE)
+        # The server never checks a mod it doesn't run, so this one is the
+        # player's call rather than something applied silently.
+        self.assertTrue(mine.optional)
+        self.assertEqual(mine.server_version, "")
+        self.assertFalse(rows["d.theirs"].optional)
+
+    def test_server_only_mod_is_listed_but_not_required(self):
+        rows, _ = self._diff([self._srv("d.srv", "1.0.0", client=False, server=True)], [])
+        self.assertEqual(rows["d.srv"].action, mm.ACTION_SERVER_ONLY)
+        self.assertEqual(rows["d.srv"].client_version, "")
+        self.assertFalse(rows["d.srv"].blocking)
+
+    def test_unresolvable_required_mod_blocks(self):
+        rows, plan = self._diff([self._srv("d.gone", "1.0.0")], [])
+        self.assertEqual(rows["d.gone"].action, mm.ACTION_MISSING)
+        self.assertTrue(rows["d.gone"].blocking)
+        self.assertTrue(plan.blocking)
+
+    def test_needs_repo_row_names_the_source_to_add(self):
+        server_mods = [{"id": "d.other", "version": "1.0.0", "client_side": True,
+                        "server_side": True, "parity_required": True,
+                        "source_repo": OTHER}]
+        rows, plan = self._diff(server_mods, [])
+        row = rows["d.other"]
+        self.assertEqual(row.action, mm.ACTION_NEEDS_REPO)
+        self.assertFalse(row.blocking)      # informational, not a launch stopper
+        self.assertIn(mm._repo_shorthand(OTHER), row.note)
+
+    def test_problems_sort_above_changes_and_matches(self):
+        self._install("d.keep", "1.0.0")     # becomes an optional deactivate
+        self._publish("d.add", "1.0.0")
+        server_mods = [self._srv("d.add", "1.0.0"), self._srv("d.gone", "1.0.0")]
+        plan = mm.plan_join(self.game, server_mods, [summary("d.add", ["1.0.0"])], [self.BASE])
+        order = [r.action for r in mm.build_mod_diff(self.game, server_mods, plan)]
+        self.assertEqual(order[0], mm.ACTION_MISSING)
+        self.assertLess(order.index(mm.ACTION_INSTALL), order.index(mm.ACTION_DEACTIVATE))
+
+    def test_pin_conflict_annotates_the_row_without_duplicating_it(self):
+        self._publish("d.pin", "1.0.0")
+        self._publish("d.pin", "2.0.0")
+        index = [summary("d.pin", ["1.0.0"]), summary("d.pin", ["2.0.0"])]
+        server_mods = [self._srv("d.pin", "1.0.0")]
+        plan = mm.plan_join(self.game, server_mods, index, [self.BASE], pinned=["d.pin@2.0.0"])
+        rows = mm.build_mod_diff(self.game, server_mods, plan)
+        self.assertEqual(len([r for r in rows if r.mod_id == "d.pin"]), 1)
+        self.assertIn("2.0.0", rows[0].note)
+        self.assertIn("1.0.0", rows[0].note)
 
 
 class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
@@ -879,7 +1052,7 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
 
     def test_downloads_missing_required_mod_and_caches_it(self):
         self._publish("dl.m", "1.0.0")
-        server_mods = [{"id": "dl.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        server_mods = [{"id": "dl.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
         index = [summary("dl.m", ["1.0.0"])]
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
 
@@ -892,7 +1065,7 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
         mm.cache_store_mod(self.game, "cch.m")
         mm.uninstall_mod(self.game, "cch.m")
 
-        server_mods = [{"id": "cch.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        server_mods = [{"id": "cch.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
         index = [summary("cch.m", ["1.0.0"])]
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
         downloads_before = len(self.dl_dirs)
@@ -916,7 +1089,7 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
         mm.adopt_installed_mods(self.game)
         self.assertTrue(os.path.isdir(mm._cache_mod_dir("adopt.m", "1.0.0")))
 
-        server_mods = [{"id": "adopt.m", "version": "2.0.0", "client_side": True, "server_side": True}]
+        server_mods = [{"id": "adopt.m", "version": "2.0.0", "client_side": True, "server_side": True, "parity_required": True}]
         index = [summary("adopt.m", ["1.0.0"]), summary("adopt.m", ["2.0.0"])]
         mm.render_active_set(self.game, mm.plan_join(self.game, server_mods, index, [self.BASE]))
 
@@ -925,7 +1098,7 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
         self.assertTrue(os.path.isdir(mm._cache_mod_dir("adopt.m", "1.0.0")))
 
         # Dropping back to 1.0.0 is therefore a file move, not a download.
-        back = [{"id": "adopt.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        back = [{"id": "adopt.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
         plan_back = mm.plan_join(self.game, back, index, [self.BASE])
         self.assertTrue(plan_back.entries[0].cached)
         downloads_before = len(self.dl_dirs)
@@ -935,7 +1108,7 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
 
     def test_already_active_entry_is_left_alone(self):
         self._install("act.m", "1.0.0")
-        server_mods = [{"id": "act.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        server_mods = [{"id": "act.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
         index = [summary("act.m", ["1.0.0"])]
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
         downloads_before = len(self.dl_dirs)
@@ -944,23 +1117,74 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
         self.assertEqual(len(self.dl_dirs), downloads_before)
         self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "act.m", "act.m.dll")))
 
-    def test_deactivated_mod_removed_from_mods_but_stays_cached(self):
+    def test_deactivated_mod_is_disabled_not_uninstalled(self):
+        """Deactivating is a rename, not a delete. The mod stays installed and
+        listed, its files stay on disk, and only the record moves so
+        MelonLoader stops scanning the folder."""
         self._install("old.m", "1.0.0")
         plan = mm.plan_join(self.game, [], [], [self.BASE])   # nothing required -> deactivate everything
 
         mm.render_active_set(self.game, plan)
-        self.assertFalse(os.path.exists(os.path.join(self.game, "Mods", "old.m")))
-        self.assertTrue(os.path.isdir(mm._cache_mod_dir("old.m", "1.0.0")))
+        mod_dir = os.path.join(self.game, "Mods", "old.m")
+        self.assertTrue(os.path.isfile(os.path.join(mod_dir, "old.m.dll")))
+        self.assertFalse(os.path.isfile(os.path.join(mod_dir, mm.RECORD_NAME)))
+        self.assertTrue(os.path.isfile(os.path.join(mod_dir, mm.DISABLED_RECORD_NAME)))
 
-        # Recoverable later with no re-download.
-        mm.cache_restore_mod(self.game, "old.m", "1.0.0")
-        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "old.m", "old.m.dll")))
+        # Still installed, just not enabled - so it keeps its place in the list.
+        listed = {r["id"]: r for r in mm.list_installed_mods(self.game)}
+        self.assertIn("old.m", listed)
+        self.assertFalse(listed["old.m"]["enabled"])
+        # And not reported to a server, which is what makes the parity check pass.
+        self.assertEqual(mm.handshake_snapshot(self.game)[2], [])
+        # Cached all the same, so a version switch later is still a file move.
+        self.assertTrue(os.path.isdir(mm._cache_mod_dir("old.m", "1.0.0")))
+        # And a second sync finds nothing left to do, since to_deactivate only
+        # counts enabled mods. That's what stops it disabling the same mod forever.
+        self.assertEqual(mm.plan_join(self.game, [], [], [self.BASE]).to_deactivate, [])
+
+    def test_reactivating_a_disabled_mod_needs_no_download_or_cache_copy(self):
+        """The counterpart: a mod disabled at the version now wanted comes back
+        with a rename. Nothing is fetched, and it works with the cache emptied."""
+        self._install("back.m", "1.0.0")
+        mm.render_active_set(self.game, mm.plan_join(self.game, [], [], [self.BASE]))
+
+        # Wipe the cache to prove the files on disk are what's being reused.
+        __import__("shutil").rmtree(mm._cache_mod_dir("back.m", "1.0.0"))
+        downloads_before = len(self.dl_dirs)
+
+        server_mods = [{"id": "back.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        index = [summary("back.m", ["1.0.0"])]
+        plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
+        self.assertEqual([e.cached for e in plan.entries], [False])
+
+        mm.render_active_set(self.game, plan)
+        self.assertEqual(len(self.dl_dirs), downloads_before)
+        mod_dir = os.path.join(self.game, "Mods", "back.m")
+        self.assertTrue(os.path.isfile(os.path.join(mod_dir, mm.RECORD_NAME)))
+        self.assertFalse(os.path.isfile(os.path.join(mod_dir, mm.DISABLED_RECORD_NAME)))
+
+    def test_a_disabled_mod_at_the_wrong_version_still_switches_properly(self):
+        """Enabling in place is only right when the version already matches;
+        otherwise the wanted version has to come from the cache or the network."""
+        self._install("ver.m", "1.0.0")
+        self._publish("ver.m", "2.0.0")
+        mm.render_active_set(self.game, mm.plan_join(self.game, [], [], [self.BASE]))
+
+        server_mods = [{"id": "ver.m", "version": "2.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        index = [summary("ver.m", ["1.0.0"]), summary("ver.m", ["2.0.0"])]
+        mm.render_active_set(self.game, mm.plan_join(self.game, server_mods, index, [self.BASE]))
+
+        listed = {r["id"]: r for r in mm.list_installed_mods(self.game)}
+        self.assertTrue(listed["ver.m"]["enabled"])
+        self.assertEqual(listed["ver.m"]["version"], "2.0.0")
+        # The version it was disabled at is still cached, so switching back is a move.
+        self.assertTrue(os.path.isdir(mm._cache_mod_dir("ver.m", "1.0.0")))
 
     def test_library_downloaded_then_orphan_pruned_after_deactivation(self):
         lib_url = "https://x/Prune.dll"
         lib = {"name": "Prune", "download_url": lib_url, "sha256": "", "filename": "Prune.dll"}
         self._publish("lib.m", "1.0.0", library_dependencies=[dict(lib)])
-        server_mods = [{"id": "lib.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        server_mods = [{"id": "lib.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
         index = [summary("lib.m", ["1.0.0"])]
 
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
@@ -980,7 +1204,7 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
         lib_url = "https://x/Reuse.dll"
         lib = {"name": "Reuse", "download_url": lib_url, "sha256": "", "filename": "Reuse.dll"}
         self._publish("lib2.m", "1.0.0", library_dependencies=[dict(lib)])
-        server_mods = [{"id": "lib2.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        server_mods = [{"id": "lib2.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
         index = [summary("lib2.m", ["1.0.0"])]
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
         mm.render_active_set(self.game, plan)
@@ -997,12 +1221,321 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(self.game, "UserLibs", "Reuse.dll")))
 
     def test_blocking_plan_raises_and_changes_nothing(self):
-        server_mods = [{"id": "ghost.m", "version": "1.0.0", "client_side": True, "server_side": True}]
+        server_mods = [{"id": "ghost.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
         plan = mm.plan_join(self.game, server_mods, [], [self.BASE])
         self.assertTrue(plan.blocking)
         with self.assertRaises(mm.ModManagerError):
             mm.render_active_set(self.game, plan)
         self.assertFalse(os.path.exists(os.path.join(self.game, "Mods")))
+
+    # on_step / render_plan_steps: what ModDiffWindow shows progress from.
+
+    def _stepped(self, plan):
+        """Renders and returns the on_step calls in order."""
+        steps = []
+        mm.render_active_set(self.game, plan,
+                             on_step=lambda i, s: steps.append((i, s)))
+        return steps
+
+    def test_every_item_reports_a_start_and_a_done(self):
+        self._publish("step.a", "1.0.0")
+        self._publish("step.b", "1.0.0")
+        server_mods = [{"id": i, "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}
+                       for i in ("step.a", "step.b")]
+        index = [summary("step.a", ["1.0.0"]), summary("step.b", ["1.0.0"])]
+        plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
+
+        steps = self._stepped(plan)
+        self.assertEqual(steps, [("step.a", "start"), ("step.a", "done"),
+                                 ("step.b", "start"), ("step.b", "done")])
+
+    def test_deactivation_reports_a_step_too(self):
+        self._install("keep.m", "1.0.0")
+        self._install("drop.m", "1.0.0")
+        server_mods = [{"id": "keep.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        index = [summary("keep.m", ["1.0.0"])]
+        plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
+
+        self.assertEqual(plan.to_deactivate, ["drop.m"])
+        self.assertEqual(self._stepped(plan),
+                         [("drop.m", "start"), ("drop.m", "done")])
+
+    def test_step_count_matches_render_plan_steps_including_libraries(self):
+        """The bar is sized from render_plan_steps before anything runs, so the
+        two must agree exactly or it stalls short of the end or overshoots."""
+        lib = {"name": "Shared", "download_url": "https://x/Shared.dll",
+               "sha256": "", "filename": "Shared.dll"}
+        self._publish("libbed.m", "1.0.0", library_dependencies=[dict(lib)])
+        server_mods = [{"id": "libbed.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        index = [summary("libbed.m", ["1.0.0"])]
+        plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
+
+        self.assertEqual(mm.render_plan_steps(plan), 2)      # the mod + its library
+        steps = self._stepped(plan)
+        self.assertEqual([s for _, s in steps].count("done"), mm.render_plan_steps(plan))
+        self.assertIn(("Shared.dll", "done"), steps)
+
+    def test_library_already_active_still_reports_its_step(self):
+        """It's skipped for work, not for counting: a bar sized against
+        render_plan_steps would never fill if the skip stayed silent."""
+        lib = {"name": "Shared", "download_url": "https://x/Shared.dll",
+               "sha256": "", "filename": "Shared.dll"}
+        self._install("libbed.m", "1.0.0", library_dependencies=[dict(lib)])
+        server_mods = [{"id": "libbed.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        index = [summary("libbed.m", ["1.0.0"])]
+        plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
+
+        # Nothing to do for the mod itself, so the library is the whole render.
+        self.assertEqual([e.active for e in plan.entries], [True])
+        self.assertEqual(mm.render_plan_steps(plan), 1)
+        self.assertEqual(self._stepped(plan),
+                         [("Shared.dll", "start"), ("Shared.dll", "done")])
+
+    def test_rendering_without_a_step_hook_still_works(self):
+        self._publish("nohook.m", "1.0.0")
+        server_mods = [{"id": "nohook.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        index = [summary("nohook.m", ["1.0.0"])]
+        mm.render_active_set(self.game, mm.plan_join(self.game, server_mods, index, [self.BASE]))
+        self.assertTrue(os.path.isdir(os.path.join(self.game, "Mods", "nohook.m")))
+
+
+class Parity(_FakeInstallFixture, unittest.TestCase):
+    """parity: whether a server running a mod obliges the client to match it.
+
+    "required" is the old behaviour and the default, so anything published
+    before the field existed keeps the guarantee it shipped with. "optional"
+    means the server won't refuse a join over it, so the client is offered it
+    and may decline."""
+
+    def setUp(self):
+        super().setUp()
+        self.data_dir = tempfile.mkdtemp(prefix="tavern_appdata_")
+        self._saved_data_dir = mm._tavern_data_dir
+        mm._tavern_data_dir = lambda: self.data_dir
+        self.addCleanup(lambda: setattr(mm, "_tavern_data_dir", self._saved_data_dir))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data_dir, ignore_errors=True))
+
+    def _install(self, mod_id, version, **over):
+        self._publish(mod_id, version, **over)
+        mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
+                               [self.BASE], self.progress.append)
+
+    @staticmethod
+    def _srv(mod_id, version, required=None, client=True, server=True):
+        return {"id": mod_id, "version": version,
+                "client_side": client, "server_side": server,
+                "parity_required": True if required is None else required}
+
+    # -- reading the value ---------------------------------------------------
+
+    def test_absent_parity_is_an_error_not_a_default(self):
+        """No default anywhere. Guessing is the one mistake that matters here,
+        since this decides whether a joining client is obliged to match."""
+        with self.assertRaises(mm.ModManagerError) as caught:
+            mm.parity_required({"id": "a.b"})
+        self.assertIn("parity_required", str(caught.exception))
+
+    def test_unknown_parity_reads_as_required(self):
+        """Present but malformed still fails closed: an unreviewed source must
+        not be able to downgrade a mod the server needs by inventing a value."""
+        for bad in ("false", "", None, 0, [], "optional"):
+            self.assertTrue(mm.parity_required({"parity_required": bad}), bad)
+
+    def test_only_a_real_false_relaxes_it(self):
+        self.assertFalse(mm.parity_required({"parity_required": False}))
+
+    def test_a_manifest_without_the_field_is_rejected(self):
+        """Published manifests must state it outright. The lenient reader above
+        is for places it can legitimately be absent - a record written before
+        the field existed, an older server's handshake entry - not for a
+        manifest being published now."""
+        d = manifest_dict("no.parity", "1.0.0")
+        d.pop("parity_required")
+        with self.assertRaises(mm.ModManagerError) as caught:
+            mm._manifest_from_dict(d, self.BASE)
+        self.assertIn("parity_required", str(caught.exception))
+
+    def test_a_record_without_the_field_is_ignored_not_assumed(self):
+        """A record predating the field can't be read, so the mod counts as not
+        installed rather than being assumed required. Recoverable: the next plan
+        reinstalls it and the new record carries the field."""
+        self._install("p.old", "1.0.0")
+        record_path = mm._mod_record_path(self.game, "p.old")
+        with io.open(record_path, encoding="utf-8") as f:
+            record = json.load(f)
+        del record["parity_required"]
+        with io.open(record_path, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+
+        self.assertEqual(mm.list_installed_mods(self.game), [])
+        self.assertEqual(mm.handshake_snapshot(self.game)[2], [])
+        # The files are still there, so reinstalling is what fixes it.
+        self.assertTrue(os.path.isdir(mm._mod_dir_path(self.game, "p.old")))
+
+    def test_an_index_entry_without_the_field_is_skipped(self):
+        d = {"name": "M", "author": "a", "description": "",
+             "client_side": True, "server_side": True, "versions": ["1.0.0"]}
+        self.assertIsNone(mm._summary_from_dict(d, "no.parity", self.BASE))
+        d["parity_required"] = True
+        self.assertIsNotNone(mm._summary_from_dict(d, "no.parity", self.BASE))
+
+    def test_a_server_entry_without_the_field_fails_the_plan(self):
+        """A server on an older TavernLib can't be planned against, rather than
+        having its requirements guessed at."""
+        with self.assertRaises(mm.ModManagerError):
+            mm.plan_join(self.game,
+                         [{"id": "p.x", "version": "1.0.0",
+                           "client_side": True, "server_side": True}],
+                         [], [self.BASE])
+
+    # -- carrying it through -------------------------------------------------
+
+    def test_manifest_parity_reaches_the_install_record_and_the_handshake(self):
+        self._install("p.opt", "1.0.0", parity_required=False)
+        self._install("p.req", "1.0.0")
+
+        rec = mm._read_mod_record(self.game, "p.opt")
+        self.assertIs(rec["parity_required"], False)
+
+        _, _, mods = mm.handshake_snapshot(self.game)
+        by_id = {m["id"]: m for m in mods}
+        self.assertIs(by_id["p.opt"]["parity_required"], False)
+        self.assertIs(by_id["p.req"]["parity_required"], True)
+
+    # -- planning ------------------------------------------------------------
+
+    def test_optional_mod_is_planned_in_by_default(self):
+        """Recommended still means installed unless the user says otherwise."""
+        self._publish("p.rec", "1.0.0", parity_required=False)
+        plan = mm.plan_join(self.game, [self._srv("p.rec", "1.0.0", required=False)],
+                            [summary("p.rec", ["1.0.0"])], [self.BASE])
+        self.assertEqual([(e.mod_id, e.reason) for e in plan.entries],
+                         [("p.rec", "recommended")])
+        self.assertEqual(plan.declined, [])
+
+    def test_declining_leaves_an_optional_mod_out_of_the_plan(self):
+        self._publish("p.rec", "1.0.0", parity_required=False)
+        plan = mm.plan_join(self.game, [self._srv("p.rec", "1.0.0", required=False)],
+                            [summary("p.rec", ["1.0.0"])], [self.BASE],
+                            declined=["p.rec"])
+        self.assertEqual(plan.entries, [])
+        self.assertEqual(plan.declined, [("p.rec", "1.0.0")])
+
+    def test_declining_a_required_mod_is_ignored(self):
+        """No client-side choice can make that join work, so pretending it can
+        would just move the rejection to the server."""
+        self._publish("p.req", "1.0.0")
+        plan = mm.plan_join(self.game, [self._srv("p.req", "1.0.0", required=True)],
+                            [summary("p.req", ["1.0.0"])], [self.BASE],
+                            declined=["p.req"])
+        self.assertEqual([e.mod_id for e in plan.entries], ["p.req"])
+        self.assertEqual(plan.declined, [])
+
+    def test_declining_never_deactivates_something_already_installed(self):
+        """Declining is 'don't add it', not 'take it away'."""
+        self._install("p.rec", "1.0.0", parity_required=False)
+        plan = mm.plan_join(self.game, [self._srv("p.rec", "1.0.0", required=False)],
+                            [summary("p.rec", ["1.0.0"])], [self.BASE],
+                            declined=["p.rec"])
+        self.assertEqual(plan.to_deactivate, [])
+        self.assertEqual(plan.entries, [])
+
+    def test_an_unresolvable_optional_mod_does_not_block(self):
+        """Required and unresolvable blocks the join; recommended just doesn't
+        happen, since the server allows a client not to have it."""
+        plan = mm.plan_join(self.game, [self._srv("p.gone", "1.0.0", required=False)],
+                            [], [self.BASE])
+        self.assertFalse(plan.blocking)
+        self.assertEqual(plan.missing, [])
+        self.assertEqual(plan.entries, [])
+
+    def test_an_unresolvable_required_mod_still_blocks(self):
+        plan = mm.plan_join(self.game, [self._srv("p.gone", "1.0.0", required=True)],
+                            [], [self.BASE])
+        self.assertTrue(plan.blocking)
+        self.assertEqual(plan.missing, [("p.gone", "1.0.0")])
+
+    def test_a_server_mod_with_no_parity_field_is_still_required(self):
+        plan = mm.plan_join(self.game, [self._srv("p.old", "1.0.0")], [], [self.BASE])
+        self.assertTrue(plan.blocking)
+
+    # -- the comparison ------------------------------------------------------
+
+    def test_recommended_rows_are_the_users_call_required_ones_are_not(self):
+        self._publish("p.rec", "1.0.0", parity_required=False)
+        self._publish("p.req", "1.0.0")
+        server_mods = [self._srv("p.rec", "1.0.0", required=False),
+                       self._srv("p.req", "1.0.0", required=True)]
+        index = [summary("p.rec", ["1.0.0"]), summary("p.req", ["1.0.0"])]
+        plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
+        rows = {r.mod_id: r for r in mm.build_mod_diff(self.game, server_mods, plan)}
+
+        self.assertTrue(rows["p.rec"].optional)
+        self.assertTrue(rows["p.rec"].recommended)
+        self.assertIn("doesn't require it", rows["p.rec"].note)
+        self.assertFalse(rows["p.req"].optional)
+        self.assertFalse(rows["p.req"].recommended)
+
+    def test_a_declined_mod_gets_a_row_so_the_choice_can_be_taken_back(self):
+        self._publish("p.rec", "1.0.0", parity_required=False)
+        server_mods = [self._srv("p.rec", "1.0.0", required=False)]
+        plan = mm.plan_join(self.game, server_mods, [summary("p.rec", ["1.0.0"])],
+                            [self.BASE], declined=["p.rec"])
+        rows = {r.mod_id: r for r in mm.build_mod_diff(self.game, server_mods, plan)}
+
+        self.assertEqual(rows["p.rec"].action, mm.ACTION_SKIPPED)
+        self.assertTrue(rows["p.rec"].optional)
+        self.assertTrue(rows["p.rec"].recommended)
+        self.assertEqual(rows["p.rec"].server_version, "1.0.0")
+
+    def test_an_already_matching_recommended_mod_is_not_offered_as_a_choice(self):
+        """Nothing to decide: it's installed, current, and the server is happy."""
+        self._install("p.rec", "1.0.0", parity_required=False)
+        server_mods = [self._srv("p.rec", "1.0.0", required=False)]
+        plan = mm.plan_join(self.game, server_mods, [summary("p.rec", ["1.0.0"])],
+                            [self.BASE])
+        rows = {r.mod_id: r for r in mm.build_mod_diff(self.game, server_mods, plan)}
+        self.assertEqual(rows["p.rec"].action, mm.ACTION_MATCH)
+        self.assertFalse(rows["p.rec"].optional)
+
+    # -- remembering the choice ----------------------------------------------
+
+    def _cfg(self):
+        """set_declined saves through the host's save_cfg, so wire a recorder in
+        its place and hand back the dict it writes to."""
+        saved = []
+        self._saved_save_cfg = mm._save_cfg
+        mm._save_cfg = saved.append
+        self.addCleanup(lambda: setattr(mm, "_save_cfg", self._saved_save_cfg))
+        return {}, saved
+
+    def test_declines_are_stored_per_server(self):
+        cfg, _ = self._cfg()
+        mm.set_declined(cfg, "one.example", ["a.b"])
+        mm.set_declined(cfg, "two.example", ["c.d"])
+        self.assertEqual(mm.list_declined(cfg, "one.example"), ["a.b"])
+        self.assertEqual(mm.list_declined(cfg, "two.example"), ["c.d"])
+        self.assertEqual(mm.list_declined(cfg, "never.seen"), [])
+
+    def test_setting_declines_replaces_rather_than_merges(self):
+        """The window hands back the whole set each time, so taking a choice
+        back has to actually remove it."""
+        cfg, _ = self._cfg()
+        mm.set_declined(cfg, "one.example", ["a.b", "c.d"])
+        mm.set_declined(cfg, "one.example", ["a.b"])
+        self.assertEqual(mm.list_declined(cfg, "one.example"), ["a.b"])
+
+    def test_a_server_with_nothing_declined_leaves_no_entry_behind(self):
+        cfg, _ = self._cfg()
+        mm.set_declined(cfg, "one.example", ["a.b"])
+        mm.set_declined(cfg, "one.example", [])
+        self.assertEqual(cfg[mm.CFG_DECLINED_KEY], {})
+
+    def test_the_choice_is_actually_persisted_not_just_held_in_memory(self):
+        cfg, saved = self._cfg()
+        mm.set_declined(cfg, "one.example", ["a.b"])
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0][mm.CFG_DECLINED_KEY], {"one.example": ["a.b"]})
 
 
 class ResolveMissingMods(_FakeInstallFixture, unittest.TestCase):
