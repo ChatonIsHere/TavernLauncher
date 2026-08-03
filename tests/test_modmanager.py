@@ -199,6 +199,14 @@ class RepoSourcesConfig(unittest.TestCase):
         self.assertEqual(mm._repo_shorthand(OTHER), "someone/theirmods")
         self.assertEqual(mm._repo_shorthand(mm.DEFAULT_REPO), "ChatonIsHere/CommunityMods")
 
+    def test_source_display_github_uses_shorthand(self):
+        self.assertEqual(mm._source_display(OTHER), "someone/theirmods")
+        self.assertEqual(mm._source_display(mm.DEFAULT_REPO), "ChatonIsHere/CommunityMods")
+
+    def test_source_display_non_github_uses_full_url(self):
+        url = "https://example.com/mods/someone/theirmods"
+        self.assertEqual(mm._source_display(url), url)
+
     def test_add_repo_stores_by_shorthand(self):
         cfg = {}
         mm.add_repo(cfg, OTHER)
@@ -448,6 +456,15 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
         self.assertNotIn("version", lib_meta)
         self.assertNotIn("source_repo", lib_meta)
         self.assertTrue(any(m.startswith("[3/3]") for m in self.progress))
+
+    def test_install_closure_explicit_version_overrides_highest(self):
+        self._publish("v.v", "1.0.0")
+        self._publish("v.v", "2.0.0")
+        index = [summary("v.v", ["1.0.0", "2.0.0"])]
+        mm.install_mod_closure(self.game, summary("v.v", ["1.0.0", "2.0.0"]), index,
+                               [self.BASE], self.progress.append, version="1.0.0")
+        mod_meta = read_json(os.path.join(self.game, "Mods", "v.v", "manifest.json"))
+        self.assertEqual(mod_meta["version"], "1.0.0")
 
     def test_checksum_mismatch_aborts_leaving_nothing(self):
         d = self._publish("bad.m", "1.0.0")
@@ -1665,6 +1682,54 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         mm.apply_import(self.game, plan, self.progress.append)
         self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "root.m", "root.m.dll")))
         self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "dep.k", "dep.k.dll")))
+
+    def test_apply_import_disables_installed_mods_not_in_list(self):
+        self._install("keep.m", "1.0.0")
+        self._install("drop.m", "1.0.0")
+        self._publish_latest("keep.m", "1.0.0")
+        modlist = {"schema": 1, "repos": [], "mods": ["keep.m"]}
+        plan = mm.import_modlist(modlist, [], [self.BASE])
+
+        mm.apply_import(self.game, plan, self.progress.append)
+
+        installed = {r["id"]: r["enabled"] for r in mm.list_installed_mods(self.game)}
+        self.assertTrue(installed["keep.m"])
+        self.assertFalse(installed["drop.m"])
+
+    def test_apply_import_does_not_disable_pulled_in_dependencies(self):
+        self._install("dep.k", "1.0.0")
+        self._publish("dep.k", "1.0.0")
+        self._publish_latest("root.m", "1.0.0", dependencies={"dep.k": "1.0.0"})
+        index = [summary("dep.k", ["1.0.0"])]
+        modlist = {"schema": 1, "repos": [], "mods": ["root.m"]}
+        plan = mm.import_modlist(modlist, index, [self.BASE])
+
+        mm.apply_import(self.game, plan, self.progress.append)
+
+        installed = {r["id"]: r["enabled"] for r in mm.list_installed_mods(self.game)}
+        self.assertTrue(installed["dep.k"])
+
+    def test_apply_import_leaves_already_disabled_mods_alone(self):
+        self._install("dis.m", "1.0.0")
+        mm.disable_mod(self.game, "dis.m")
+        modlist = {"schema": 1, "repos": [], "mods": []}
+        plan = mm.import_modlist(modlist, [], [self.BASE])
+
+        mm.apply_import(self.game, plan, self.progress.append)
+
+        installed = {r["id"]: r["enabled"] for r in mm.list_installed_mods(self.game)}
+        self.assertFalse(installed["dis.m"])
+
+    def test_modlist_import_disables_previews_without_side_effects(self):
+        self._install("keep.m", "1.0.0")
+        self._install("drop.m", "1.0.0")
+        self._publish_latest("keep.m", "1.0.0")
+        modlist = {"schema": 1, "repos": [], "mods": ["keep.m"]}
+        plan = mm.import_modlist(modlist, [], [self.BASE])
+
+        self.assertEqual(mm.modlist_import_disables(self.game, plan), ["drop.m"])
+        installed = {r["id"]: r["enabled"] for r in mm.list_installed_mods(self.game)}
+        self.assertTrue(installed["drop.m"])
 
     def test_apply_import_blocking_plan_raises_without_installing(self):
         modlist = {"schema": 1, "repos": [], "mods": ["ghost.m"]}

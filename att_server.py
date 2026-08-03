@@ -2979,16 +2979,14 @@ def _tavernlib_status(game_dir):
 
 
 def _mods_need_attention(game_dir):
-    """True if either required mod is missing/outdated, or the optional
-    CircuitsVoiceChat is outdated — the trigger for flashing the main
-    window's Mods button. Deliberately not "missing" for the optional mod:
-    not having opted into it is a normal, expected state, not something
-    that needs attention. Network failures during the update checks never
-    trigger a false alarm on their own — only a real missing install (a
-    purely local, always-reliable check) does that unconditionally."""
+    """True if either required mod (MelonLoader, TavernLib) is missing or
+    outdated — the trigger for flashing the main window's Setup button (see
+    _refresh_setup_alert, which also folds in the patch check). Network
+    failures during the update checks never trigger a false alarm on their
+    own — only a real missing install (a purely local, always-reliable
+    check) does that unconditionally."""
     return (_melonloader_status(game_dir) in ("missing", "outdated") or
-            _tavernlib_status(game_dir)   in ("missing", "outdated") or
-            _circuitsvoicechat_status(game_dir) == "outdated")
+            _tavernlib_status(game_dir)   in ("missing", "outdated"))
 
 
 # ── Patch ─────────────────────────────────────────────────────────────────────
@@ -3026,20 +3024,27 @@ def _sha256_file(path):
 
 
 def _patch_is_applied(game_exe):
-    """True if the installed Root.Township.dll's content exactly matches the
-    local Patch/themoddingtavern.dll. This is a real on-disk comparison, not
-    a remembered "I clicked this before" flag — so if the client launcher
-    already patched a given game install, the server launcher (or vice
-    versa) correctly sees it as already done too, as long as they're both
-    pointed at the same game folder. No re-patching, no re-flashing."""
-    src = _patch_source_path()
+    """True if the installed Root.Township.dll's content matches the hash
+    apply_patch most recently confirmed writing there, recorded in the
+    per-game-dir meta file (see _load_mod_meta) rather than compared against
+    the local Patch/themoddingtavern.dll fallback copy. Comparing against the
+    local bundled copy broke as soon as apply_patch actually used its GitHub
+    download (the common case, whenever GitHub is reachable): the installed
+    file matched what was genuinely just applied, but not a bundled reference
+    that's either stale or missing entirely, so this reported "not applied"
+    right after a successful patch. Hashing what we ourselves last wrote
+    fixes that regardless of which source supplied it. The meta file lives in
+    game_dir, not per-launcher state, so if the client launcher already
+    patched a given game install, the server launcher (or vice versa)
+    correctly sees it as already done too, as long as they're both pointed
+    at the same game folder. No re-patching, no re-flashing."""
+    game_dir = os.path.dirname(game_exe)
     dst = _patch_target_path(game_exe)
+    recorded = _load_mod_meta(game_dir).get("patch_sha256")
+    if not recorded or not os.path.isfile(dst):
+        return False
     try:
-        if not (os.path.isfile(src) and os.path.isfile(dst)):
-            return False
-        if os.path.getsize(src) != os.path.getsize(dst):
-            return False
-        return _sha256_file(src) == _sha256_file(dst)
+        return _sha256_file(dst) == recorded
     except OSError:
         return False
 
@@ -3073,6 +3078,7 @@ def apply_patch(game_exe, on_progress=None):
     if on_progress is None:
         on_progress = lambda msg: None
 
+    game_dir = os.path.dirname(game_exe)
     dst = _patch_target_path(game_exe)
     managed_dir = os.path.dirname(dst)
     if not os.path.isdir(managed_dir):
@@ -3098,23 +3104,32 @@ def apply_patch(game_exe, on_progress=None):
             source = "bundled"
 
         new_hash = _sha256_file(tmp_dest)
-        if os.path.isfile(dst) and _sha256_file(dst) == new_hash:
-            # Already exactly what we'd install — skip the write entirely
-            # rather than rewriting (and re-triggering AV scanning of) a
-            # file that's already correct.
-            return "current"
+        already_current = os.path.isfile(dst) and _sha256_file(dst) == new_hash
+        if not already_current:
+            # Not already exactly what we'd install — swap it in. (If it
+            # already matches, skip the write entirely rather than
+            # rewriting, and re-triggering AV scanning of, a file that's
+            # already correct.)
+            os.replace(tmp_dest, dst)  # atomic on Windows — always a full swap, never a partial one
+            if not os.path.isfile(dst) or _sha256_file(dst) != new_hash:
+                raise RuntimeError(
+                    "The file was written without any error, but checking it afterward "
+                    "shows it doesn't match what was just installed. This usually means "
+                    "something on this PC silently blocked the write — most commonly "
+                    "Windows' Controlled Folder Access, or antivirus real-time protection. "
+                    "Try adding an exclusion for the game's install folder in Windows "
+                    "Security (or your antivirus), or temporarily disabling Controlled "
+                    "Folder Access, then try again.")
 
-        os.replace(tmp_dest, dst)  # atomic on Windows — always a full swap, never a partial one
-        if not os.path.isfile(dst) or _sha256_file(dst) != new_hash:
-            raise RuntimeError(
-                "The file was written without any error, but checking it afterward "
-                "shows it doesn't match what was just installed. This usually means "
-                "something on this PC silently blocked the write — most commonly "
-                "Windows' Controlled Folder Access, or antivirus real-time protection. "
-                "Try adding an exclusion for the game's install folder in Windows "
-                "Security (or your antivirus), or temporarily disabling Controlled "
-                "Folder Access, then try again.")
-        return source
+        # Record what's now confirmed to be sitting at dst so
+        # _patch_is_applied (any launcher, any time) can recognize it without
+        # needing to compare against the local Patch/ fallback copy, which
+        # may be stale or absent by the time this runs.
+        meta = _load_mod_meta(game_dir)
+        meta["patch_sha256"] = new_hash
+        _save_mod_meta(game_dir, meta)
+
+        return "current" if already_current else source
     finally:
         try:
             if os.path.isfile(tmp_dest):
@@ -3123,12 +3138,19 @@ def apply_patch(game_exe, on_progress=None):
             pass
 
 
-class ModsWindow(tk.Toplevel):
+class SetupWindow(tk.Toplevel):
+    """Patch, MelonLoader, TavernLib, in that order — the fixed sequence
+    everything else in the launcher depends on. Each step's button stays
+    disabled until the step before it has been installed at least once
+    (see _lock_row) — a fresh install can't jump ahead — but that lock never
+    blocks re-running a step that's already installed (an update or a
+    reinstall), even if an earlier step has since gone missing again."""
+
     def __init__(self, parent, exe_path, on_status_change=None):
         super().__init__(parent)
-        self.title("Mods")
+        self.title("Setup")
         self.configure(bg=BG)
-        self.geometry("520x420")
+        self.geometry("520x480")
         self.resizable(False, False)
         self._exe = exe_path
         self._game_dir = os.path.dirname(exe_path)
@@ -3147,40 +3169,36 @@ class ModsWindow(tk.Toplevel):
     def _build(self):
         h = tk.Frame(self, bg=SURF, height=44)
         h.pack(fill="x"); h.pack_propagate(False)
-        tk.Label(h, text="🧪  Mods", bg=SURF, fg=AMBER,
+        tk.Label(h, text="🛠  Setup", bg=SURF, fg=AMBER,
                  font=("Georgia",12,"bold")).pack(side="left", padx=16, pady=8)
+        self._auto_btn = _btn(h, "⚡ Automatic Setup", self._on_automatic_setup,
+                              style="primary", font=("Segoe UI",9,"bold"), pady=6, padx=12)
+        self._auto_btn.pack(side="right", padx=12)
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
 
         tk.Label(self,
-            text="These set up modding for A Township Tale on this machine. "
-                 "Install MelonLoader first, then the others. If GitHub can't be "
-                 "reached (some networks/antivirus block it), the version bundled "
-                 "with this launcher is used automatically instead.",
+            text="These set up modding for A Township Tale on this machine, in "
+                 "order: Patch, then MelonLoader, then TavernLib. If GitHub can't "
+                 "be reached (some networks/antivirus block it), the version "
+                 "bundled with this launcher is used automatically instead.",
             bg=BG, fg=MUTED, font=("Segoe UI",9), wraplength=470, justify="left"
-        ).pack(anchor="w", padx=20, pady=(10,4))
+        ).pack(anchor="w", padx=20, pady=(10,8))
 
-        _section_label(self, "REQUIRED MODS")
+        _section_label(self, "IN ORDER")
+        self._patch_btn = self._mod_row(
+            "Patch", "Enables hosting and connecting to custom servers.",
+            self._on_patch_click)
         self._ml_btn = self._mod_row(
-            "MelonLoader", "The mod loader itself — required before anything else.",
+            "MelonLoader", "Universal Mod Loader for Unity Games.",
             self._on_melonloader_click)
         self._tl_btn = self._mod_row(
-            "TavernLib", "Our plugin — adds this server's mod support to the game.",
+            "TavernLib", "MelonLoader plugin to keep the game alive.",
             self._on_tavernlib_click)
 
-        _section_label(self, "OPTIONAL MODS")
-        self._cvc_btn = self._mod_row(
-            "CircuitsVoiceChat", "Proximity voice chat for players on this server.",
-            self._on_circuitsvoicechat_click)
-
-        tk.Label(self, text="More mods will be manageable from here later.",
-                 bg=BG, fg=MUTED, font=("Segoe UI",8,"italic")
-        ).pack(anchor="w", padx=22, pady=(2,8))
-
-        tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=20)
         self._status = tk.StringVar(value="")
         tk.Label(self, textvariable=self._status, bg=BG, fg=CYAN,
                  font=("Segoe UI",9), wraplength=470, justify="left"
-        ).pack(anchor="w", padx=20, pady=10)
+        ).pack(anchor="w", padx=20, pady=(10,10))
 
         self._refresh_states()
 
@@ -3193,15 +3211,23 @@ class ModsWindow(tk.Toplevel):
         tf = tk.Frame(row, bg=SURF)
         tf.pack(side="left", fill="both", expand=True, pady=8)
         tk.Label(tf, text=title, bg=SURF, fg=PARCH, font=("Georgia",10,"bold")).pack(anchor="w")
-        subvar = tk.StringVar(value=subtitle)
-        tk.Label(tf, textvariable=subvar, bg=SURF, fg=MUTED, font=("Segoe UI",8),
+        tk.Label(tf, text=subtitle, bg=SURF, fg=MUTED, font=("Segoe UI",8),
                  wraplength=280, justify="left").pack(anchor="w")
-        btn = _btn(row, "…", on_click, font=("Segoe UI",9), pady=6, padx=12)
+        # Its own line, separate from the (static) description above, so
+        # "Up to date." / a version tag / a lock message doesn't get run
+        # into the description text — and this line is always reserved
+        # (even when empty) so a row doesn't change height when it appears.
+        notevar = tk.StringVar(value="")
+        note = tk.Label(tf, textvariable=notevar, bg=SURF, fg=MUTED, font=("Segoe UI",8),
+                        wraplength=280, justify="left")
+        note.pack(anchor="w")
+        # Fixed width so the row doesn't shift when the label changes length
+        # ("⬇ Install" vs "⟳ Reinstall") as a step's state changes.
+        btn = _btn(row, "…", on_click, font=("Segoe UI",9), pady=6, padx=12, width=11)
         btn.pack(side="right", padx=12)
         btn._dotvar = dotvar
         btn._dotlabel = dot
-        btn._subvar = subvar
-        btn._subtitle = subtitle
+        btn._notevar = notevar
         return btn
 
     # ── Status ───────────────────────────────────────────────────────────────
@@ -3213,25 +3239,35 @@ class ModsWindow(tk.Toplevel):
         "current":  ("●", GREEN, "⟳ Reinstall"),
     }
     _STATE_NOTE = {
-        "missing": None,
+        "missing": "",
         "outdated": "Update available.",
-        "unknown": None,
+        "unknown": "",
         "current": "Up to date.",
     }
 
     def _refresh_states(self):
         self._status.set("Checking status…")
+        exe, game_dir = self._exe, self._game_dir
         def worker():
-            ml = _melonloader_status(self._game_dir)
-            tl = _tavernlib_status(self._game_dir)
-            cvc = _circuitsvoicechat_status(self._game_dir)
-            self.after(0, lambda: self._apply_states(ml, tl, cvc))
+            patch_state = "current" if _patch_is_applied(exe) else "missing"
+            ml = _melonloader_status(game_dir)
+            tl = _tavernlib_status(game_dir)
+            ml_tag = _load_mod_meta(game_dir).get("melonloader_tag")
+            self.after(0, lambda: self._apply_states(patch_state, ml, tl, ml_tag))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _apply_states(self, ml_state, tl_state, cvc_state):
+    def _apply_states(self, patch_state, ml_state, tl_state, ml_tag):
+        self._apply_row_state(self._patch_btn, patch_state)
         self._apply_row_state(self._ml_btn, ml_state)
         self._apply_row_state(self._tl_btn, tl_state)
-        self._apply_row_state(self._cvc_btn, cvc_state)
+        # A real release tag (not the "bundled:<hash>" fallback marker) is
+        # worth showing so it's obvious exactly what got installed, not just
+        # that something did.
+        if ml_tag and not ml_tag.startswith("bundled:"):
+            note = self._ml_btn._notevar.get()
+            self._ml_btn._notevar.set(f"{note}  ({ml_tag})" if note else f"({ml_tag})")
+        self._lock_row(self._ml_btn, ml_state, patch_state, "Patch")
+        self._lock_row(self._tl_btn, tl_state, ml_state, "MelonLoader")
         self._status.set("")
         if self._on_status_change: self._on_status_change()
 
@@ -3240,16 +3276,48 @@ class ModsWindow(tk.Toplevel):
         btn._dotvar.set(dot)
         btn._dotlabel.config(fg=color)
         btn.config(text=text)
-        note = self._STATE_NOTE[state]
-        btn._subvar.set(f"{btn._subtitle}  ·  {note}" if note else btn._subtitle)
+        btn._notevar.set(self._STATE_NOTE[state])
+
+    def _lock_row(self, btn, state, prior_state, prior_name):
+        """Disables a step's button only when it's never been installed AND
+        its prerequisite hasn't either — never blocks updating/reinstalling
+        a step that's already there, no matter what the earlier step is
+        doing right now."""
+        locked = state == "missing" and prior_state == "missing"
+        if not self._busy:
+            btn.config(state="disabled" if locked else "normal")
+        if locked:
+            note = btn._notevar.get()
+            lock_msg = f"Install {prior_name} first"
+            btn._notevar.set(f"{note}  ·  {lock_msg}" if note else lock_msg)
 
     def _set_busy(self, busy, msg=""):
         self._busy = busy
         state = "disabled" if busy else "normal"
+        self._auto_btn.config(state=state)
+        self._patch_btn.config(state=state)
         self._ml_btn.config(state=state)
         self._tl_btn.config(state=state)
-        self._cvc_btn.config(state=state)
         self._status.set(msg)
+
+    def _on_patch_click(self):
+        if self._busy: return
+        self._set_busy(True, "Checking for the latest patch…")
+        exe = self._exe
+        def worker():
+            try:
+                result = apply_patch(exe, lambda m: self.after(0, lambda: self._status.set(m)))
+                messages = {
+                    "downloaded": "Downloaded the latest Tavern patch from GitHub and applied it.",
+                    "bundled": "Couldn't reach GitHub, so the version bundled with this "
+                               "launcher was applied instead.",
+                    "current": "Already up to date — no changes were needed.",
+                }
+                msg = messages.get(result, "Root.Township.dll has been replaced with the Tavern patch.")
+                self.after(0, lambda: self._finish_install(True, msg))
+            except RuntimeError as e:
+                self.after(0, lambda err=str(e): self._finish_install(False, f"Patch failed: {err}"))
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_melonloader_click(self):
         if self._busy: return
@@ -3287,21 +3355,35 @@ class ModsWindow(tk.Toplevel):
                 self.after(0, lambda e=e: self._finish_install(False, f"Install failed: {e}"))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_circuitsvoicechat_click(self):
+    def _on_automatic_setup(self):
         if self._busy: return
-        if not _melonloader_installed(self._game_dir):
-            messagebox.showwarning("Install MelonLoader first",
-                "CircuitsVoiceChat is a MelonLoader mod — install MelonLoader above first.", parent=self)
-            return
-        self._set_busy(True, "Installing CircuitsVoiceChat…")
+        self._set_busy(True, "Running automatic setup…")
+        exe, game_dir = self._exe, self._game_dir
 
         def worker():
             try:
-                _install_circuitsvoicechat(self._game_dir,
-                    lambda m: self.after(0, lambda: self._status.set(m)))
-                self.after(0, lambda: self._finish_install(True, "CircuitsVoiceChat installed."))
+                if not _patch_is_applied(exe):
+                    self.after(0, lambda: self._status.set("Applying patch…"))
+                    apply_patch(exe, lambda m: self.after(0, lambda: self._status.set(m)))
+
+                if _melonloader_status(game_dir) != "current":
+                    arch = _detect_exe_arch(exe)
+                    if not arch:
+                        raise RuntimeError(
+                            "Couldn't determine whether the game is 32- or 64-bit from "
+                            "the selected .exe. Try re-browsing to it on the main screen.")
+                    self.after(0, lambda: self._status.set(f"Detected {arch} game — installing MelonLoader…"))
+                    _install_melonloader(game_dir, arch,
+                        lambda m: self.after(0, lambda: self._status.set(m)))
+
+                if _tavernlib_status(game_dir) != "current":
+                    self.after(0, lambda: self._status.set("Installing TavernLib…"))
+                    _install_tavernlib(game_dir,
+                        lambda m: self.after(0, lambda: self._status.set(m)))
+
+                self.after(0, lambda: self._finish_install(True, "Automatic setup complete."))
             except Exception as e:
-                self.after(0, lambda e=e: self._finish_install(False, f"Install failed: {e}"))
+                self.after(0, lambda e=e: self._finish_install(False, f"Automatic setup failed: {e}"))
         threading.Thread(target=worker, daemon=True).start()
 
     def _finish_install(self, ok, msg):
@@ -3515,16 +3597,14 @@ class ServerLauncher(tk.Tk):
         self._auth_on  = False
         self._tailer   = None
         self._mgr_win  = None
-        self._mods_win = None
+        self._setup_win = None
+        self._mod_manager_win = None
         self._sett_win = None
         self._console_win = None
         self._tickets_win = None
-        self._mods_animating  = False
-        self._mods_anim_job   = None
-        self._mods_anim_phase = 0
-        self._patch_animating  = False
-        self._patch_anim_job   = None
-        self._patch_anim_phase = 0
+        self._setup_animating  = False
+        self._setup_anim_job   = None
+        self._setup_anim_phase = 0
         self._exe_check_job   = None
         self._build_ui()
         self._load()
@@ -3577,15 +3657,12 @@ class ServerLauncher(tk.Tk):
              pady=7, padx=12).pack(side="left", padx=6)
         _btn(tr, "🖥 Console",  self._open_console,  font=("Segoe UI",9),
              pady=7, padx=12).pack(side="left", padx=6)
-        self._patch_btn = _btn(tr, "🩹 Patch", self._on_patch_click,
+        self._setup_btn = _btn(tr, "🛠 Setup", self._open_setup,
                                font=("Segoe UI",9), pady=7, padx=12)
-        self._patch_btn.pack(side="left")
-        self._mods_btn = _btn(tr, "🧪 Mods", self._open_mods,
-                              font=("Segoe UI",9), pady=7, padx=12)
-        self._mods_btn.pack(side="left", padx=6)
-        self._community_btn = _btn(tr, "📦 Community Mods", self._open_community_mods,
-                                   font=("Segoe UI",9), pady=7, padx=12)
-        self._community_btn.pack(side="left", padx=(0,6))
+        self._setup_btn.pack(side="left")
+        self._mod_manager_btn = _btn(tr, "📦 Mod Manager", self._open_mod_manager,
+                                     font=("Segoe UI",9), pady=7, padx=12)
+        self._mod_manager_btn.pack(side="left", padx=(6,6))
         _btn(tr, "📁 Saves",    self._open_saves,    font=("Segoe UI",9),
              pady=7, padx=12).pack(side="right")
         _divider(self)
@@ -3828,26 +3905,28 @@ class ServerLauncher(tk.Tk):
             self._console_win.lift(); return
         self._console_win = ConsoleWindow(self)
 
-    def _open_mods(self):
+    def _open_setup(self):
         exe = self.v_exe.get().strip()
         if not exe or not os.path.isfile(exe):
             messagebox.showerror("Game not found",
                 "Please set the path to 'A Township Tale.exe' above first.", parent=self)
             return
-        if self._mods_win and self._mods_win.winfo_exists():
-            self._mods_win.lift(); return
-        self._mods_win = ModsWindow(self, exe, on_status_change=self._refresh_mods_alert)
+        if self._setup_win and self._setup_win.winfo_exists():
+            self._setup_win.lift(); return
+        self._setup_win = SetupWindow(self, exe, on_status_change=self._refresh_setup_alert)
 
-    def _open_community_mods(self):
+    def _open_mod_manager(self):
         exe = self.v_exe.get().strip()
         if not exe or not os.path.isfile(exe):
             messagebox.showerror("Game not found",
                 "Please set the path to 'A Township Tale.exe' above first.", parent=self)
             return
-        _modmanager.CommunityModsWindow(self, os.path.dirname(exe), side="server",
-                                        on_change=self._refresh_mods_alert)
+        if self._mod_manager_win and self._mod_manager_win.winfo_exists():
+            self._mod_manager_win.lift(); return
+        self._mod_manager_win = _modmanager.ModManagerWindow(
+            self, os.path.dirname(exe), side="server", on_change=self._refresh_setup_alert)
 
-    # ── Patch / Mods buttons (same mechanism as the client launcher) ────────
+    # ── Setup button (same mechanism as the client launcher) ────────────────
 
     def _on_exe_changed(self, *_):
         if self._exe_check_job:
@@ -3856,124 +3935,61 @@ class ServerLauncher(tk.Tk):
         self._exe_check_job = self.after(800, self._refresh_tool_states)
 
     def _refresh_tool_states(self):
-        """Enables/disables the Patch and Mods buttons based on whether a
-        valid game exe is selected, then separately refreshes each button's
-        own flashing-alert condition. State is only ever touched here, and
-        the animation loops below only ever touch bg/fg — kept deliberately
-        separate so neither path can clobber the other."""
+        """Enables/disables the Setup and Mod Manager buttons based on
+        whether a valid game exe is selected, then separately refreshes the
+        Setup button's own flashing-alert condition. State is only ever
+        touched here, and the animation loop below only ever touches bg/fg —
+        kept deliberately separate so neither path can clobber the other."""
         exe = self.v_exe.get().strip()
         valid = bool(exe and os.path.isfile(exe))
         state = "normal" if valid else "disabled"
-        try: self._patch_btn.config(state=state)
+        try: self._setup_btn.config(state=state)
         except Exception: pass
-        try: self._mods_btn.config(state=state)
+        try: self._mod_manager_btn.config(state=state)
         except Exception: pass
-        self._refresh_mods_alert()
-        self._refresh_patch_alert(exe)
+        self._refresh_setup_alert()
 
-    def _refresh_mods_alert(self):
+    def _refresh_setup_alert(self):
         exe = self.v_exe.get().strip()
         if not exe or not os.path.isfile(exe):
-            self._set_mods_alert(False)
+            self._set_setup_alert(False)
             return
         game_dir = os.path.dirname(exe)
         def worker():
             try:
-                need = _mods_need_attention(game_dir)
+                need = _mods_need_attention(game_dir) or (
+                    os.path.isfile(_patch_source_path()) and not _patch_is_applied(exe))
             except Exception:
                 need = False
-            self.after(0, lambda: self._set_mods_alert(need))
+            self.after(0, lambda: self._set_setup_alert(need))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _set_mods_alert(self, needed):
-        if needed: self._start_mods_animation()
-        else:      self._stop_mods_animation()
+    def _set_setup_alert(self, needed):
+        if needed: self._start_setup_animation()
+        else:      self._stop_setup_animation()
 
-    def _start_mods_animation(self):
-        if self._mods_animating: return
-        self._mods_animating = True
-        self._mods_anim_phase = 0
-        self._animate_mods_btn()
+    def _start_setup_animation(self):
+        if self._setup_animating: return
+        self._setup_animating = True
+        self._setup_anim_phase = 0
+        self._animate_setup_btn()
 
-    def _animate_mods_btn(self):
-        if not self._mods_animating: return
-        bg, fg = (SURF2, AMBER) if self._mods_anim_phase % 2 == 0 else ("#5a3d0e", "#ffd080")
-        try: self._mods_btn.config(bg=bg, fg=fg)
+    def _animate_setup_btn(self):
+        if not self._setup_animating: return
+        bg, fg = (SURF2, AMBER) if self._setup_anim_phase % 2 == 0 else ("#5a3d0e", "#ffd080")
+        try: self._setup_btn.config(bg=bg, fg=fg)
         except Exception: return
-        self._mods_anim_phase += 1
-        self._mods_anim_job = self.after(450, self._animate_mods_btn)
+        self._setup_anim_phase += 1
+        self._setup_anim_job = self.after(450, self._animate_setup_btn)
 
-    def _stop_mods_animation(self):
-        self._mods_animating = False
-        if self._mods_anim_job:
-            try: self.after_cancel(self._mods_anim_job)
+    def _stop_setup_animation(self):
+        self._setup_animating = False
+        if self._setup_anim_job:
+            try: self.after_cancel(self._setup_anim_job)
             except Exception: pass
-            self._mods_anim_job = None
-        try: self._mods_btn.config(bg=SURF2, fg=PARCH)
+            self._setup_anim_job = None
+        try: self._setup_btn.config(bg=SURF2, fg=PARCH)
         except Exception: pass
-
-    def _refresh_patch_alert(self, exe):
-        """Flash the Patch button only while the patch DLL is actually
-        present AND not already applied — a real on-disk check, so it
-        correctly reflects reality even if the client launcher already did
-        this for the same game (both point at the same target files)."""
-        if not exe or not os.path.isfile(exe):
-            self._stop_patch_animation()
-            return
-        def worker():
-            try:
-                need = os.path.isfile(_patch_source_path()) and not _patch_is_applied(exe)
-            except Exception:
-                need = False
-            self.after(0, lambda: self._start_patch_animation() if need else self._stop_patch_animation())
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _start_patch_animation(self):
-        if self._patch_animating: return
-        self._patch_animating = True
-        self._patch_anim_phase = 0
-        self._animate_patch_btn()
-
-    def _animate_patch_btn(self):
-        if not self._patch_animating: return
-        bg, fg = ("#1a3d2a", "#80d8aa") if self._patch_anim_phase % 2 == 0 else ("#0d2419", "#50aa7a")
-        try: self._patch_btn.config(bg=bg, fg=fg)
-        except Exception: return
-        self._patch_anim_phase += 1
-        self._patch_anim_job = self.after(450, self._animate_patch_btn)
-
-    def _stop_patch_animation(self):
-        self._patch_animating = False
-        if self._patch_anim_job:
-            try: self.after_cancel(self._patch_anim_job)
-            except Exception: pass
-            self._patch_anim_job = None
-        try: self._patch_btn.config(bg=SURF2, fg=PARCH)
-        except Exception: pass
-
-    def _on_patch_click(self):
-        exe = self.v_exe.get().strip()
-        if not exe or not os.path.isfile(exe):
-            messagebox.showerror("Game not found",
-                "Please set the path to 'A Township Tale.exe' above first.", parent=self)
-            return
-
-        def worker():
-            try:
-                result = apply_patch(exe)
-                messages = {
-                    "downloaded": "Downloaded the latest Tavern patch from GitHub and applied it.",
-                    "bundled": "Couldn't reach GitHub, so the version bundled with this "
-                               "launcher was applied instead.",
-                    "current": "Already up to date — no changes were needed.",
-                }
-                msg = messages.get(result, "Root.Township.dll has been replaced with the Tavern patch.")
-                self.after(0, lambda: (
-                    messagebox.showinfo("Patch applied", msg, parent=self),
-                    self._refresh_patch_alert(exe)))
-            except RuntimeError as e:
-                self.after(0, lambda err=str(e): messagebox.showerror("Patch failed", err, parent=self))
-        threading.Thread(target=worker, daemon=True).start()
 
     def _open_saves(self):
         try: os.makedirs(PLAYERS_SAVE, exist_ok=True); os.startfile(PLAYERS_SAVE)

@@ -471,6 +471,20 @@ def _repo_shorthand(url):
     return "/".join(path[:2]) if len(path) >= 2 else _norm(url)
 
 
+_GITHUB_HOSTS = ("raw.githubusercontent.com", "github.com")
+
+
+def _source_display(url):
+    """Human-facing label for a repo URL, distinct from _repo_shorthand's
+    identifier role: "Author/Repo" for a GitHub host, since that's a
+    recognizable convention there, but the full URL verbatim for anything
+    else - a non-GitHub host has no such shorthand convention, so collapsing
+    it the same way would just hide which source it actually is."""
+    if urlparse(_norm(url)).netloc.lower() in _GITHUB_HOSTS:
+        return _repo_shorthand(url)
+    return _norm(url)
+
+
 def _named_repos(cfg):
     """cfg[CFG_REPOS_KEY] as {shorthand: url}, migrating a pre-shorthand
     list-of-URLs shape in memory (older configs stored a plain list; new ones
@@ -1144,14 +1158,17 @@ def install_library_dependency(game_dir, lib, on_progress):
     })
 
 
-def install_mod_closure(game_dir, mod, index, repo_bases, on_progress):
+def install_mod_closure(game_dir, mod, index, repo_bases, on_progress, version=None):
     """Installs a mod AND its full closure, the flow a single COMMUNITY MODS
-    click runs. `mod` is the ModSummary the user picked; its highest version's
-    manifest is fetched, then resolve_dependencies walks the graph fetching each
-    dependency's manifest, and collect_library_dependencies gathers the pinned
-    libraries. Every cycle/depth/diamond/library conflict is surfaced (and every
-    manifest fetched) BEFORE anything touches disk. A mod with no dependencies is
-    just the degenerate case: empty closure, one install_mod.
+    click runs. `mod` is the ModSummary the user picked; its manifest is
+    fetched at `version` if given, else mod.highest() (the ordinary
+    install/update path; an explicit version is how Community Mods' right-click
+    "Change Version" installs an older/different release instead), then
+    resolve_dependencies walks the graph fetching each dependency's manifest,
+    and collect_library_dependencies gathers the pinned libraries. Every
+    cycle/depth/diamond/library conflict is surfaced (and every manifest
+    fetched) BEFORE anything touches disk. A mod with no dependencies is just
+    the degenerate case: empty closure, one install_mod.
 
     Manifests fetched during a single closure are cached, so a diamond (two mods
     needing the same dependency) fetches it once."""
@@ -1163,7 +1180,7 @@ def install_mod_closure(game_dir, mod, index, repo_bases, on_progress):
             fetched[key] = _fetch_manifest(repo_bases, mod_id, version, prefer_repo=source_repo)
         return fetched[key]
 
-    root = fetch(mod.id, mod.highest(), mod.source_repo)
+    root = fetch(mod.id, version or mod.highest(), mod.source_repo)
     deps = resolve_dependencies([root], index, fetch)
     all_mods = [root] + deps
     libs = collect_library_dependencies(all_mods)     # raises on conflict before any download
@@ -1361,6 +1378,70 @@ def list_installed_mods(game_dir):
             rec["enabled"] = enabled       # in-memory only; not on disk
             out[rec["id"]] = rec
     return list(out.values())
+
+
+def list_untracked_mods(game_dir):
+    """Everything sitting in Mods/ that MelonLoader can load but this manager
+    doesn't own (docs/mod-manager-design.md "Untracked mods"): a loose root
+    Mods/*.dll (the classic drag-a-dll-in manual install, invisible to
+    list_installed_mods since it never looks at files, only subfolders), or a
+    first-level Mods/<name>/ folder that list_installed_mods didn't already
+    claim - a foreign manifest.json, or one predating parity_required (see the
+    skip-with-warning above). Each entry is {"name", "kind" ("file"/"folder"),
+    "enabled"}. Deliberately surfacing-and-toggling only, per the design doc:
+    there's no manifest we trust to reconcile a version/update against, so
+    this never appears anywhere near install/update, only enable/disable."""
+    out = []
+    mods_dir = _mods_base(game_dir)
+    if not os.path.isdir(mods_dir):
+        return out
+    claimed = {_safe_basename(rec["id"]) for rec in list_installed_mods(game_dir)}
+    for name in os.listdir(mods_dir):
+        full = os.path.join(mods_dir, name)
+        if name.startswith((".", "~")):
+            continue
+        if os.path.isfile(full):
+            lower = name.lower()
+            if lower.endswith(".dll"):
+                out.append({"name": name, "kind": "file", "enabled": True})
+            elif lower.endswith(".dll.disabled"):
+                out.append({"name": name[:-len(".disabled")], "kind": "file", "enabled": False})
+        elif os.path.isdir(full):
+            if name in claimed:
+                continue
+            rec = _read_sidecar(os.path.join(full, RECORD_NAME))
+            enabled = True
+            if not rec:
+                rec = _read_sidecar(os.path.join(full, DISABLED_RECORD_NAME))
+                enabled = False
+            if rec is None:
+                continue    # empty/junk folder - nothing MelonLoader would load
+            out.append({"name": name, "kind": "folder", "enabled": enabled})
+    return out
+
+
+def disable_untracked_dll(game_dir, filename):
+    """Takes a loose root Mods/<filename> out of rotation without deleting
+    it, by renaming it out of MelonLoader's view - the file equivalent of
+    disable_mod's manifest rename. A root dll has no manifest to hide behind
+    and MelonLoader always loads any Mods/*.dll it finds, so the rename
+    itself has to be what stops it loading. Returns True if it was there and
+    enabled, False if not."""
+    src = os.path.join(_mods_base(game_dir), filename)
+    if not os.path.isfile(src):
+        return False
+    os.replace(src, src + ".disabled")
+    return True
+
+
+def enable_untracked_dll(game_dir, filename):
+    """Reverses disable_untracked_dll. Returns True if it was disabled and is
+    now enabled, False if there was nothing disabled to enable."""
+    src = os.path.join(_mods_base(game_dir), filename) + ".disabled"
+    if not os.path.isfile(src):
+        return False
+    os.replace(src, os.path.join(_mods_base(game_dir), filename))
+    return True
 
 
 def handshake_snapshot(game_dir):
@@ -2217,10 +2298,27 @@ def import_modlist(modlist, index, repo_bases):
                       hinted_repos=list(modlist.get("repos", [])))
 
 
+def modlist_import_disables(game_dir, plan):
+    """Every currently-ENABLED installed mod that isn't part of `plan`'s
+    resolved set (roots + dependencies) - what apply_import will disable, so
+    a caller can preview/confirm it before the import actually runs rather
+    than only discovering it mid-install."""
+    keep_ids = {mod.id for mod in plan.roots + plan.dependencies}
+    return [rec["id"] for rec in list_installed_mods(game_dir)
+            if rec["id"] not in keep_ids and rec.get("enabled")]
+
+
 def apply_import(game_dir, plan, on_progress=None):
     """Installs everything import_modlist resolved - every root plus their
     dependency closure plus every collected library - in one confirmed batch
-    (install_mod_closure's flow, generalized to a modlist's many roots).
+    (install_mod_closure's flow, generalized to a modlist's many roots), then
+    disables every currently-ENABLED installed mod that isn't part of that
+    resolved set (modlist_import_disables), so importing a modlist makes it
+    the active set rather than just adding to whatever was already enabled.
+    Disabled, not uninstalled: same as disable_mod, files stay in place. A
+    dependency pulled in for another root counts as "in the list" even
+    though it has no entry of its own in `mods`, so it's never disabled out
+    from under the root that needs it.
     Raises if plan.blocking; callers must check that themselves first, same
     as render_active_set does for a JoinPlan."""
     if plan.blocking:
@@ -2235,6 +2333,10 @@ def apply_import(game_dir, plan, on_progress=None):
     for lib in collect_library_dependencies(all_mods):
         progress(f"Installing library {lib.filename}")
         install_library_dependency(game_dir, lib, progress)
+
+    for mod_id in modlist_import_disables(game_dir, plan):
+        progress(f"Disabling {mod_id}")
+        disable_mod(game_dir, mod_id)
 
 
 # Community-mods UI
@@ -2314,7 +2416,7 @@ class ModSourcesWindow(tk.Toplevel):
         self._listbox.delete(0, tk.END)
         for url in self._repos:
             tag = "  (default, always on)" if _is_default(url) else ""
-            self._listbox.insert(tk.END, url + tag)
+            self._listbox.insert(tk.END, _source_display(url) + tag)
 
     def _on_add(self):
         url = simpledialog.askstring("Add mod source",
@@ -2363,97 +2465,6 @@ class ModSourcesWindow(tk.Toplevel):
             self._status.set(f"Couldn't remove: {e}")
             return
         self._status.set("Source removed.")
-        self._reload()
-        if self._on_change:
-            self._on_change()
-
-
-class PinnedModsWindow(tk.Toplevel):
-    """Client-only: mods pinned always-on, unioned into whichever server's
-    active set is rendered at join regardless of what that server
-    actually requires. Same listbox/add/remove shape as ModSourcesWindow,
-    calling straight into list_pinned/add_pin/remove_pin."""
-    def __init__(self, parent, on_change=None):
-        super().__init__(parent)
-        self.title("Pinned Mods")
-        self.configure(bg=BG)
-        self.geometry("480x360")
-        self.resizable(False, False)
-        self._on_change = on_change
-        self._build()
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
-        _enable_dark_titlebar(self)
-        self.transient(parent)
-
-    def _build(self):
-        h = tk.Frame(self, bg=SURF, height=44)
-        h.pack(fill="x"); h.pack_propagate(False)
-        tk.Label(h, text="Pinned Mods", bg=SURF, fg=AMBER,
-                 font=("Georgia",12,"bold")).pack(side="left", padx=16, pady=8)
-        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
-
-        tk.Label(self,
-            text="Mods that stay active no matter which server you join, on top "
-                 "of whatever that server itself requires. Pin just the mod id to "
-                 "always track its latest version, or id@version to pin an exact "
-                 "one (e.g. Acme.AdminTools@1.4.0). If the server you're joining "
-                 "requires a different exact version, you'll be asked which to use.",
-            bg=BG, fg=MUTED, font=("Segoe UI",9), wraplength=430, justify="left"
-        ).pack(anchor="w", padx=20, pady=(10,6))
-
-        lb_frame = tk.Frame(self, bg=BORDER, highlightbackground=BORDER, highlightthickness=1)
-        lb_frame.pack(fill="both", expand=True, padx=20, pady=(0,8))
-        self._listbox = tk.Listbox(lb_frame, bg=SURF, fg=PARCH, bd=0,
-                                   highlightthickness=0, selectbackground=AMBERDIM,
-                                   font=("Consolas",9), activestyle="none")
-        self._listbox.pack(fill="both", expand=True, padx=1, pady=1)
-
-        bar = tk.Frame(self, bg=BG)
-        bar.pack(fill="x", padx=20, pady=(0,12))
-        _btn(bar, "+ Add pin", self._on_add, style="primary",
-             font=("Segoe UI",9), pady=5, padx=12).pack(side="left")
-        _btn(bar, "- Remove selected", self._on_remove, style="danger",
-             font=("Segoe UI",9), pady=5, padx=12).pack(side="left", padx=8)
-
-        self._status = tk.StringVar(value="")
-        tk.Label(self, textvariable=self._status, bg=BG, fg=CYAN,
-                 font=("Segoe UI",8), wraplength=430, justify="left"
-        ).pack(anchor="w", padx=20, pady=(0,8))
-        self._reload()
-
-    def _reload(self):
-        self._pins = list_pinned(_load_cfg())
-        self._listbox.delete(0, tk.END)
-        for entry in self._pins:
-            self._listbox.insert(tk.END, entry)
-
-    def _on_add(self):
-        entry = simpledialog.askstring("Add pin",
-            "Mod id to pin (e.g. Acme.QuestGiver or Acme.AdminTools@1.4.0):",
-            parent=self)
-        if not entry:
-            return
-        try:
-            add_pin(_load_cfg(), entry.strip())
-        except Exception as e:
-            self._status.set(f"Couldn't add pin: {e}")
-            return
-        self._status.set("Pin added.")
-        self._reload()
-        if self._on_change:
-            self._on_change()
-
-    def _on_remove(self):
-        sel = self._listbox.curselection()
-        if not sel:
-            return
-        entry = self._pins[sel[0]]
-        try:
-            remove_pin(_load_cfg(), entry)
-        except Exception as e:
-            self._status.set(f"Couldn't remove: {e}")
-            return
-        self._status.set("Pin removed.")
         self._reload()
         if self._on_change:
             self._on_change()
@@ -2969,15 +2980,113 @@ class ModDiffWindow(tk.Toplevel):
             self._on_cancel_cb(self)
 
 
-class CommunityModsWindow(tk.Toplevel):
-    """Table-based browser for community mods pulled from the configured sources.
-    Lists every available mod, plus any installed mod that has dropped out of the
-    index, with its status, and offers install / update / reinstall / uninstall on
-    the selected row. All network and disk work runs off the UI thread; the parent
-    Mods window is refreshed through on_change after anything changes."""
+class ModVersionWindow(tk.Toplevel):
+    """Every version one mod has published, so a user can install something
+    other than mod.highest(). No release-date column: neither manifest.json
+    nor repository.json carries a date anywhere in the schema (see the module
+    docstring's field lists), so there's genuinely nothing to show there -
+    fabricating one would be worse than omitting it. "Requires" is the one
+    piece of real per-version metadata available (dependencies can change
+    release to release, unlike author/description, which don't), fetched
+    lazily per row since getting it means pulling that version's full
+    manifest, not just the slim index entry."""
+    _COLS   = ("version", "installed", "requires")
+    _WIDTHS = (100,       80,          360)
 
-    _COLS   = ("status", "author", "mod", "installed", "latest", "source")
-    _WIDTHS = (100,      120,      170,   84,          80,       120)
+    def __init__(self, parent, mod, versions, installed_version, repo_bases, on_install):
+        super().__init__(parent)
+        self.title(f"{mod.name} - Change Version")
+        self.configure(bg=BG)
+        self.geometry("580x380")
+        self.minsize(480, 260)
+        self._mod = mod
+        self._versions = versions
+        self._installed_version = installed_version
+        self._repo_bases = repo_bases
+        self._on_install = on_install
+        self._build()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        _enable_dark_titlebar(self)
+        self.transient(parent)
+        self._load_requires()
+
+    def _build(self):
+        h = tk.Frame(self, bg=SURF, height=44)
+        h.pack(fill="x"); h.pack_propagate(False)
+        tk.Label(h, text=f"{self._mod.name} — Versions", bg=SURF, fg=AMBER,
+                 font=("Georgia",12,"bold")).pack(side="left", padx=16, pady=8)
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
+
+        tk.Label(self,
+            text="Every release this mod has published, newest first. Mod authors "
+                 "don't provide a release date, so none is shown here.",
+            bg=BG, fg=MUTED, font=("Segoe UI",9), wraplength=540, justify="left"
+        ).pack(anchor="w", padx=16, pady=(10,6))
+
+        table_wrap = tk.Frame(self, bg=BG)
+        table_wrap.pack(fill="both", expand=True, padx=16)
+        self._tree = _mk_tree(table_wrap, self._COLS, self._WIDTHS, height=10)
+        self._tree.tag_configure("installed", foreground=GREEN)
+        self._tree.bind("<Double-1>", lambda e: self._on_install_click())
+        for v in self._versions:
+            tag = ("installed",) if v == self._installed_version else ()
+            label = "Yes" if v == self._installed_version else ""
+            self._tree.insert("", "end", iid=v, values=(v, label, "..."), tags=tag)
+        if self._versions:
+            self._tree.selection_set(self._versions[0])
+
+        bar = tk.Frame(self, bg=BG)
+        bar.pack(fill="x", padx=16, pady=(8,4))
+        self._install_btn = _btn(bar, "Install Selected", self._on_install_click,
+                                 style="primary", font=("Segoe UI",9), pady=5, padx=14)
+        self._install_btn.pack(side="left")
+
+        self._status = tk.StringVar(value="Loading version details...")
+        tk.Label(self, textvariable=self._status, bg=BG, fg=CYAN,
+                 font=("Segoe UI",9), wraplength=540, justify="left"
+        ).pack(anchor="w", padx=16, pady=(0,10))
+
+    def _load_requires(self):
+        mod, repo_bases, versions = self._mod, self._repo_bases, self._versions
+        def worker():
+            for v in versions:
+                try:
+                    manifest = _fetch_manifest(repo_bases, mod.id, v, prefer_repo=mod.source_repo)
+                    deps = manifest.dependencies or {}
+                    text = ", ".join(f"{dep_id}>={min_v}" for dep_id, min_v in sorted(deps.items())) or "-"
+                except ModManagerError:
+                    text = "?"
+                self.after(0, lambda v=v, t=text: self._apply_requires(v, t))
+            self.after(0, lambda: self._status.set(""))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_requires(self, version, text):
+        if self._tree.exists(version):
+            values = list(self._tree.item(version, "values"))
+            values[2] = text
+            self._tree.item(version, values=values)
+
+    def _on_install_click(self):
+        sel = self._tree.selection()
+        if not sel:
+            return
+        version = sel[0]
+        self.destroy()
+        self._on_install(version)
+
+
+class CommunityModsWindow(tk.Toplevel):
+    """Card-based browser for community mods pulled from the configured sources.
+    Lists every available mod - description, dependencies, client/server/parity
+    info and all - with a per-card install/update/reinstall button, plus a
+    search box over name/author/id/description. A way of ADDING mods. Managing
+    what's already installed (uninstall, enable/disable, keep-enabled, change
+    version, import/export) lives one level up in ModManagerWindow, which this
+    window is normally opened from. All network and disk work runs off the UI
+    thread; the parent is refreshed through on_change after anything changes."""
+
+    _COL_LABELS = ("Status", "Author", "Mod", "Installed", "Latest", "Source")
+    _WIDTHS     = (90,       110,      160,   74,          64,       110)
     _STATE_WORD = {
         "missing":  "Available",
         "current":  "Installed",
@@ -2990,19 +3099,33 @@ class CommunityModsWindow(tk.Toplevel):
         "current":  "Reinstall",
         "unknown":  "Reinstall",
     }
+    _SIDE_LABEL = {
+        (True, True):   "Client + Server",
+        (True, False):  "Client Only",
+        (False, True):  "Server Only",
+        (False, False): "-",
+    }
 
     def __init__(self, parent, game_dir, side="client", on_change=None):
         super().__init__(parent)
         self.title("Community Mods")
         self.configure(bg=BG)
-        self.geometry("720x460")
-        self.minsize(620, 360)
+        self.geometry("860x580")
+        self.minsize(760, 440)
         self._game_dir  = game_dir
         self._side      = side
         self._on_change = on_change
         self._index     = []      # list[ModSummary], the merged raw index
         self._rows      = {}      # id -> row dict (see _rebuild_rows)
+        self._visible_ids = []    # ids currently shown, filtered + sorted
+        self._card_widgets = {}   # id -> widget refs for in-place updates
+        # (id, version) -> resolved "Requires: ..." text, so re-searching or
+        # reloading after an install doesn't re-fetch a manifest already seen
+        # this session; keyed on version so a bumped release refetches.
+        self._deps_cache   = {}
+        self._deps_pending = set()
         self._busy      = False
+        self._sources_win = None
         self._build()
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         _enable_dark_titlebar(self)
@@ -3010,60 +3133,73 @@ class CommunityModsWindow(tk.Toplevel):
         self._load(force=False)
 
     def _build(self):
+        # Resolved here rather than as a class attribute: PARCH/GREEN/AMBER/
+        # MUTED are host colours wired in by set_helpers, which has always
+        # run by the time a window's _build() executes, but not yet at class
+        # -definition time (module import).
+        self._state_color = {
+            "missing": PARCH, "current": GREEN, "outdated": AMBER, "unknown": MUTED,
+        }
         h = tk.Frame(self, bg=SURF, height=44)
         h.pack(fill="x"); h.pack_propagate(False)
         tk.Label(h, text="Community Mods", bg=SURF, fg=AMBER,
                  font=("Georgia",12,"bold")).pack(side="left", padx=16, pady=8)
         _btn(h, "Manage Sources", self._open_sources, style="dim",
              font=("Segoe UI",9), pady=4, padx=10).pack(side="right", padx=12)
-        if self._side == "client":
-            # Pinning is a join-time concept - only the client renders a
-            # per-server active set at all; a launcher-run server just has one
-            # fixed Mods/, with nothing to pin against.
-            _btn(h, "Pinned Mods", self._open_pinned, style="dim",
-                 font=("Segoe UI",9), pady=4, padx=10).pack(side="right", padx=(12,0))
-        # Modlist import/export applies to both sides - a client's
-        # Mods/ and a launcher-run server's Mods/ are both real installed sets
-        # that can be exported, and either can import one (the same file a
-        # headless server's /modlist can point at directly, with zero
-        # conversion - see export_modlist/import_modlist).
-        _btn(h, "Import Modlist", self._on_import_modlist, style="dim",
-             font=("Segoe UI",9), pady=4, padx=10).pack(side="right", padx=(12,0))
-        _btn(h, "Export Modlist", self._on_export_modlist, style="dim",
-             font=("Segoe UI",9), pady=4, padx=10).pack(side="right", padx=(12,0))
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
 
-        tk.Label(self,
-            text="Mods available from your configured sources. Pick one, then use "
-                 "the buttons below to install, update, or remove it. Sources other "
-                 "than Modding Tavern are not vetted; you install from them at your "
-                 "own risk.",
-            bg=BG, fg=MUTED, font=("Segoe UI",9), wraplength=680, justify="left"
+        desc = ("Mods available from your configured sources. Sources other than "
+                "Modding Tavern are not vetted; you install from them at your "
+                "own risk.")
+        tk.Label(self, text=desc, bg=BG, fg=MUTED, font=("Segoe UI",9),
+                 wraplength=800, justify="left"
         ).pack(anchor="w", padx=16, pady=(10,6))
 
-        table_wrap = tk.Frame(self, bg=BG)
-        table_wrap.pack(fill="both", expand=True, padx=16)
-        self._tree = _mk_tree(table_wrap, self._COLS, self._WIDTHS, height=10)
-        # Colour each row by its state so status reads at a glance without icons.
-        self._tree.tag_configure("missing",  foreground=PARCH)
-        self._tree.tag_configure("current",  foreground=GREEN)
-        self._tree.tag_configure("outdated", foreground=AMBER)
-        self._tree.tag_configure("unknown",  foreground=MUTED)
-        self._tree.tag_configure("disabled", foreground=MUTED)
-        self._tree.bind("<<TreeviewSelect>>", lambda e: self._sync_buttons())
-        self._tree.bind("<Double-1>", lambda e: self._on_primary())
+        sf = tk.Frame(self, bg=BG)
+        sf.pack(fill="x", padx=16, pady=(0,8))
+        tk.Label(sf, text="🔍", bg=BG, fg=MUTED, font=("Segoe UI",10)).pack(side="left")
+        self.v_search = tk.StringVar(value="")
+        self.v_search.trace_add("write", lambda *_: self._apply_filter())
+        tk.Entry(sf, textvariable=self.v_search, bg=SURF, fg=PARCH,
+                 insertbackground=AMBER, relief="flat", font=("Consolas",10),
+                 bd=6).pack(side="left", fill="x", expand=True, padx=(6,0))
+
+        list_wrap = tk.Frame(self, bg=BG)
+        list_wrap.pack(fill="both", expand=True, padx=16)
+
+        header = tk.Frame(list_wrap, bg=SURF)
+        header.pack(fill="x")
+        for text, width in zip(self._COL_LABELS, self._WIDTHS):
+            cell = tk.Frame(header, bg=SURF, width=width, height=24)
+            cell.pack(side="left", fill="y"); cell.pack_propagate(False)
+            tk.Label(cell, text=text, bg=SURF, fg=AMBER, font=("Segoe UI",8,"bold"),
+                     anchor="w").pack(fill="both", padx=6)
+
+        # A Treeview can't host the description/dependency lines each card
+        # needs below its row of columns, so the list itself is a scrollable
+        # stack of card frames instead (same approach as ModDiffWindow).
+        canvas_frame = tk.Frame(list_wrap, bg=BG)
+        canvas_frame.pack(fill="both", expand=True)
+        canvas = tk.Canvas(canvas_frame, bg=BG, highlightthickness=0)
+        vsb = _mk_scrollbar(canvas_frame, canvas.yview)
+        vsb.pack(side="right", fill="y")
+        canvas.config(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        self._canvas = canvas
+        self._cards_frame = tk.Frame(canvas, bg=BG)
+        window = canvas.create_window((0, 0), window=self._cards_frame, anchor="nw")
+        self._cards_frame.bind("<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(window, width=e.width))
+        def _mousewheel(event):
+            if self._cards_frame.winfo_height() <= canvas.winfo_height():
+                return
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind("<MouseWheel>", _mousewheel)
+        self._cards_frame.bind("<MouseWheel>", _mousewheel)
 
         bar = tk.Frame(self, bg=BG)
         bar.pack(fill="x", padx=16, pady=(8,4))
-        self._primary_btn = _btn(bar, "Install", self._on_primary, style="primary",
-                                 font=("Segoe UI",9), pady=5, padx=14)
-        self._primary_btn.pack(side="left")
-        self._uninstall_btn = _btn(bar, "Uninstall", self._on_uninstall, style="danger",
-                                   font=("Segoe UI",9), pady=5, padx=14)
-        self._uninstall_btn.pack(side="left", padx=8)
-        self._toggle_btn = _btn(bar, "Disable", self._on_toggle, style="normal",
-                                font=("Segoe UI",9), pady=5, padx=14)
-        self._toggle_btn.pack(side="left")
         self._refresh_btn = _btn(bar, "Refresh", lambda: self._load(force=True),
                                  style="dim", font=("Segoe UI",9), pady=5, padx=12)
         self._refresh_btn.pack(side="right")
@@ -3074,9 +3210,8 @@ class CommunityModsWindow(tk.Toplevel):
 
         self._status = tk.StringVar(value="Loading community mods...")
         tk.Label(self, textvariable=self._status, bg=BG, fg=CYAN,
-                 font=("Segoe UI",9), wraplength=680, justify="left"
-        ).pack(anchor="w", padx=16, pady=(0,10))
-        self._sync_buttons()
+                 font=("Segoe UI",9), wraplength=800, justify="left"
+        ).pack(anchor="w", padx=16, pady=(10,10))
 
     # -- data loading --
 
@@ -3099,34 +3234,30 @@ class CommunityModsWindow(tk.Toplevel):
     def _render(self, index, available, installed):
         self._index = index
         self._rebuild_rows(available, installed)
-        self._populate_tree()
+        self._populate_cards()
         self._set_busy(False, "")
         self._refresh_states()
 
     def _rebuild_rows(self, available, installed):
+        # installed is cross-referenced only for the "Installed" column's
+        # display value - actually managing that install (uninstall,
+        # enable/disable, version) is ModManagerWindow's job, not this
+        # window's, so a mod that's dropped out of every index no longer
+        # gets a row here at all (it still has one there).
+        installed_by_id = {m["id"]: m for m in installed
+                           if m.get("id") and self._meta_matches_side(m)}
         rows = {}
         for s in available:
+            meta = installed_by_id.get(s.id)
             rows[s.id] = {
-                "name": s.name, "author": s.author or "",
+                "id": s.id, "name": s.name, "author": s.author or "",
+                "description": s.description or "",
+                "client_side": s.client_side, "server_side": s.server_side,
+                "parity_required": s.parity_required,
                 "latest": s.highest(), "source": self._source_label(s.source_repo),
-                "summary": s, "installed": None, "state": "missing", "enabled": None,
+                "summary": s, "installed": meta.get("version", "?") if meta else None,
+                "state": "missing",
             }
-        # Installed mods that have dropped out of every index still need to be
-        # manageable (uninstall/toggle), so fold them in even without a summary.
-        for meta in installed:
-            mod_id = meta.get("id")
-            if not mod_id or not self._meta_matches_side(meta):
-                continue                    # library sidecar (no id) or other side
-            row = rows.get(mod_id)
-            if row is None:
-                rows[mod_id] = {
-                    "name": mod_id, "author": "", "latest": "-", "source": "",
-                    "summary": None, "installed": meta.get("version", "?"),
-                    "state": "unknown", "enabled": meta.get("enabled", True),
-                }
-            else:
-                row["installed"] = meta.get("version", "?")
-                row["enabled"] = meta.get("enabled", True)
         self._rows = rows
 
     def _meta_matches_side(self, meta):
@@ -3136,35 +3267,123 @@ class CommunityModsWindow(tk.Toplevel):
     def _source_label(self, source_repo):
         if _is_default(source_repo):
             return "Modding Tavern"
-        return urlparse(source_repo).netloc or source_repo
+        return _source_display(source_repo)
 
-    # -- table rendering --
+    # -- card rendering --
 
-    def _status_word(self, r):
-        # A disabled mod reads "Disabled" regardless of its version state; the
-        # version comparison is preserved on the row and shown again once enabled.
-        if r.get("enabled") is False:
-            return "Disabled"
-        return self._STATE_WORD.get(r["state"], "")
-
-    def _row_tag(self, r):
-        return "disabled" if r.get("enabled") is False else r["state"]
-
-    def _row_values(self, mod_id):
-        r = self._rows[mod_id]
-        return (self._status_word(r), r["author"], r["name"],
-                r["installed"] or "-", r["latest"], r["source"])
-
-    def _populate_tree(self):
-        keep = self._selected_id()
-        self._tree.delete(*self._tree.get_children())
+    def _populate_cards(self):
+        """Rebuilds every card from scratch - called when the underlying data
+        actually changes (a fresh load, or after an install/uninstall), never
+        on every keystroke. Typing in the search box only re-shows/hides
+        these same card widgets (see _apply_filter); destroying and
+        recreating them per keystroke was what made the buttons flicker."""
+        for child in self._cards_frame.winfo_children():
+            child.destroy()
+        self._card_widgets = {}
         for mod_id in sorted(self._rows, key=lambda i: self._rows[i]["name"].lower()):
-            self._tree.insert("", "end", iid=mod_id,
-                              values=self._row_values(mod_id),
-                              tags=(self._row_tag(self._rows[mod_id]),))
-        if keep and self._tree.exists(keep):
-            self._tree.selection_set(keep)
-        self._sync_buttons()
+            self._mk_card(mod_id)
+        self._apply_filter()
+
+    def _apply_filter(self):
+        """Shows/hides the already-built cards to match the search box,
+        without touching any widget's identity - pack_forget/pack only, so
+        nothing flickers. Order is re-asserted on every call (forgetting
+        every card, then re-packing only the visible ones in name order)
+        since a widget that's re-packed after being forgotten would
+        otherwise land at the end of the stack instead of back in its
+        alphabetical slot."""
+        query = self.v_search.get().strip().lower()
+        def matches(mod_id):
+            if not query:
+                return True
+            r = self._rows[mod_id]
+            hay = f"{r['name']} {r['author']} {r['id']} {r['description']}".lower()
+            return query in hay
+        all_ids = sorted(self._rows, key=lambda i: self._rows[i]["name"].lower())
+        self._visible_ids = [mid for mid in all_ids if matches(mid)]
+
+        for mod_id in all_ids:
+            self._card_widgets[mod_id]["card"].pack_forget()
+        for mod_id in self._visible_ids:
+            self._card_widgets[mod_id]["card"].pack(fill="x", pady=(0,6))
+        self._cards_frame.update_idletasks()
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+        total, shown = len(self._rows), len(self._visible_ids)
+        if query:
+            self._status.set(f"{shown} of {total} mod(s) match '{query}'."
+                             if total else self._status.get())
+        self._queue_dep_fetches()
+
+    def _mk_card(self, mod_id):
+        # Not packed here - _apply_filter (called right after every card is
+        # built) is solely responsible for packing/unpacking cards, so there
+        # aren't two code paths fighting over each card's geometry.
+        r = self._rows[mod_id]
+        card = tk.Frame(self._cards_frame, bg=SURF,
+                        highlightbackground=BORDER, highlightthickness=1)
+
+        top = tk.Frame(card, bg=SURF)
+        top.pack(fill="x", pady=(8,0))
+        cells = []
+        for width in self._WIDTHS:
+            cell = tk.Frame(top, bg=SURF, width=width, height=26)
+            cell.pack(side="left", fill="y"); cell.pack_propagate(False)
+            cells.append(cell)
+        status_cell, author_cell, mod_cell, installed_cell, latest_cell, source_cell = cells
+
+        status_var = tk.StringVar(value=self._STATE_WORD.get(r["state"], ""))
+        status_lbl = tk.Label(status_cell, textvariable=status_var, bg=SURF,
+                              font=("Segoe UI",9), anchor="w")
+        status_lbl.pack(fill="both", padx=6)
+        tk.Label(author_cell, text=r["author"] or "-", bg=SURF, fg=PARCH,
+                 font=("Segoe UI",9), anchor="w").pack(fill="both", padx=6)
+        tk.Label(mod_cell, text=r["name"], bg=SURF, fg=PARCH,
+                 font=("Segoe UI",9,"bold"), anchor="w").pack(fill="both", padx=6)
+        tk.Label(installed_cell, text=r["installed"] or "-", bg=SURF, fg=PARCH,
+                 font=("Segoe UI",9), anchor="w").pack(fill="both", padx=6)
+        tk.Label(latest_cell, text=r["latest"], bg=SURF, fg=PARCH,
+                 font=("Segoe UI",9), anchor="w").pack(fill="both", padx=6)
+        tk.Label(source_cell, text=r["source"], bg=SURF, fg=PARCH,
+                 font=("Segoe UI",9), anchor="w").pack(fill="both", padx=6)
+
+        btn = _btn(top, self._PRIMARY_LABEL.get(r["state"], "Install"),
+                  lambda mid=mod_id: self._on_install_click(mid),
+                  style="primary", font=("Segoe UI",9), pady=4, padx=10, width=11)
+        btn.pack(side="right", padx=(6,10))
+
+        side_text = self._SIDE_LABEL[(r["client_side"], r["server_side"])]
+        parity_text = "Exact version required" if r["parity_required"] else "Any compatible version"
+        tk.Label(card, text=f"{side_text}  ·  {parity_text}", bg=SURF, fg=CYAN,
+                 font=("Segoe UI",8), anchor="w"
+        ).pack(fill="x", padx=10, pady=(4,2))
+
+        tk.Label(card, text=r["description"] or "No description provided.",
+                 bg=SURF, fg=PARCH, font=("Segoe UI",8), wraplength=760,
+                 justify="left", anchor="w"
+        ).pack(fill="x", padx=10, pady=(0,2))
+
+        requires_var = tk.StringVar(value="Loading dependencies…")
+        tk.Label(card, textvariable=requires_var, bg=SURF, fg=PARCH,
+                 font=("Segoe UI",8,"italic"), wraplength=760, justify="left", anchor="w"
+        ).pack(fill="x", padx=10, pady=(0,8))
+
+        self._card_widgets[mod_id] = {
+            "card": card, "status_var": status_var, "status_lbl": status_lbl,
+            "btn": btn, "requires_var": requires_var,
+        }
+        self._apply_card_state(mod_id)
+
+    def _apply_card_state(self, mod_id):
+        r = self._rows.get(mod_id)
+        w = self._card_widgets.get(mod_id)
+        if not r or not w:
+            return
+        state = r["state"]
+        w["status_var"].set(self._STATE_WORD.get(state, ""))
+        w["status_lbl"].config(fg=self._state_color.get(state, MUTED))
+        w["btn"].config(text=self._PRIMARY_LABEL.get(state, "Install"),
+                        state="disabled" if (self._busy or r["summary"] is None) else "normal")
 
     def _refresh_states(self):
         if not self._rows:
@@ -3184,115 +3403,87 @@ class CommunityModsWindow(tk.Toplevel):
         for mod_id, st in states.items():
             if mod_id in self._rows:
                 self._rows[mod_id]["state"] = st
-                if self._tree.exists(mod_id):
-                    self._tree.item(mod_id, values=self._row_values(mod_id),
-                                    tags=(self._row_tag(self._rows[mod_id]),))
-        self._sync_buttons()
+        # All cards, not just the currently-visible ones, so a card hidden
+        # by the search filter is still up to date whenever it reappears.
+        for mod_id in self._card_widgets:
+            self._apply_card_state(mod_id)
 
-    # -- selection / buttons --
+    # -- dependencies (async, cached per id+version) --
 
-    def _selected_id(self):
-        sel = self._tree.selection()
-        return sel[0] if sel else None
-
-    def _sync_buttons(self):
-        sel = self._selected_id()
-        r = self._rows.get(sel) if sel else None
-        if self._busy or r is None:
-            self._primary_btn.config(state="disabled")
-            self._uninstall_btn.config(state="disabled")
-            self._toggle_btn.config(state="disabled")
+    def _queue_dep_fetches(self):
+        repos = list_repos(_load_cfg())
+        to_fetch = []
+        for mod_id in self._visible_ids:
+            r = self._rows[mod_id]
+            if r["summary"] is None:
+                continue
+            key = (mod_id, r["latest"])
+            if key in self._deps_cache:
+                self._apply_deps_text(mod_id, self._deps_cache[key])
+                continue
+            if key in self._deps_pending:
+                continue
+            self._deps_pending.add(key)
+            to_fetch.append((mod_id, key, r["summary"]))
+        if not to_fetch:
             return
-        state = r["state"]
-        self._primary_btn.config(
-            text=self._PRIMARY_LABEL.get(state, "Install"),
-            state="normal" if r["summary"] is not None else "disabled")
-        installed = r["installed"] not in (None, "-")
-        self._uninstall_btn.config(state="normal" if installed else "disabled")
-        # Toggle: label reflects what the click will do; only an installed row
-        # (enabled True/False) can be toggled; a not-installed row (enabled None)
-        # leaves the button disabled.
-        enabled = r.get("enabled")
-        self._toggle_btn.config(
-            text="Enable" if enabled is False else "Disable",
-            state="normal" if enabled in (True, False) else "disabled")
+        def worker():
+            for mod_id, key, summary in to_fetch:
+                try:
+                    manifest = resolve_mod_by_id(repos, mod_id, prefer_repo=summary.source_repo)
+                    deps = manifest.dependencies or {}
+                    text = ("Requires: " + ", ".join(f"{d}>={v}" for d, v in sorted(deps.items()))
+                           if deps else "No dependencies.")
+                except ModManagerError:
+                    text = "Couldn't load dependency info."
+                self._deps_cache[key] = text
+                self._deps_pending.discard(key)
+                self.after(0, lambda mid=mod_id, t=text: self._apply_deps_text(mid, t))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_deps_text(self, mod_id, text):
+        w = self._card_widgets.get(mod_id)
+        if w:
+            w["requires_var"].set(text)
 
     # -- actions --
 
-    def _on_primary(self):
+    def _on_install_click(self, mod_id):
         if self._busy:
             return
-        r = self._rows.get(self._selected_id())
+        r = self._rows.get(mod_id)
         if not r or r["summary"] is None:
             return
-        mod = r["summary"]
+        self._install(r["summary"])
+
+    def _install(self, mod, version=None):
+        """Installs `mod`'s closure, at `version` if given, else
+        mod.highest() (the ordinary Install/Update/Reinstall path)."""
+        if self._busy:
+            return
         if not _melonloader_installed(self._game_dir):
             messagebox.showwarning("Install MelonLoader first",
                 f"{mod.name} is a MelonLoader mod. Install MelonLoader from the "
-                "Mods window first.", parent=self)
+                "Setup window first.", parent=self)
             return
         if not _tavernlib_installed(self._game_dir):
             messagebox.showwarning("Install TavernLib first",
-                f"{mod.name} needs TavernLib. Install it from the Mods window "
+                f"{mod.name} needs TavernLib. Install it from the Setup window "
                 "first.", parent=self)
             return
-        self._set_busy(True, f"Installing {mod.name}...")
+        label = f"{mod.name} {version}" if version else mod.name
+        self._set_busy(True, f"Installing {label}...")
         index = self._index
         def worker():
             try:
                 repos = list_repos(_load_cfg())
                 install_mod_closure(
                     self._game_dir, mod, index, repos,
-                    lambda m: self.after(0, lambda: self._status.set(m)))
-                self.after(0, lambda: self._finish(f"{mod.name} installed."))
+                    lambda m: self.after(0, lambda: self._status.set(m)),
+                    version=version)
+                self.after(0, lambda: self._finish(f"{label} installed."))
             except Exception as e:
                 self.after(0, lambda e=e: self._finish(f"Install failed: {e}"))
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_uninstall(self):
-        if self._busy:
-            return
-        sel = self._selected_id()
-        r = self._rows.get(sel) if sel else None
-        if not r or r["installed"] in (None, "-"):
-            return
-        if not messagebox.askyesno("Remove mod",
-                f"Remove {r['name']} from your game?\n\nThis deletes its folder from "
-                "Mods/. Libraries shared with other installed mods are left in place.",
-                parent=self):
-            return
-        self._set_busy(True, f"Removing {r['name']}...")
-        game_dir, name = self._game_dir, r["name"]
-        def worker():
-            try:
-                removed = uninstall_mod(game_dir, sel)
-                self.after(0, lambda: self._finish(
-                    f"{name} removed." if removed else f"{name} was not installed."))
-            except Exception as e:
-                self.after(0, lambda e=e: self._finish(f"Remove failed: {e}"))
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_toggle(self):
-        if self._busy:
-            return
-        sel = self._selected_id()
-        r = self._rows.get(sel) if sel else None
-        if not r or r.get("enabled") not in (True, False):
-            return
-        disabling = r["enabled"] is True
-        self._set_busy(True, f"{'Disabling' if disabling else 'Enabling'} {r['name']}...")
-        game_dir, name = self._game_dir, r["name"]
-        def worker():
-            try:
-                if disabling:
-                    ok = disable_mod(game_dir, sel)
-                    msg = f"{name} disabled." if ok else f"Couldn't disable {name}."
-                else:
-                    ok = enable_mod(game_dir, sel)
-                    msg = f"{name} enabled." if ok else f"Couldn't enable {name}."
-                self.after(0, lambda: self._finish(msg))
-            except Exception as e:
-                self.after(0, lambda e=e: self._finish(f"Toggle failed: {e}"))
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_clear_cache(self):
@@ -3330,17 +3521,451 @@ class CommunityModsWindow(tk.Toplevel):
         except Exception:
             return
         self._rebuild_rows(available, installed)
-        self._populate_tree()
+        self._populate_cards()
 
     def _open_sources(self):
         if self._busy:
             return
-        ModSourcesWindow(self, on_change=lambda: self._load(force=True))
+        if self._sources_win and self._sources_win.winfo_exists():
+            self._sources_win.lift(); return
+        self._sources_win = ModSourcesWindow(self, on_change=lambda: self._load(force=True))
 
-    def _open_pinned(self):
+    def _set_busy(self, busy, msg=""):
+        self._busy = busy
+        self._refresh_btn.config(state="disabled" if busy else "normal")
+        if msg or not busy:
+            self._status.set(msg)
+        for mod_id in self._card_widgets:
+            self._apply_card_state(mod_id)
+
+
+class ModManagerWindow(tk.Toplevel):
+    """Everything currently sitting in Mods/ on this machine: mods this
+    manager installed (folder + manifest.json/manifest.disabled.json - see
+    list_installed_mods) and mods that got there some other way (a loose
+    root .dll, or a folder with a manifest this manager didn't write - see
+    list_untracked_mods), told apart by the "Managed"/"Untracked" column.
+    This is where an already-installed mod actually gets MANAGED - enable/
+    disable, uninstall, keep-enabled, change version, import/export a
+    modlist. Browsing the full repo to add something new is the separate,
+    narrower CommunityModsWindow, opened from here rather than shown inline,
+    so this table only ever lists what's really on disk."""
+
+    _COLS   = ("status", "author", "mod", "installed", "latest", "managed", "source")
+    _WIDTHS = (90,       110,      160,   74,          70,       80,        120)
+    _STATE_WORD = {
+        "missing":  "Missing",
+        "current":  "Up to date",
+        "outdated": "Update ready",
+        "unknown":  "Installed",
+    }
+
+    def __init__(self, parent, game_dir, side="client", on_change=None):
+        super().__init__(parent)
+        self.title("Mod Manager")
+        self.configure(bg=BG)
+        self.geometry("800x480")
+        self.minsize(680, 380)
+        self._game_dir  = game_dir
+        self._side      = side
+        self._on_change = on_change
+        self._index     = []      # list[ModSummary], the merged raw index
+        self._rows      = {}      # row id -> row dict (see _rebuild_rows)
+        self._busy      = False
+        self._community_win = None
+        # Pinning is a join-time concept - only the client renders a
+        # per-server active set at all; a launcher-run server just has one
+        # fixed Mods/, with nothing to pin against.
+        self._pinned_ids = set()
+        self._build()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        _enable_dark_titlebar(self)
+        self.transient(parent)
+        self._load(force=False)
+
+    def _build(self):
+        h = tk.Frame(self, bg=SURF, height=44)
+        h.pack(fill="x"); h.pack_propagate(False)
+        tk.Label(h, text="Mod Manager", bg=SURF, fg=AMBER,
+                 font=("Georgia",12,"bold")).pack(side="left", padx=16, pady=8)
+        _btn(h, "Community Mods", self._open_community, style="dim",
+             font=("Segoe UI",9), pady=4, padx=10).pack(side="right", padx=12)
+        # Modlist import/export applies to both sides - a client's Mods/ and
+        # a launcher-run server's Mods/ are both real installed sets that can
+        # be exported, and either can import one (the same file a headless
+        # server's /modlist can point at directly, with zero conversion -
+        # see export_modlist/import_modlist).
+        _btn(h, "Import Modlist", self._on_import_modlist, style="dim",
+             font=("Segoe UI",9), pady=4, padx=10).pack(side="right", padx=(12,0))
+        _btn(h, "Export Modlist", self._on_export_modlist, style="dim",
+             font=("Segoe UI",9), pady=4, padx=10).pack(side="right", padx=(12,0))
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
+
+        desc = ("Every mod installed on this machine - the ones this launcher "
+                 "manages plus anything dropped into Mods/ by hand (marked "
+                 "\"Untracked\"). Select one, then enable/disable, remove, or "
+                 "(managed mods only) change its version, or right-click for the "
+                 "same options. To add something new, use Community Mods.")
+        tk.Label(self, text=desc, bg=BG, fg=MUTED, font=("Segoe UI",9),
+                 wraplength=760, justify="left"
+        ).pack(anchor="w", padx=16, pady=(10,6))
+
+        table_wrap = tk.Frame(self, bg=BG)
+        table_wrap.pack(fill="both", expand=True, padx=16)
+        self._tree = _mk_tree(table_wrap, self._COLS, self._WIDTHS, height=10)
+        self._tree.tag_configure("missing",   foreground=PARCH)
+        self._tree.tag_configure("current",   foreground=GREEN)
+        self._tree.tag_configure("outdated",  foreground=AMBER)
+        self._tree.tag_configure("unknown",   foreground=MUTED)
+        self._tree.tag_configure("untracked", foreground=PARCH)
+        self._tree.tag_configure("disabled",  foreground=MUTED)
+        self._tree.bind("<<TreeviewSelect>>", lambda e: self._sync_buttons())
+        self._tree.bind("<Button-3>", self._on_right_click)
+
+        bar = tk.Frame(self, bg=BG)
+        bar.pack(fill="x", padx=16, pady=(8,4))
+        self._uninstall_btn = _btn(bar, "Uninstall", self._on_uninstall, style="danger",
+                                   font=("Segoe UI",9), pady=5, padx=14)
+        self._uninstall_btn.pack(side="left")
+        self._toggle_btn = _btn(bar, "Disable", self._on_toggle, style="normal",
+                                font=("Segoe UI",9), pady=5, padx=14)
+        self._toggle_btn.pack(side="left", padx=8)
+        self._refresh_btn = _btn(bar, "Refresh", lambda: self._load(force=True),
+                                 style="dim", font=("Segoe UI",9), pady=5, padx=12)
+        self._refresh_btn.pack(side="right")
+
+        self._status = tk.StringVar(value="Loading installed mods...")
+        tk.Label(self, textvariable=self._status, bg=BG, fg=CYAN,
+                 font=("Segoe UI",9), wraplength=760, justify="left"
+        ).pack(anchor="w", padx=16, pady=(10,10))
+        self._sync_buttons()
+
+    # -- data loading --
+
+    def _load(self, force=False):
+        self._set_busy(True, "Loading installed mods...")
+        prev_index = self._index
+        def worker():
+            try:
+                installed = list_installed_mods(self._game_dir)
+                untracked = list_untracked_mods(self._game_dir)
+            except Exception as e:
+                self.after(0, lambda e=e: self._load_failed(e))
+                return
+            # What's actually installed/untracked is purely local - a mod is
+            # still there whether or not the index is reachable right now.
+            # The index is only needed for extra context (author, latest
+            # version, update state, Change Version), so a fetch failure
+            # degrades to showing that context stale/missing rather than
+            # hiding the whole table.
+            try:
+                repos = list_repos(_load_cfg())
+                index = fetch_indexes(repos, force=force)
+            except Exception:
+                index = prev_index
+            self.after(0, lambda: self._render(index, installed, untracked))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _load_failed(self, err):
+        self._set_busy(False, f"Couldn't read installed mods: {err}")
+
+    def _render(self, index, installed, untracked):
+        self._index = index
+        if self._side == "client":
+            self._pinned_ids = {_parse_pin_entry(p)[0] for p in list_pinned(_load_cfg())}
+        self._rebuild_rows(installed, untracked)
+        self._populate_tree()
+        self._set_busy(False, "")
+        self._refresh_states()
+
+    def _rebuild_rows(self, installed, untracked):
+        summaries = {}     # id -> ModSummary with the highest version seen
+        for s in self._index:
+            cur = summaries.get(s.id)
+            if cur is None or _parse_version(s.highest()) > _parse_version(cur.highest()):
+                summaries[s.id] = s
+        rows = {}
+        for meta in installed:
+            mod_id = meta.get("id")
+            if not mod_id or not self._meta_matches_side(meta):
+                continue
+            s = summaries.get(mod_id)
+            rows[f"m:{mod_id}"] = {
+                "kind": "managed", "key": mod_id,
+                "name": s.name if s else mod_id,
+                "author": s.author if s else "",
+                "installed": meta.get("version", "?"),
+                "latest": s.highest() if s else "-",
+                "managed": "Managed",
+                "source": self._source_label(s.source_repo) if s else "-",
+                "summary": s, "state": "unknown",
+                "enabled": meta.get("enabled", True),
+            }
+        for u in untracked:
+            rows[f"u:{u['kind']}:{u['name']}"] = {
+                "kind": f"untracked_{u['kind']}", "key": u["name"],
+                "name": u["name"], "author": "", "installed": "-", "latest": "-",
+                "managed": "Untracked", "source": "-",
+                "summary": None, "state": None, "enabled": u["enabled"],
+            }
+        self._rows = rows
+
+    def _meta_matches_side(self, meta):
+        key = "client_side" if self._side == "client" else "server_side"
+        return meta.get(key, True)
+
+    def _source_label(self, source_repo):
+        if _is_default(source_repo):
+            return "Modding Tavern"
+        return _source_display(source_repo)
+
+    # -- table rendering --
+
+    def _status_word(self, r):
+        if r["kind"] != "managed":
+            return "Enabled" if r["enabled"] else "Disabled"
+        if r.get("enabled") is False:
+            return "Disabled"
+        return self._STATE_WORD.get(r["state"], "")
+
+    def _row_tag(self, r):
+        if r.get("enabled") is False:
+            return "disabled"
+        if r["kind"] != "managed":
+            return "untracked"
+        return r["state"] or "current"
+
+    def _row_values(self, row_id):
+        r = self._rows[row_id]
+        return (self._status_word(r), r["author"], r["name"],
+                r["installed"], r["latest"], r["managed"], r["source"])
+
+    def _populate_tree(self):
+        keep = self._selected_id()
+        self._tree.delete(*self._tree.get_children())
+        for row_id in sorted(self._rows, key=lambda i: self._rows[i]["name"].lower()):
+            self._tree.insert("", "end", iid=row_id,
+                              values=self._row_values(row_id),
+                              tags=(self._row_tag(self._rows[row_id]),))
+        if keep and self._tree.exists(keep):
+            self._tree.selection_set(keep)
+        self._sync_buttons()
+
+    def _refresh_states(self):
+        managed_ids = [r["key"] for r in self._rows.values() if r["kind"] == "managed"]
+        if not managed_ids:
+            return
+        index, game_dir = self._index, self._game_dir
+        def worker():
+            states = {}
+            for mod_id in managed_ids:
+                try:
+                    states[mod_id] = mod_status(game_dir, mod_id, index)
+                except Exception:
+                    states[mod_id] = "unknown"
+            self.after(0, lambda: self._apply_states(states))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_states(self, states):
+        for row_id, r in self._rows.items():
+            if r["kind"] == "managed" and r["key"] in states:
+                r["state"] = states[r["key"]]
+                if self._tree.exists(row_id):
+                    self._tree.item(row_id, values=self._row_values(row_id),
+                                    tags=(self._row_tag(r),))
+        self._sync_buttons()
+
+    # -- selection / buttons --
+
+    def _selected_id(self):
+        sel = self._tree.selection()
+        return sel[0] if sel else None
+
+    def _sync_buttons(self):
+        sel = self._selected_id()
+        r = self._rows.get(sel) if sel else None
+        if self._busy or r is None:
+            self._uninstall_btn.config(state="disabled")
+            self._toggle_btn.config(state="disabled")
+            return
+        self._uninstall_btn.config(state="normal" if r["kind"] == "managed" else "disabled")
+        self._toggle_btn.config(text="Enable" if not r["enabled"] else "Disable", state="normal")
+
+    # -- actions --
+
+    def _on_right_click(self, event):
+        row = self._tree.identify_row(event.y)
+        if not row:
+            return
+        self._tree.selection_set(row)
+        self._sync_buttons()
+        r = self._rows.get(row)
+        if not r:
+            return
+        menu = self._build_context_menu(row, r)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _build_context_menu(self, row_id, r):
+        """Untracked rows are deliberately surfacing-and-toggling only (see
+        list_untracked_mods): no Uninstall (we don't own the file/folder well
+        enough to promise a clean removal) and no Change Version (no manifest
+        to resolve one against)."""
+        menu = tk.Menu(self, tearoff=0, bg=SURF, fg=PARCH,
+                       activebackground=AMBERDIM, activeforeground=PARCH)
+        managed = r["kind"] == "managed"
+
+        menu.add_command(label="Uninstall", command=self._on_uninstall,
+                         state="normal" if managed else "disabled")
+        menu.add_command(label="Enable" if not r["enabled"] else "Disable",
+                         command=self._on_toggle)
+
+        if managed and self._side == "client":
+            menu.add_separator()
+            # Kept alive on self so Tk's variable trace survives past this
+            # call - a BooleanVar with no surviving Python reference can be
+            # garbage-collected while the menu is still open.
+            self._pin_var = tk.BooleanVar(value=r["key"] in self._pinned_ids)
+            menu.add_checkbutton(label="Keep Enabled", variable=self._pin_var,
+                                 command=lambda: self._toggle_pin(r["key"]))
+
+        if managed and r["summary"] is not None:
+            versions = self._available_versions(r["key"])
+            if versions:
+                menu.add_separator()
+                menu.add_command(label="Change Version",
+                                 command=lambda: self._open_version_window(
+                                     r["summary"], versions, r["installed"]))
+
+        return menu
+
+    def _available_versions(self, mod_id):
+        """Every version of mod_id across every major in the loaded index
+        (only the highest major is kept per id above), newest first."""
+        versions = set()
+        for s in self._index:
+            if s.id == mod_id:
+                versions.update(s.versions)
+        return sorted(versions, key=_parse_version, reverse=True)
+
+    def _open_version_window(self, mod, versions, installed_version):
+        repos = list_repos(_load_cfg())
+        ModVersionWindow(self, mod, versions, installed_version, repos,
+                         on_install=lambda v: self._install_version(mod, v))
+
+    def _install_version(self, mod, version):
         if self._busy:
             return
-        PinnedModsWindow(self)
+        if not _melonloader_installed(self._game_dir):
+            messagebox.showwarning("Install MelonLoader first",
+                f"{mod.name} is a MelonLoader mod. Install MelonLoader from the "
+                "Setup window first.", parent=self)
+            return
+        if not _tavernlib_installed(self._game_dir):
+            messagebox.showwarning("Install TavernLib first",
+                f"{mod.name} needs TavernLib. Install it from the Setup window "
+                "first.", parent=self)
+            return
+        label = f"{mod.name} {version}"
+        self._set_busy(True, f"Installing {label}...")
+        index = self._index
+        def worker():
+            try:
+                repos = list_repos(_load_cfg())
+                install_mod_closure(
+                    self._game_dir, mod, index, repos,
+                    lambda m: self.after(0, lambda: self._status.set(m)),
+                    version=version)
+                self.after(0, lambda: self._finish(f"{label} installed."))
+            except Exception as e:
+                self.after(0, lambda e=e: self._finish(f"Install failed: {e}"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_uninstall(self):
+        if self._busy:
+            return
+        sel = self._selected_id()
+        r = self._rows.get(sel) if sel else None
+        if not r or r["kind"] != "managed":
+            return
+        if not messagebox.askyesno("Remove mod",
+                f"Remove {r['name']} from your game?\n\nThis deletes its folder from "
+                "Mods/. Libraries shared with other installed mods are left in place.",
+                parent=self):
+            return
+        self._set_busy(True, f"Removing {r['name']}...")
+        game_dir, name, mod_id = self._game_dir, r["name"], r["key"]
+        def worker():
+            try:
+                removed = uninstall_mod(game_dir, mod_id)
+                self.after(0, lambda: self._finish(
+                    f"{name} removed." if removed else f"{name} was not installed."))
+            except Exception as e:
+                self.after(0, lambda e=e: self._finish(f"Remove failed: {e}"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_toggle(self):
+        if self._busy:
+            return
+        sel = self._selected_id()
+        r = self._rows.get(sel) if sel else None
+        if not r:
+            return
+        disabling = r["enabled"] is True
+        self._set_busy(True, f"{'Disabling' if disabling else 'Enabling'} {r['name']}...")
+        game_dir, name, kind, key = self._game_dir, r["name"], r["kind"], r["key"]
+        def worker():
+            try:
+                if kind in ("managed", "untracked_folder"):
+                    ok = disable_mod(game_dir, key) if disabling else enable_mod(game_dir, key)
+                else:
+                    ok = (disable_untracked_dll(game_dir, key) if disabling
+                          else enable_untracked_dll(game_dir, key))
+                verb = "disabled" if disabling else "enabled"
+                msg = f"{name} {verb}." if ok else f"Couldn't {verb[:-1]} {name}."
+                self.after(0, lambda: self._finish(msg))
+            except Exception as e:
+                self.after(0, lambda e=e: self._finish(f"Toggle failed: {e}"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _toggle_pin(self, mod_id):
+        cfg = _load_cfg()
+        try:
+            if mod_id in self._pinned_ids:
+                remove_pin(cfg, mod_id)
+            else:
+                add_pin(cfg, mod_id)
+        except ModManagerError as e:
+            self._status.set(str(e))
+            return
+        self._pinned_ids = {_parse_pin_entry(p)[0] for p in list_pinned(cfg)}
+
+    def _finish(self, msg):
+        self._set_busy(False, msg)
+        # The available set didn't change, only what's on disk, so re-scan
+        # installed/untracked state locally rather than re-fetching the index.
+        self._reconcile_installed()
+        self._refresh_states()
+        if self._on_change:
+            self._on_change()
+
+    def _reconcile_installed(self):
+        try:
+            installed = list_installed_mods(self._game_dir)
+            untracked = list_untracked_mods(self._game_dir)
+        except Exception:
+            return
+        self._rebuild_rows(installed, untracked)
+        self._populate_tree()
+
+    def _open_community(self):
+        if self._community_win and self._community_win.winfo_exists():
+            self._community_win.lift(); return
+        self._community_win = CommunityModsWindow(
+            self, self._game_dir, side=self._side,
+            on_change=lambda: self._load(force=True))
 
     def _on_export_modlist(self):
         if self._busy:
@@ -3391,10 +4016,14 @@ class CommunityModsWindow(tk.Toplevel):
     def _confirm_import(self, plan):
         self._set_busy(False)
         all_mods = plan.roots + plan.dependencies
+        to_disable = modlist_import_disables(self._game_dir, plan)
         lines = []
         if all_mods:
             lines.append("Will install:")
             lines += [f"  • {m.id} {m.version}" for m in all_mods]
+        if to_disable:
+            lines.append("Will disable (not in this modlist):")
+            lines += [f"  • {mid}" for mid in to_disable]
         if plan.unresolved:
             lines.append("Could not resolve (add the right source, then re-import):")
             lines += [f"  • {mid}" + (f" {v}" if v else "") for mid, v in plan.unresolved]
@@ -3403,9 +4032,9 @@ class CommunityModsWindow(tk.Toplevel):
         if plan.blocking:
             messagebox.showerror("Modlist has unresolved mods", "\n".join(lines), parent=self)
             return
-        if not all_mods:
+        if not all_mods and not to_disable:
             messagebox.showinfo("Nothing to import",
-                "This modlist has nothing new to install.", parent=self)
+                "This modlist has nothing new to install or disable.", parent=self)
             return
         if not messagebox.askyesno("Import modlist",
                 "\n".join(lines) + "\n\nInstall these now?", parent=self):
@@ -3417,7 +4046,10 @@ class CommunityModsWindow(tk.Toplevel):
             try:
                 apply_import(game_dir, plan,
                              lambda m: self.after(0, lambda: self._status.set(m)))
-                self.after(0, lambda: self._finish(f"Imported {len(plan.roots)} mod(s)."))
+                msg = f"Imported {len(plan.roots)} mod(s)."
+                if to_disable:
+                    msg += f" Disabled {len(to_disable)}."
+                self.after(0, lambda: self._finish(msg))
             except Exception as e:
                 self.after(0, lambda e=e: self._finish(f"Import failed: {e}"))
         threading.Thread(target=worker, daemon=True).start()
