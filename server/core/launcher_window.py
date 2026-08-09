@@ -365,7 +365,7 @@ class ServerLauncher(tk.Tk):
                 # on success — if we get here at all, something went wrong
                 # after the point of no return.
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Update failed",
+                self.after(0, lambda e=e: messagebox.showerror("Update failed",
                     f"Couldn't apply the update:\n{e}\n\n"
                     "The current version is unaffected — nothing was replaced.", parent=self))
         threading.Thread(target=worker, daemon=True).start()
