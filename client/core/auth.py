@@ -128,7 +128,13 @@ def _recv_framed(s, timeout):
 
 def fetch_server_mods(host, timeout=10):
     """Fetches the server's full installed-mods list: every currently-enabled
-    mod as {"id","version","client_side","server_side"}.
+    mod as {"id", "version", "client_side", "server_side", "parity_required",
+    "source_repo"} -- the same six fields handshake_snapshot builds and
+    TavernLib's ModHandshake.Entry serialises, so both kinds of server answer
+    this identically. parity_required decides whether a client must match a mod
+    or may decline it, and source_repo is a hint only (never resolved into a
+    pull on its own); omitting either from a caller's expectations turns a
+    "recommended" mod into a hard join failure.
     Only called on a mods_hash cache miss (or right before a join); the
     ordinary ping/pong stays a single small recv, this is the one request that
     needs proper length-prefixed framing since a large mod list can genuinely

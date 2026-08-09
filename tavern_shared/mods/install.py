@@ -552,9 +552,18 @@ def handshake_snapshot(game_dir):
     mod-sync check. Disabled mods are excluded: they aren't loaded, so a
     joining client shouldn't be asked to match them. Returns
     (mods_hash, mods_count, mods_list):
-    - mods_hash: sha256 of the sorted "id@version" list, joined with newlines.
-      A client caches this per server; an unchanged hash means it already has
-      the full list and skips the extra round trip.
+    - mods_hash: sha256 of the id-sorted "id@version@req|opt" lines, joined
+      with newlines ("req" when parity_required, "opt" otherwise). A client
+      caches this per server; an unchanged hash means it already has the full
+      list and skips the extra round trip.
+
+      This exact format is a cross-language invariant: TavernLib computes the
+      same hash in C# (Backend/Mods/ModHandshake.cs, whose own comment says it
+      must stay byte-identical to this) and a client compares the two. Changing
+      the separator, the ordering, or which fields take part silently breaks
+      every join against a server running the other side's build -- the hash
+      just never matches, there is no version negotiation, and nothing reports
+      a mismatch as such. Sorting is by id, ordinal on both sides.
     - mods_count: len(mods_list), sent alongside the hash in the pong so a
       client can sanity-check its cache without decoding anything.
     - mods_list: every entry as {"id", "version", "client_side", "server_side",
