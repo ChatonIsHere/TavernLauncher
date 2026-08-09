@@ -45,9 +45,8 @@ class ModDiffWindow(tk.Toplevel):
     _WIDTHS = (280, 90, 90, 190)   # mod, server, you, action
 
     # Row colour per action, keyed by an abstract tag name resolved to an
-    # actual colour in _build (once the host's palette is wired in via
-    # set_helpers). Reads as a diff at a glance: additions green, removals
-    # red, version changes amber, problems red, quiet rows muted.
+    # actual colour in _build. Reads as a diff at a glance: additions green,
+    # removals red, version changes amber, problems red, quiet rows muted.
     _TAGS = {
         ACTION_INSTALL:     "add",   ACTION_ACTIVATE: "add",  ACTION_ENABLE: "add",
         ACTION_UPDATE:      "chg",   ACTION_DOWNGRADE: "chg",
@@ -127,8 +126,7 @@ class ModDiffWindow(tk.Toplevel):
             bg=BG, fg=MUTED, font=("Segoe UI",9), wraplength=720, justify="left"
         ).pack(anchor="w", padx=16, pady=(10,6))
 
-        # Colour per abstract tag, resolved now that the host's palette is
-        # wired in (set_helpers ran before this window could ever open).
+        # Colour per abstract tag, resolved against the shared palette.
         self._tag_colors = {
             "add": GREEN, "chg": AMBER, "del": RED, "same": MUTED, "bad": RED,
             "kept": CYAN, "working": AMBER, "done": GREEN,
