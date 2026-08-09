@@ -74,6 +74,11 @@ def _btn(parent, text, cmd, style="normal", **kw):
     }[style]
     return tk.Button(parent, text=text, bg=colors[0], fg=colors[1],
                      activebackground=colors[2], activeforeground=colors[3],
+                     # Tk's default disabled grey is nearly invisible on this
+                     # palette, and SetupWindow disables step buttons until
+                     # their prerequisite is installed -- a state the user has
+                     # to be able to read.
+                     disabledforeground=MUTED,
                      relief="flat", bd=0, cursor="hand2", command=cmd, **kw)
 
 

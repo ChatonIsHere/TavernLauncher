@@ -80,7 +80,10 @@ def ticket_request(host, action, username, token, timeout=10, **kwargs):
 
 
 def ping_server(host, timeout=5):
-    """Returns (info_dict, latency_ms) or raises."""
+    """Returns (info_dict, latency_ms) or raises. info_dict carries mods_hash/
+    mods_count alongside the existing fields when the server supports it. An
+    older server without them just omits those keys, so callers must use
+    .get(), not [] indexing, for either."""
     t0 = time.time()
     s  = socket.socket()
     s.settimeout(timeout)
@@ -90,6 +93,62 @@ def ping_server(host, timeout=5):
     ms  = int((time.time() - t0) * 1000)
     s.close()
     return json.loads(raw.decode()), ms
+
+
+# Hard ceiling on a framed response body.
+_MAX_FRAMED_BYTES = 8 * 1024 * 1024
+
+
+def _recv_framed(s, timeout):
+    """Reads one length-prefixed message: a 4-byte big-endian byte count, then
+    exactly that many bytes, looping recv() since a single call can return a
+    partial read no matter the buffer size. Raises on a short/closed stream, or
+    on a declared length past _MAX_FRAMED_BYTES (rejected from the header alone,
+    before a single body byte is read or buffered)."""
+    s.settimeout(timeout)
+    header = b""
+    while len(header) < 4:
+        chunk = s.recv(4 - len(header))
+        if not chunk:
+            raise ConnectionError("Connection closed while reading length header.")
+        header += chunk
+    length = int.from_bytes(header, "big")
+    if length > _MAX_FRAMED_BYTES:
+        raise ConnectionError(
+            f"Server declared a {length}-byte response, over the "
+            f"{_MAX_FRAMED_BYTES}-byte limit; refusing to read it.")
+    body = bytearray()
+    while len(body) < length:
+        chunk = s.recv(min(65536, length - len(body)))
+        if not chunk:
+            raise ConnectionError("Connection closed while reading message body.")
+        body += chunk
+    return bytes(body)
+
+
+def fetch_server_mods(host, timeout=10):
+    """Fetches the server's full installed-mods list: every currently-enabled
+    mod as {"id","version","client_side","server_side"}.
+    Only called on a mods_hash cache miss (or right before a join); the
+    ordinary ping/pong stays a single small recv, this is the one request that
+    needs proper length-prefixed framing since a large mod list can genuinely
+    exceed one recv's buffer. Raises on any connection/parse failure or a
+    server that doesn't understand the request (older TavernLib/launcher)."""
+    s = socket.socket()
+    s.settimeout(timeout)
+    try:
+        s.connect((host, AUTH_PORT))
+        s.sendall(json.dumps({"mods_list": True}).encode())
+        body = _recv_framed(s, timeout)
+    finally:
+        # Closed on every path: this runs against an unreachable or misbehaving
+        # host often enough that leaking the socket on the error path matters.
+        try: s.close()
+        except OSError: pass
+    resp = json.loads(body.decode())
+    if resp.get("status") != "ok":
+        raise Exception(resp.get("message", "Server rejected the mods list request."))
+    return resp.get("mods", [])
 
 
 def _b64url(b): return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
@@ -127,7 +186,7 @@ def _valid_port(value, default=1757):
         return default
 
 
-def build_tokens(user_id, username, tavern_token=""):
+def build_tokens(user_id, username, tavern_token="", mods_claim=""):
     """tavern_token is our OWN internal secret (the same one _get_or_create_token
     already tracks per server+username) — embedded here as an extra custom
     claim purely for a server-side mod to verify independently. UserId and
@@ -139,7 +198,22 @@ def build_tokens(user_id, username, tavern_token=""):
     that's only ever handed out after actually passing the auth handshake
     (password, whitelist, blacklist all included), so a mod checking it
     against the server's own records closes that gap regardless of what
-    else the presented JWT claims to be."""
+    else the presented JWT claims to be.
+
+    mods_claim is a JSON object string of {mod_id: version} for every
+    community mod currently enabled on this machine, the client's own side of
+    TavernLib's exact-version mod-parity check (PlayerJoinFilter /
+    ModParity.ValidateClient), read off the same "TavernMods" claim. Empty
+    string when there's nothing to report (no mods enabled, or the caller
+    didn't compute one); a server with no client_side-required mods ignores it
+    either way.
+
+    Both TavernToken and TavernMods go on the identity token as well as the
+    access token, because the identity one is what the game actually sends as
+    RequestJoinMessage.UserCredentials - the only token a server ever reads
+    these off. On the access token alone the claim never arrives, the server
+    sees a client with no mods, and every mod it requires of clients comes
+    back as a mismatch no matter what's installed."""
     exp, uid = 9999999999, str(user_id)
     a = _jwt({"UserId":uid,"Username":username,"role":"Access","is_verified":"True",
               "is_member":"True","Policy":["offline","play_offline","server_access_pre_alpha",
@@ -147,11 +221,11 @@ def build_tokens(user_id, username, tavern_token=""):
               "server_access_development","server_access_testing","game_access_testing",
               "server_owner","debug_features","admin_vr_modes","database_admin",
               "server_create_development","reuse_refresh_tokens"],
-              "TavernToken":tavern_token,
+              "TavernToken":tavern_token,"TavernMods":mods_claim,
               "exp":exp,"iss":"AltaWebAPI","aud":"AltaClient"})
     r = _jwt({"UserId":uid,"role":"Refresh","exp":exp,"iss":"AltaWebAPI","aud":"AltaClient"})
     i = _jwt({"UserId":uid,"Username":username,"role":"Identity","is_member":"True",
-              "is_dev":"True","TavernToken":tavern_token,
+              "is_dev":"True","TavernToken":tavern_token,"TavernMods":mods_claim,
               "exp":exp,"iss":"AltaWebAPI","aud":"AltaClient"})
     return a, r, i
 
