@@ -7,10 +7,11 @@ from tavern_shared.mods.errors import ModManagerError
 
 
 def _tavern_data_dir():
-    """Same shared appdata folder both mono files already use for their own
-    config (%AppData%/TheModdingTavern) - a small, dependency-free copy rather
-    than a set_helpers()-borrowed one, since it's a pure function of the
-    environment, not host state. Home for the client mod cache."""
+    """The same %AppData%/TheModdingTavern folder tavern_shared.paths resolves,
+    kept as a small local copy rather than an import: it is a pure function of
+    the environment, and this module is the one the tests redirect (see
+    cache._cache_base) to point the mod cache at a temp directory. Home for the
+    client mod cache."""
     base = os.environ.get("APPDATA", os.path.join(os.path.expanduser("~"), "AppData", "Roaming"))
     return os.path.join(base, "TheModdingTavern")
 
