@@ -135,18 +135,29 @@ class SetupWindow(tk.Toplevel):
         "current": "Up to date.",
     }
 
-    def _refresh_states(self):
-        self._status.set("Checking status…")
+    def _refresh_states(self, keep_status=None):
+        """Re-reads what's installed and repaints the rows.
+
+        keep_status is the message from a just-finished install, held on screen
+        across the whole refresh instead of the usual "Checking status…" ->
+        blank cycle. Without it the refresh this method's own caller triggers
+        overwrites that message within milliseconds of it being set, which for
+        a failure means the reason is produced and then blanked before anyone
+        can read it -- no better than never producing it at all.
+        """
+        self._status.set("Checking status…" if keep_status is None else keep_status)
         exe, game_dir = self._exe, self._game_dir
         def worker():
             patch_state = "current" if _patch_is_applied(exe) else "missing"
             ml = _melonloader_status(game_dir)
             tl = _tavernlib_status(game_dir)
             ml_tag = _load_mod_meta(game_dir).get("melonloader_tag")
-            self.after(0, lambda: self._apply_states(patch_state, ml, tl, ml_tag))
+            self.after(0, lambda: self._apply_states(patch_state, ml, tl, ml_tag,
+                                                     keep_status))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _apply_states(self, patch_state, ml_state, tl_state, ml_tag):
+    def _apply_states(self, patch_state, ml_state, tl_state, ml_tag,
+                      keep_status=None):
         self._apply_row_state(self._patch_btn, patch_state)
         self._apply_row_state(self._ml_btn, ml_state)
         self._apply_row_state(self._tl_btn, tl_state)
@@ -158,7 +169,7 @@ class SetupWindow(tk.Toplevel):
             self._ml_btn._notevar.set(f"{note}  ({ml_tag})" if note else f"({ml_tag})")
         self._lock_row(self._ml_btn, ml_state, patch_state, "Patch")
         self._lock_row(self._tl_btn, tl_state, ml_state, "MelonLoader")
-        self._status.set("")
+        self._status.set("" if keep_status is None else keep_status)
         if self._on_status_change: self._on_status_change()
 
     def _apply_row_state(self, btn, state):
@@ -278,4 +289,9 @@ class SetupWindow(tk.Toplevel):
 
     def _finish_install(self, ok, msg):
         self._set_busy(False, msg)
-        self._refresh_states()
+        # Held across the refresh rather than blanked by it. On failure this is
+        # the only place the reason is ever shown -- there's no dialog and no
+        # log in this window -- and the reasons are the actionable ones
+        # (download stalled, antivirus locked the file, Controlled Folder
+        # Access silently blocked the write).
+        self._refresh_states(keep_status=msg)
