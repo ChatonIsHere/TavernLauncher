@@ -1,9 +1,16 @@
 """
-Mod installation logic (MelonLoader, TavernLib, CircuitsVoiceChat) shared
-by both apps -- both need Install/Update buttons for the same three mods,
-and this was previously duplicated near-verbatim between att_client.py
-and att_server.py. Client's copies used throughout (diff confirmed only
-cosmetic drift against the server's).
+Installing the two mods that are prerequisites rather than choices:
+MelonLoader, which has to load before anything else can, and TavernLib, which
+is what makes a server's mod support work at all. Shared by both apps, since
+both need Install/Update buttons for the same two.
+
+Nothing else belongs here. CircuitsVoiceChat used to, as an "optional mod"
+row, and its installer was a second bespoke copy of this file's
+download-verify-fallback machinery pinned to one hard-coded GitHub repo. It is
+a community mod now, installed through the Mod Manager like any other, which
+gets it version pinning, dependency resolution, a sha256 checked against a
+reviewed index, and the ability to be turned off per server -- none of which a
+hard-coded installer here could offer.
 """
 import os
 import sys
@@ -11,7 +18,6 @@ import time
 import json
 import shutil
 import socket
-import hashlib
 import threading
 import tempfile
 import zipfile
@@ -19,7 +25,6 @@ import struct
 import contextlib
 import urllib.request
 import urllib.error
-import urllib.parse
 import http.client
 from urllib.parse import urlparse
 
@@ -152,136 +157,6 @@ def _tavernlib_installed(game_dir):
     return os.path.isfile(os.path.join(game_dir, "Plugins", TAVERNLIB_FILENAME))
 
 
-CIRCUITSVOICECHAT_REPO = "CircuitLord/CircuitsVoiceChat"
-
-
-CIRCUITSVOICECHAT_DESTINATIONS = {
-    "CircuitsVoiceChat.dll": "Mods",
-    "Concentus.dll": "UserLibs",
-}
-
-
-def _get_circuitsvoicechat_latest_tag():
-    """Same redirect-peek trick as MelonLoader's tag check — no GitHub API
-    call, no rate limit."""
-    loc = _get_redirect_location(f"https://github.com/{CIRCUITSVOICECHAT_REPO}/releases/latest")
-    if not loc:
-        return None
-    return loc.rstrip("/").split("/")[-1]
-
-
-def _circuitsvoicechat_manual_paths():
-    """Where a copy of both DLLs shipped with this launcher release is
-    checked for, as an automatic fallback if the GitHub download fails or
-    is taking too long — same reasoning as MelonLoader's bundled fallback."""
-    return {name: os.path.join(_app_dir(), "Patch", name)
-            for name in CIRCUITSVOICECHAT_DESTINATIONS}
-
-
-def _circuitsvoicechat_installed(game_dir):
-    return all(os.path.isfile(os.path.join(game_dir, subdir, name))
-               for name, subdir in CIRCUITSVOICECHAT_DESTINATIONS.items())
-
-
-def _circuitsvoicechat_status(game_dir):
-    """Returns 'missing', 'outdated', 'unknown', or 'current' — same state
-    machine as _melonloader_status, now that this has a real tag to check
-    against instead of just a local file."""
-    if not _circuitsvoicechat_installed(game_dir):
-        return "missing"
-    installed_tag = _load_mod_meta(game_dir).get("circuitsvoicechat_tag")
-    if not installed_tag or installed_tag.startswith("bundled:"):
-        return "unknown"
-    try:
-        latest = _get_circuitsvoicechat_latest_tag()
-    except Exception:
-        return "unknown"
-    if not latest:
-        return "unknown"
-    return "current" if latest == installed_tag else "outdated"
-
-
-def _install_circuitsvoicechat(game_dir, on_progress):
-    """Tries downloading the latest CircuitsVoiceChat release first; if
-    that fails, or a bundled copy exists in Patch/ and the download hasn't
-    finished quickly, falls back to the bundled DLLs — the exact same
-    network-first, fast-fallback pattern as _install_melonloader. Checks
-    both destination files exist in whichever source is actually used
-    before writing anything, so a partial zip or a missing bundled file
-    can't leave the mod half-installed."""
-    manual_paths = _circuitsvoicechat_manual_paths()
-    have_bundled = all(os.path.isfile(p) for p in manual_paths.values())
-
-    tag = None
-    try: tag = _get_circuitsvoicechat_latest_tag()
-    except Exception: pass
-
-    downloaded_files = None  # filename -> bytes, populated only on a real successful download
-    if tag:
-        zip_filename = f"CircuitsVoiceChat-{tag}.zip"
-        url = (f"https://github.com/{CIRCUITSVOICECHAT_REPO}/releases/latest/"
-               f"download/{urllib.parse.quote(zip_filename)}")
-        tmp_zip = os.path.join(tempfile.gettempdir(), "tavern_circuitsvoicechat_dl.zip")
-        try:
-            if have_bundled:
-                # A good fallback is right there — don't make the user
-                # wait long before using it.
-                _download_with_progress(url, tmp_zip, on_progress,
-                                         connect_timeout=8, max_total_seconds=15)
-            else:
-                _download_with_progress(url, tmp_zip, on_progress)
-            on_progress("Extracting CircuitsVoiceChat…")
-            found = {}
-            with _open_zip_with_retry(tmp_zip) as zf:
-                for wanted in CIRCUITSVOICECHAT_DESTINATIONS:
-                    match = _find_zip_entry(zf, wanted)
-                    if not match:
-                        raise RuntimeError(
-                            f"The downloaded release zip didn't contain {wanted}.")
-                    found[wanted] = zf.read(match)
-            downloaded_files = found
-        except Exception:
-            downloaded_files = None
-            if not have_bundled:
-                raise
-            on_progress("Couldn't reach GitHub — using the version bundled with this launcher…")
-        finally:
-            try: os.remove(tmp_zip)
-            except Exception: pass
-    elif not have_bundled:
-        raise RuntimeError(
-            "Couldn't reach GitHub to check for CircuitsVoiceChat, and no bundled "
-            "copy was found in Patch/ either.")
-
-    for name, subdir in CIRCUITSVOICECHAT_DESTINATIONS.items():
-        dest_dir = os.path.join(game_dir, subdir)
-        os.makedirs(dest_dir, exist_ok=True)
-        dest_path = os.path.join(dest_dir, name)
-        if downloaded_files is not None:
-            expected_hash = hashlib.sha256(downloaded_files[name]).hexdigest()
-            with open(dest_path, "wb") as f:
-                f.write(downloaded_files[name])
-        else:
-            expected_hash = _sha256_file(manual_paths[name])
-            shutil.copy2(manual_paths[name], dest_path)
-        # Controlled Folder Access can silently no-op a write; verify by reading back.
-        if not os.path.isfile(dest_path) or _sha256_file(dest_path) != expected_hash:
-            raise RuntimeError(
-                f"{name} was written without any error, but checking it afterward shows "
-                "it doesn't match what was just downloaded/copied. This usually means "
-                "something on this PC silently blocked the write — most commonly Windows' "
-                "Controlled Folder Access, or antivirus real-time protection. Try adding an "
-                "exclusion for the game's install folder in Windows Security (or your "
-                "antivirus), or temporarily disabling Controlled Folder Access, then try again.")
-
-    meta = _load_mod_meta(game_dir)
-    if downloaded_files is not None and tag:
-        meta["circuitsvoicechat_tag"] = tag
-    else:
-        meta["circuitsvoicechat_tag"] = "bundled:local"
-    _save_mod_meta(game_dir, meta)
-
-
 @contextlib.contextmanager
 def _force_ipv4():
     """Temporarily makes socket.getaddrinfo only return IPv4 results.
@@ -408,24 +283,6 @@ def _open_zip_with_retry(path, retries=8, delay=1.0):
         f"Couldn't open the downloaded file — {last_err}\n\n"
         "This can happen if antivirus is still scanning it. Try clicking "
         "Install again, or temporarily disable real-time scanning and retry.")
-
-
-def _find_zip_entry(zf, wanted_filename):
-    """Finds a zip entry matching wanted_filename, tolerating a version
-    suffix baked into the actual filename — e.g. the real CircuitsVoiceChat
-    release ships "CircuitsVoiceChat-v1.0.4.dll" for what we track as
-    "CircuitsVoiceChat.dll". That suffix changes every release, so an exact
-    filename match would break on every version bump; matching by stem
-    prefix + same extension instead means a new release just works without
-    ever needing a code change here. Returns the zip entry's real name (for
-    reading), or None if nothing matches."""
-    stem, ext = os.path.splitext(wanted_filename)
-    stem, ext = stem.lower(), ext.lower()
-    for n in zf.namelist():
-        b_stem, b_ext = os.path.splitext(os.path.basename(n))
-        if b_ext.lower() == ext and b_stem.lower().startswith(stem):
-            return n
-    return None
 
 
 def _melonloader_manual_zip_path(arch):
