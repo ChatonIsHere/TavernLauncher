@@ -340,6 +340,32 @@ class ServerLauncher(tk.Tk):
         # Update check runs a couple seconds after startup, off the UI
         # thread, so it never delays the window actually appearing.
         self.after(2000, self._check_for_launcher_update)
+        self.after(1200, self._report_partial_update)
+
+    def _report_partial_update(self):
+        """Tells the user when the update they just applied replaced the exe
+        but couldn't replace everything else. See the client launcher's copy
+        for why this is read here rather than reported where it happens."""
+        if _updater is None:
+            return
+        marker = _updater.read_partial_update_marker()
+        if not marker:
+            return
+        _updater.clear_partial_update_marker()
+        files = marker.get("files", [])
+        self._print(f"Update warning: {len(files)} file(s) could not be replaced.", "warn")
+        for f in files:
+            self._print(f"  · {f}", "warn")
+        messagebox.showwarning("Update didn't fully apply",
+            f"The launcher itself updated, but {len(files)} file(s) couldn't be "
+            "replaced:\n\n" + "\n".join(f"  • {f}" for f in files[:10])
+            + ("\n  • …" if len(files) > 10 else "")
+            + "\n\nThey were most likely locked by antivirus, or blocked by "
+              "Windows' Controlled Folder Access. The launcher is running the new "
+              "version, but these files are still the old ones.\n\n"
+              "Re-running the update usually fixes it. If it doesn't, add an "
+              "exclusion for the launcher's folder in Windows Security first.",
+            parent=self)
 
     def _check_for_launcher_update(self):
         if _updater is None:
@@ -361,9 +387,15 @@ class ServerLauncher(tk.Tk):
             try:
                 _updater.download_and_apply_update(url, UPDATE_APP_FOLDER,
                     on_progress=lambda m: self.after(0, lambda: self._print(m, "warn")))
-                # download_and_apply_update relaunches and calls os._exit()
-                # on success — if we get here at all, something went wrong
-                # after the point of no return.
+                # download_and_apply_update relaunches and calls os._exit() on
+                # success, and those are its last two statements — so every
+                # path that raises does so before them, and everything it
+                # touched up to that point lives in a temp staging folder. The
+                # installed copy really is untouched here, which is why the
+                # message below can say so. (The install itself happens in the
+                # relaunched process; when that half goes wrong it reports via
+                # _report_partial_update instead, since this handler is long
+                # gone by then.)
             except Exception as e:
                 self.after(0, lambda e=e: messagebox.showerror("Update failed",
                     f"Couldn't apply the update:\n{e}\n\n"
