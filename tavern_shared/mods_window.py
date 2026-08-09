@@ -17,10 +17,11 @@ import tkinter as tk
 from tkinter import messagebox
 
 from tavern_shared.theme import (
-    BG, SURF, BORDER, AMBER, PARCH, MUTED, GREEN,
+    BG, SURF, BORDER, AMBER, PARCH, MUTED, GREEN, RED,
     CYAN, _btn, _section_label,
 )
 from tavern_shared.window_chrome import _start_hidden, _finish_dark_window
+from tavern_shared.manual_install import ManualInstallWindow
 from tavern_shared.patch import _patch_is_applied, apply_patch
 from tavern_shared.mod_install import (
     _detect_exe_arch, _install_melonloader, _install_tavernlib, _load_mod_meta,
@@ -90,6 +91,16 @@ class SetupWindow(tk.Toplevel):
                  font=("Segoe UI",9), wraplength=470, justify="left"
         ).pack(anchor="w", padx=20, pady=(10,10))
 
+        # Only shown after something actually fails. Offering "do it by hand"
+        # unprompted would suggest the automatic path is unreliable; offering
+        # it the moment the automatic path has demonstrably not worked is the
+        # one time it's the most useful thing on screen.
+        self._manual_bar = tk.Frame(self, bg=BG)
+        self._manual_btn = _btn(self._manual_bar, "📄 Manual Install…",
+                                self._open_manual, font=("Segoe UI",9), pady=6, padx=12)
+        self._manual_btn.pack(side="left")
+        self._manual_for = None
+
         self._refresh_states()
 
     def _mod_row(self, title, subtitle, on_click):
@@ -125,12 +136,18 @@ class SetupWindow(tk.Toplevel):
     _STATE_STYLE = {
         "missing":  ("○", MUTED, "⬇ Install"),
         "outdated": ("⚠", AMBER, "⟳ Update"),
+        "damaged":  ("✕", RED,   "⟳ Repair"),
         "unknown":  ("●", MUTED, "⟳ Reinstall"),
         "current":  ("●", GREEN, "⟳ Reinstall"),
     }
     _STATE_NOTE = {
         "missing": "",
         "outdated": "Update available.",
+        # Deliberately says what was checked, not just that something is
+        # wrong: this state exists to catch the case where the version looks
+        # right and the file isn't, which is otherwise indistinguishable from
+        # a healthy install.
+        "damaged": "Installed file doesn't match what was installed — repair it.",
         "unknown": "",
         "current": "Up to date.",
     }
@@ -217,7 +234,8 @@ class SetupWindow(tk.Toplevel):
                 msg = messages.get(result, "Root.Township.dll has been replaced with the Tavern patch.")
                 self.after(0, lambda: self._finish_install(True, msg))
             except RuntimeError as e:
-                self.after(0, lambda err=str(e): self._finish_install(False, f"Patch failed: {err}"))
+                self.after(0, lambda err=str(e): self._finish_install(
+                    False, f"Patch failed: {err}", "Patch"))
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_melonloader_click(self):
@@ -236,7 +254,8 @@ class SetupWindow(tk.Toplevel):
                     lambda m: self.after(0, lambda: self._status.set(m)))
                 self.after(0, lambda: self._finish_install(True, "MelonLoader installed."))
             except Exception as e:
-                self.after(0, lambda e=e: self._finish_install(False, f"Install failed: {e}"))
+                self.after(0, lambda e=e: self._finish_install(
+                    False, f"Install failed: {e}", "MelonLoader"))
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_tavernlib_click(self):
@@ -253,7 +272,8 @@ class SetupWindow(tk.Toplevel):
                     lambda m: self.after(0, lambda: self._status.set(m)))
                 self.after(0, lambda: self._finish_install(True, "TavernLib installed."))
             except Exception as e:
-                self.after(0, lambda e=e: self._finish_install(False, f"Install failed: {e}"))
+                self.after(0, lambda e=e: self._finish_install(
+                    False, f"Install failed: {e}", "TavernLib"))
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_automatic_setup(self):
@@ -261,12 +281,18 @@ class SetupWindow(tk.Toplevel):
         self._set_busy(True, "Running automatic setup…")
         exe, game_dir = self._exe, self._game_dir
 
+        # Which step is running right now, so a failure can offer Manual
+        # Install for the component that actually failed rather than making
+        # the user work it out from the message.
+        stage = ["Patch"]
+
         def worker():
             try:
                 if not _patch_is_applied(exe):
                     self.after(0, lambda: self._status.set("Applying patch…"))
                     apply_patch(exe, lambda m: self.after(0, lambda: self._status.set(m)))
 
+                stage[0] = "MelonLoader"
                 if _melonloader_status(game_dir) != "current":
                     arch = _detect_exe_arch(exe)
                     if not arch:
@@ -277,6 +303,7 @@ class SetupWindow(tk.Toplevel):
                     _install_melonloader(game_dir, arch,
                         lambda m: self.after(0, lambda: self._status.set(m)))
 
+                stage[0] = "TavernLib"
                 if _tavernlib_status(game_dir) != "current":
                     self.after(0, lambda: self._status.set("Installing TavernLib…"))
                     _install_tavernlib(game_dir,
@@ -284,14 +311,47 @@ class SetupWindow(tk.Toplevel):
 
                 self.after(0, lambda: self._finish_install(True, "Automatic setup complete."))
             except Exception as e:
-                self.after(0, lambda e=e: self._finish_install(False, f"Automatic setup failed: {e}"))
+                self.after(0, lambda e=e, s=stage[0]: self._finish_install(
+                    False, f"Automatic setup failed: {e}", s))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_install(self, ok, msg):
+    def _finish_install(self, ok, msg, component=None):
         self._set_busy(False, msg)
+        if ok:
+            self._hide_manual_offer()
+        elif component:
+            self._show_manual_offer(component, msg)
         # Held across the refresh rather than blanked by it. On failure this is
         # the only place the reason is ever shown -- there's no dialog and no
         # log in this window -- and the reasons are the actionable ones
         # (download stalled, antivirus locked the file, Controlled Folder
         # Access silently blocked the write).
         self._refresh_states(keep_status=msg)
+
+    # ── Manual install fallback ──────────────────────────────────────────────
+
+    def _show_manual_offer(self, component, reason):
+        """Reveals the Manual Install button, bound to whichever component
+        just failed. The reason is carried through so the manual window can
+        repeat what went wrong -- by the time it's open, the status line
+        behind it is no longer readable."""
+        self._manual_for = (component, reason)
+        self._manual_btn.config(text=f"📄 Install {component} manually…")
+        if not self._manual_bar.winfo_ismapped():
+            self._manual_bar.pack(fill="x", padx=20, pady=(0, 10))
+            self.update_idletasks()
+            self.geometry(f"520x{self.winfo_reqheight()}")
+
+    def _hide_manual_offer(self):
+        self._manual_for = None
+        if self._manual_bar.winfo_ismapped():
+            self._manual_bar.pack_forget()
+            self.update_idletasks()
+            self.geometry(f"520x{self.winfo_reqheight()}")
+
+    def _open_manual(self):
+        if not self._manual_for:
+            return
+        component, reason = self._manual_for
+        ManualInstallWindow(self, self._exe, component, reason=reason,
+                            on_recheck=self._refresh_states)

@@ -21,6 +21,7 @@ import socket
 import threading
 import tempfile
 import zipfile
+import zlib
 import struct
 import contextlib
 import urllib.request
@@ -209,6 +210,26 @@ def _urlopen_hard_timeout(req, connect_timeout=20, socket_timeout=20):
     return result["resp"]
 
 
+def _short_read_message(url, downloaded, total):
+    """The message for a download that ended before Content-Length said it
+    would. Worth being explicit that nothing was installed, because the
+    symptom users actually reported for this was the opposite -- an install
+    that looked like it completed, over a file that hadn't changed."""
+    pct = int(downloaded * 100 / max(1, total))
+    return (
+        f"The download from {urlparse(url).netloc} ended early — got "
+        f"{downloaded:,} of {total:,} bytes ({pct}%).\n\n"
+        "The connection was cut part-way through rather than refused outright, "
+        "which is usually antivirus, a VPN, or a school/corporate proxy "
+        "interrupting the transfer. Nothing was installed and nothing was "
+        "changed — the existing files are untouched.\n\n"
+        "Worth trying:\n"
+        "  • Try again — this often succeeds on a second attempt\n"
+        "  • Try a different network (a phone hotspot is a quick test)\n"
+        "  • Temporarily disable antivirus/VPN and retry\n"
+        "  • Use Manual Install to download it in your browser instead")
+
+
 def _download_with_progress(url, dest_path, on_progress,
                              connect_timeout=20, max_total_seconds=1800, chunk_size=1<<16):
     """Downloads url to dest_path, reporting live progress and enforcing a
@@ -218,7 +239,15 @@ def _download_with_progress(url, dest_path, on_progress,
     permanent hang rather than a slow download. Returns the response
     headers on success (some callers use these, e.g. for an ETag). Raises
     RuntimeError with a specific, actionable message on failure, and never
-    leaves a partially-downloaded file at dest_path."""
+    leaves a partially-downloaded file at dest_path.
+
+    A short read is a failure, not a success. read() returning b"" means
+    "no more data is coming", NOT "the file is complete" -- a connection cut
+    mid-transfer by a proxy, VPN or antivirus ends the loop exactly the same
+    way a finished download does. Without the Content-Length check below,
+    every caller then hashes the truncated file, gets a hash that of course
+    matches itself, records it as verified, and installs a broken DLL while
+    reporting success."""
     start = time.time()
     req = urllib.request.Request(url, headers={"User-Agent": "TavernLauncher/1.0"})
     with _force_ipv4():
@@ -255,6 +284,8 @@ def _download_with_progress(url, dest_path, on_progress,
                         on_progress(f"Downloading… {pct}%  ({downloaded//1024:,} / {total//1024:,} KB)")
                     else:
                         on_progress(f"Downloading… {downloaded//1024:,} KB")
+                if total is not None and downloaded != total:
+                    raise RuntimeError(_short_read_message(url, downloaded, total))
         except Exception:
             try: os.remove(dest_path)
             except Exception: pass
@@ -283,6 +314,55 @@ def _open_zip_with_retry(path, retries=8, delay=1.0):
         f"Couldn't open the downloaded file — {last_err}\n\n"
         "This can happen if antivirus is still scanning it. Try clicking "
         "Install again, or temporarily disable real-time scanning and retry.")
+
+
+def _verify_extracted(zf, dest_dir):
+    """Reads back every file extractall() was supposed to write and checks it
+    against the CRC32 the archive already carries for it. Returns the list of
+    entries that are missing or don't match — empty means the extraction
+    genuinely landed.
+
+    A presence check can't do this job. Controlled Folder Access and some
+    antivirus make extractall() appear to succeed while writing nothing, and
+    when MelonLoader is being *updated* rather than installed fresh, the
+    previous version's files are still sitting there — so "is version.dll
+    present?" passes, the new release tag gets recorded against the old files,
+    and every status check from then on reports 'current'. The update silently
+    never happened and nothing will ever notice. Comparing content against the
+    archive is the only check that distinguishes the two."""
+    bad = []
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        path = os.path.join(dest_dir, info.filename.replace("\\", "/"))
+        try:
+            crc = 0
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    crc = zlib.crc32(chunk, crc)
+        except OSError:
+            bad.append(info.filename)
+            continue
+        if crc != info.CRC:
+            bad.append(info.filename)
+    return bad
+
+
+def _blocked_write_message(what, examples):
+    """Shared wording for "we wrote it, then read it back, and it isn't what
+    we wrote" — the signature of a silently-blocked write rather than a
+    failed one."""
+    return (
+        f"{what} was written without any error, but reading it back afterward "
+        f"shows it isn't what was just installed ({examples}).\n\n"
+        "This means something on this PC silently blocked the write instead of "
+        "refusing it — most commonly Windows' Controlled Folder Access, or "
+        "antivirus real-time protection.\n\n"
+        "Worth trying:\n"
+        "  • Add an exclusion for the game's install folder in Windows Security\n"
+        "  • Temporarily turn off Controlled Folder Access, then retry\n"
+        "  • Run the launcher as Administrator\n"
+        "  • Use Manual Install to place the files yourself")
 
 
 def _melonloader_manual_zip_path(arch):
@@ -336,20 +416,21 @@ def _install_melonloader(game_dir, arch, on_progress):
     on_progress("Extracting MelonLoader…")
     with _open_zip_with_retry(source_zip) as zf:
         zf.extractall(game_dir)
+        # Verified against the archive itself, not just checked for presence
+        # -- see _verify_extracted for why presence is not enough here.
+        on_progress("Verifying extracted files…")
+        bad = _verify_extracted(zf, game_dir)
     if downloaded_ok:
         try: os.remove(tmp_zip)
         except Exception: pass
 
-    # Controlled Folder Access can silently no-op extractall(); the two
-    # files _melonloader_installed checks are a good-enough proxy.
+    if bad:
+        shown = ", ".join(bad[:3]) + (f", and {len(bad)-3} more" if len(bad) > 3 else "")
+        raise RuntimeError(_blocked_write_message(
+            "MelonLoader", f"{len(bad)} file(s) wrong or missing: {shown}"))
     if not _melonloader_installed(game_dir):
-        raise RuntimeError(
-            "MelonLoader was extracted without any error, but checking afterward shows "
-            "the expected files aren't actually there. This usually means something on "
-            "this PC silently blocked the write — most commonly Windows' Controlled "
-            "Folder Access, or antivirus real-time protection. Try adding an exclusion "
-            "for the game's install folder in Windows Security (or your antivirus), or "
-            "temporarily disabling Controlled Folder Access, then try again.")
+        raise RuntimeError(_blocked_write_message(
+            "MelonLoader", "the expected files aren't in the game folder"))
 
     meta = _load_mod_meta(game_dir)
     if downloaded_ok and tag:
@@ -359,6 +440,16 @@ def _install_melonloader(game_dir, arch, on_progress):
         # status check (once network access works again) can still tell
         # this apart from "definitely current", prompting a real update.
         meta["melonloader_tag"] = f"bundled:{_sha256_file(manual_zip)[:12]}"
+    # The tag says which release we fetched; this says what is actually on
+    # disk right now, which is a different question and the only one that can
+    # answer "has something changed these files since we installed them?".
+    # version.dll is the shim the game itself loads, so if anything is going
+    # to get quarantined, rolled back or overwritten, it's this.
+    try:
+        meta["melonloader_version_sha256"] = _sha256_file(
+            os.path.join(game_dir, "version.dll"))
+    except OSError:
+        meta.pop("melonloader_version_sha256", None)
     _save_mod_meta(game_dir, meta)
 
 
@@ -408,26 +499,50 @@ def _install_tavernlib(game_dir, on_progress):
         # with the old file — or nothing at all — actually still there.
         # Reading the result back and comparing is the only reliable way
         # to tell a real success apart from that.
-        raise RuntimeError(
-            "TavernLib.dll was written without any error, but checking it afterward "
-            "shows it doesn't match what was just downloaded. This usually means "
-            "something on this PC silently blocked the write — most commonly Windows' "
-            "Controlled Folder Access, or antivirus real-time protection. Try adding an "
-            "exclusion for the game's install folder in Windows Security (or your "
-            "antivirus), or temporarily disabling Controlled Folder Access, then try again.")
+        raise RuntimeError(_blocked_write_message(
+            "TavernLib.dll", "the installed file doesn't match what was downloaded"))
+    meta = _load_mod_meta(game_dir)
     if fingerprint:
-        meta = _load_mod_meta(game_dir)
         meta["tavernlib_fingerprint"] = fingerprint
-        _save_mod_meta(game_dir, meta)
+    # The fingerprint is GitHub's ETag — it answers "is a newer one published?"
+    # and nothing else. This is the hash of the file we actually put on disk,
+    # which is what answers "is the file we installed still the file that's
+    # there?" — a question the ETag cannot address at all.
+    meta["tavernlib_sha256"] = expected_hash
+    _save_mod_meta(game_dir, meta)
+
+
+def _file_matches_recorded(path, recorded):
+    """Whether path still hashes to what we recorded writing there. None when
+    there's nothing recorded to compare against, so callers can tell "we
+    checked and it's wrong" apart from "we have no baseline" -- these must
+    never collapse into one answer, because only the first is a problem."""
+    if not recorded:
+        return None
+    try:
+        return _sha256_file(path) == recorded
+    except OSError:
+        return False
 
 
 def _melonloader_status(game_dir):
-    """Returns 'missing', 'outdated', 'unknown' (installed, but we have no
-    baseline to compare — e.g. it was installed by hand before this feature
-    existed, or the update check failed), or 'current'."""
+    """Returns 'missing', 'damaged', 'outdated', 'unknown' (installed, but we
+    have no baseline to compare — e.g. it was installed by hand before this
+    feature existed, or the update check failed), or 'current'.
+
+    'damaged' is checked before anything to do with versions, and is purely
+    local: the version tag we recorded describes the release we fetched, so
+    it keeps reporting 'current' regardless of what later happens to the files
+    on disk. Antivirus quarantining version.dll, a game update overwriting it,
+    or a half-finished extract all leave the tag intact and the install
+    broken."""
     if not _melonloader_installed(game_dir):
         return "missing"
-    installed_tag = _load_mod_meta(game_dir).get("melonloader_tag")
+    meta = _load_mod_meta(game_dir)
+    if _file_matches_recorded(os.path.join(game_dir, "version.dll"),
+                              meta.get("melonloader_version_sha256")) is False:
+        return "damaged"
+    installed_tag = meta.get("melonloader_tag")
     if not installed_tag:
         return "unknown"
     try:
@@ -440,9 +555,17 @@ def _melonloader_status(game_dir):
 
 
 def _tavernlib_status(game_dir):
+    """Same five states as _melonloader_status, and 'damaged' matters here for
+    the same reason: tavernlib_fingerprint is GitHub's ETag for the published
+    file, so it answers "is a newer one out?" and is completely blind to the
+    installed copy being truncated, quarantined or replaced."""
     if not _tavernlib_installed(game_dir):
         return "missing"
-    installed_fp = _load_mod_meta(game_dir).get("tavernlib_fingerprint")
+    meta = _load_mod_meta(game_dir)
+    if _file_matches_recorded(os.path.join(game_dir, "Plugins", TAVERNLIB_FILENAME),
+                              meta.get("tavernlib_sha256")) is False:
+        return "damaged"
+    installed_fp = meta.get("tavernlib_fingerprint")
     if not installed_fp:
         return "unknown"
     try:
@@ -454,9 +577,13 @@ def _tavernlib_status(game_dir):
     return "current" if latest_fp == installed_fp else "outdated"
 
 
+NEEDS_ATTENTION = ("missing", "outdated", "damaged")
+
+
 def _mods_need_attention(game_dir):
-    """True if either required mod (MelonLoader, TavernLib) is missing or
-    outdated — the trigger for flashing the main window's Setup button (see
+    """True if either required mod (MelonLoader, TavernLib) is missing,
+    outdated or damaged — the trigger for flashing the main window's Setup
+    button (see
     each launcher's _refresh_setup_alert, which also folds in the patch
     check). Network failures during the update checks never trigger a false
     alarm on their own — only a real missing install (a purely local,
@@ -465,6 +592,6 @@ def _mods_need_attention(game_dir):
     CircuitsVoiceChat is deliberately not considered any more. It is a
     community mod now, installed and updated through the Mod Manager like
     any other, so it has no place in the fixed Setup sequence."""
-    return (_melonloader_status(game_dir) in ("missing", "outdated") or
-            _tavernlib_status(game_dir)   in ("missing", "outdated"))
+    return (_melonloader_status(game_dir) in NEEDS_ATTENTION or
+            _tavernlib_status(game_dir)   in NEEDS_ATTENTION)
 
