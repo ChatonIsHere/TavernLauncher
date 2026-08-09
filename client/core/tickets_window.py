@@ -176,7 +176,7 @@ class TicketsWindow(tk.Toplevel):
                 resp = ticket_request(resolved, "list_mine", username, token)
             except Exception as e:
                 if not silent:
-                    self.after(0, lambda: messagebox.showerror(
+                    self.after(0, lambda e=e: messagebox.showerror(
                         "Couldn't fetch tickets", str(e), parent=self))
                 return
             if resp.get("status") != "ok":
@@ -259,7 +259,7 @@ class TicketsWindow(tk.Toplevel):
                     resp = ticket_request(resolved, "create", username, token,
                                           title=title, description=description, server=host)
                 except Exception as e:
-                    self.after(0, lambda: messagebox.showerror(
+                    self.after(0, lambda e=e: messagebox.showerror(
                         "Couldn't submit ticket", str(e), parent=win))
                     return
                 if resp.get("status") != "ok":
@@ -304,7 +304,7 @@ class TicketsWindow(tk.Toplevel):
                 resp = ticket_request(resolved, "respond", username, token,
                                       ticket_id=tid, message=msg)
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror(
+                self.after(0, lambda e=e: messagebox.showerror(
                     "Couldn't send reply", str(e), parent=self))
                 return
             if resp.get("status") != "ok":
@@ -336,7 +336,7 @@ class TicketsWindow(tk.Toplevel):
                 resp = ticket_request(resolved, "close", username, token,
                                       ticket_id=tid, message=msg)
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror(
+                self.after(0, lambda e=e: messagebox.showerror(
                     "Couldn't close ticket", str(e), parent=self))
                 return
             if resp.get("status") != "ok":
