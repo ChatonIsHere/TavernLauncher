@@ -51,14 +51,19 @@ class ImportPlan:
         return bool(self.unresolved)
 
 
-def import_modlist(modlist, index, repo_bases):
+def import_modlist(modlist, index, repo_bases, side):
     """Resolves a modlist's `mods` entries against the importer's OWN
     configured repos only (repo_bases) - the file's `repos` field is never
     treated as a source to fetch from or silently add. Same
     by-id / exact-version resolution install already uses. An entry not
     resolvable from any configured repo is reported unresolved (with the
     modlist's hinted `repos` surfaced alongside it, so the user knows what to
-    go add) rather than silently skipped or auto-added from its shorthand."""
+    go add) rather than silently skipped or auto-added from its shorthand.
+
+    `side` is the importing launcher's own, since the manager window this runs
+    from is shared by both. A modlist exported on a client can name mods whose
+    dependencies are client-only; importing it on a server resolves the same
+    entries but leaves those dependencies out."""
     if modlist.get("schema") != MODLIST_SCHEMA:
         raise ModManagerError(
             f"This modlist is schema {modlist.get('schema')!r}; this launcher "
@@ -77,7 +82,7 @@ def import_modlist(modlist, index, repo_bases):
     def fetch_manifest(mod_id, ver, source_repo):
         return _fetch_manifest(repo_bases, mod_id, ver, prefer_repo=source_repo)
 
-    dependencies = resolve_dependencies(roots, index, fetch_manifest) if roots else []
+    dependencies = resolve_dependencies(roots, index, fetch_manifest, side) if roots else []
     return ImportPlan(roots=roots, dependencies=dependencies, unresolved=unresolved,
                       hinted_repos=list(modlist.get("repos", [])))
 
