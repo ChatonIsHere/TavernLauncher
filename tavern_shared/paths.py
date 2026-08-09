@@ -30,6 +30,21 @@ def _tavern_data_dir():
     except Exception: pass
     return path
 
+def _last_rejection_path():
+    """Same path TavernLib's TavernDirectories.LastRejection writes to:
+    %AppData%/TheModdingTavern/last_rejection.json. A cross-process contract
+    with the game-side plugin, which is why it is pinned here beside the other
+    shared locations rather than derived at its one call site."""
+    return os.path.join(_tavern_data_dir(), "last_rejection.json")
+
+
+def _delete_last_rejection_file():
+    """Called right before every launch so a file present after THIS process
+    exits was written by THIS attempt, not left over from an earlier one."""
+    try: os.remove(_last_rejection_path())
+    except OSError: pass
+
+
 def _sha256_file(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:

@@ -335,7 +335,7 @@ def _urlopen_hard_timeout(req, connect_timeout=20, socket_timeout=20):
 
 
 def _download_with_progress(url, dest_path, on_progress,
-                             connect_timeout=20, max_total_seconds=90, chunk_size=1<<16):
+                             connect_timeout=20, max_total_seconds=1800, chunk_size=1<<16):
     """Downloads url to dest_path, reporting live progress and enforcing a
     real wall-clock cap on the whole operation — a plain urlopen timeout=
     only guards a single socket operation, so a connection that trickles
@@ -366,7 +366,7 @@ def _download_with_progress(url, dest_path, on_progress,
                 while True:
                     if time.time() - start > max_total_seconds:
                         raise RuntimeError(
-                            f"Download stalled for over {max_total_seconds}s — giving up. "
+                            f"Download stalled for over {max_total_seconds // 60} minutes — giving up. "
                             "The connection may be extremely slow, or something is "
                             "silently throttling it (security software, a captive "
                             "portal, etc.) rather than blocking it outright.")
@@ -598,14 +598,16 @@ def _tavernlib_status(game_dir):
 
 
 def _mods_need_attention(game_dir):
-    """True if either required mod is missing/outdated, or the optional
-    CircuitsVoiceChat is outdated — the trigger for flashing the main
-    window's Mods button. Deliberately not "missing" for the optional mod:
-    not having opted into it is a normal, expected state, not something
-    that needs attention. Network failures during the update checks never
-    trigger a false alarm on their own — only a real missing install (a
-    purely local, always-reliable check) does that unconditionally."""
+    """True if either required mod (MelonLoader, TavernLib) is missing or
+    outdated — the trigger for flashing the main window's Setup button (see
+    each launcher's _refresh_setup_alert, which also folds in the patch
+    check). Network failures during the update checks never trigger a false
+    alarm on their own — only a real missing install (a purely local,
+    always-reliable check) does that unconditionally.
+
+    CircuitsVoiceChat is deliberately not considered any more. It is a
+    community mod now, installed and updated through the Mod Manager like
+    any other, so it has no place in the fixed Setup sequence."""
     return (_melonloader_status(game_dir) in ("missing", "outdated") or
-            _tavernlib_status(game_dir)   in ("missing", "outdated") or
-            _circuitsvoicechat_status(game_dir) == "outdated")
+            _tavernlib_status(game_dir)   in ("missing", "outdated"))
 

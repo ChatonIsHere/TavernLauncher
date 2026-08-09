@@ -27,8 +27,9 @@ except ImportError:
     pass
 from tavern_shared.log_tailer import GameLogTailer
 from tavern_shared.mod_install import _melonloader_installed, _mods_need_attention
-from tavern_shared.patch import _patch_source_path, _patch_is_applied, apply_patch
-from tavern_shared.mods_window import ModsWindow
+from tavern_shared.patch import _patch_source_path, _patch_is_applied
+from tavern_shared.mods_window import SetupWindow
+from tavern_shared.mods.ui.manager_window import ModManagerWindow
 
 from server.core.data_store import (
     load_cfg, save_cfg, CONFIG_FILE, GAME_LOG_PATH, DISCORD_URL,
@@ -75,16 +76,15 @@ class ServerLauncher(tk.Tk):
         self._auth_on  = False
         self._tailer   = None
         self._mgr_win  = None
-        self._mods_win = None
+        self._setup_win = None
+        self._mod_manager_win = None
         self._sett_win = None
         self._console_win = None
         self._tickets_win = None
-        self._mods_animating  = False
-        self._mods_anim_job   = None
-        self._mods_anim_phase = 0
-        self._patch_animating  = False
-        self._patch_anim_job   = None
-        self._patch_anim_phase = 0
+        # Read every tick by start_flashing_button on the main thread, and
+        # only ever written from the main thread (see _refresh_setup_alert),
+        # so the background check can't tear it.
+        self._setup_needs_attention = False
         self._exe_check_job   = None
         self._build_ui()
         self._load()
@@ -114,12 +114,14 @@ class ServerLauncher(tk.Tk):
              padx=10, pady=6).pack(side="right")
         btn_row_mods = tk.Frame(self, bg=BG)
         btn_row_mods.pack(fill="x", padx=20, pady=(4,0))
-        self._patch_btn = _btn(btn_row_mods, "🩹 Patch", self._on_patch_click,
+        self._setup_btn = _btn(btn_row_mods, "🛠 Setup", self._open_setup,
              font=("Segoe UI",9), pady=5, padx=10)
-        self._patch_btn.pack(side="left")
-        self._mods_btn = _btn(btn_row_mods, "🧪 Mods", self._open_mods,
+        self._setup_btn.pack(side="left")
+        start_flashing_button(self._setup_btn,
+            lambda: self._setup_needs_attention, normal_bg=SURF2, alert_bg="#5a3d0e")
+        self._mod_manager_btn = _btn(btn_row_mods, "📦 Mod Manager", self._open_mod_manager,
              font=("Segoe UI",9), pady=5, padx=10)
-        self._mods_btn.pack(side="left", padx=(6,0))
+        self._mod_manager_btn.pack(side="left", padx=(6,0))
         _section_label(self, "GAME PORT")
         pf2 = _field(self)
         self.v_port = tk.StringVar(value="1757")
@@ -435,15 +437,27 @@ class ServerLauncher(tk.Tk):
             self._console_win.lift(); return
         self._console_win = ConsoleWindow(self)
 
-    def _open_mods(self):
+    def _open_setup(self):
         exe = self.v_exe.get().strip()
         if not exe or not os.path.isfile(exe):
             messagebox.showerror("Game not found",
                 "Please set the path to 'A Township Tale.exe' above first.", parent=self)
             return
-        if self._mods_win and self._mods_win.winfo_exists():
-            self._mods_win.lift(); return
-        self._mods_win = ModsWindow(self, exe, on_status_change=self._refresh_mods_alert)
+        if self._setup_win and self._setup_win.winfo_exists():
+            self._setup_win.lift(); return
+        self._setup_win = SetupWindow(self, exe, on_status_change=self._refresh_setup_alert)
+
+    def _open_mod_manager(self):
+        exe = self.v_exe.get().strip()
+        if not exe or not os.path.isfile(exe):
+            messagebox.showerror("Game not found",
+                "Please set the path to 'A Township Tale.exe' above first.", parent=self)
+            return
+        if self._mod_manager_win and self._mod_manager_win.winfo_exists():
+            self._mod_manager_win.lift(); return
+        self._mod_manager_win = ModManagerWindow(
+            self, os.path.dirname(exe), side="server",
+            on_change=self._refresh_setup_alert)
 
     def _open_addons(self):
         from server.core import addon_loader
@@ -454,7 +468,7 @@ class ServerLauncher(tk.Tk):
         exe = self.v_exe.get().strip()
         return os.path.dirname(exe) if exe and os.path.isfile(exe) else None
 
-    # ── Patch / Mods buttons (same mechanism as the client launcher) ────────
+    # ── Setup button (same mechanism as the client launcher) ────────────────
 
     def _on_exe_changed(self, *_):
         if self._exe_check_job:
@@ -463,123 +477,41 @@ class ServerLauncher(tk.Tk):
         self._exe_check_job = self.after(800, self._refresh_tool_states)
 
     def _refresh_tool_states(self):
-        """Enables/disables the Patch and Mods buttons based on whether a
-        valid game exe is selected, then separately refreshes each button's
-        own flashing-alert condition. State is only ever touched here, and
-        the animation loops below only ever touch bg/fg — kept deliberately
-        separate so neither path can clobber the other."""
+        """Enables/disables the Setup and Mod Manager buttons based on
+        whether a valid game exe is selected, then separately refreshes the
+        Setup button's flashing-alert condition. State is only ever touched
+        here, and start_flashing_button only ever touches bg — kept
+        deliberately separate so neither path can clobber the other."""
         exe = self.v_exe.get().strip()
         valid = bool(exe and os.path.isfile(exe))
         state = "normal" if valid else "disabled"
-        try: self._patch_btn.config(state=state)
+        try: self._setup_btn.config(state=state)
         except Exception: pass
-        try: self._mods_btn.config(state=state)
+        try: self._mod_manager_btn.config(state=state)
         except Exception: pass
-        self._refresh_mods_alert()
-        self._refresh_patch_alert(exe)
+        self._refresh_setup_alert()
 
-    def _refresh_mods_alert(self):
+    def _refresh_setup_alert(self):
+        """One alert for the whole Setup sequence: a required mod missing or
+        outdated, or the patch present but not applied. These used to be two
+        separately flashing buttons for what is really one "this install
+        isn't ready yet" state.
+
+        The checks hit the network and the disk, so they run on a worker and
+        only the resulting flag is written back on the main thread -- the
+        flashing loop reads it every tick and must never block."""
         exe = self.v_exe.get().strip()
         if not exe or not os.path.isfile(exe):
-            self._set_mods_alert(False)
+            self._setup_needs_attention = False
             return
         game_dir = os.path.dirname(exe)
         def worker():
             try:
-                need = _mods_need_attention(game_dir)
+                need = _mods_need_attention(game_dir) or (
+                    os.path.isfile(_patch_source_path()) and not _patch_is_applied(exe))
             except Exception:
                 need = False
-            self.after(0, lambda: self._set_mods_alert(need))
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _set_mods_alert(self, needed):
-        if needed: self._start_mods_animation()
-        else:      self._stop_mods_animation()
-
-    def _start_mods_animation(self):
-        if self._mods_animating: return
-        self._mods_animating = True
-        self._mods_anim_phase = 0
-        self._animate_mods_btn()
-
-    def _animate_mods_btn(self):
-        if not self._mods_animating: return
-        bg, fg = (SURF2, AMBER) if self._mods_anim_phase % 2 == 0 else ("#5a3d0e", "#ffd080")
-        try: self._mods_btn.config(bg=bg, fg=fg)
-        except Exception: return
-        self._mods_anim_phase += 1
-        self._mods_anim_job = self.after(450, self._animate_mods_btn)
-
-    def _stop_mods_animation(self):
-        self._mods_animating = False
-        if self._mods_anim_job:
-            try: self.after_cancel(self._mods_anim_job)
-            except Exception: pass
-            self._mods_anim_job = None
-        try: self._mods_btn.config(bg=SURF2, fg=PARCH)
-        except Exception: pass
-
-    def _refresh_patch_alert(self, exe):
-        """Flash the Patch button only while the patch DLL is actually
-        present AND not already applied — a real on-disk check, so it
-        correctly reflects reality even if the client launcher already did
-        this for the same game (both point at the same target files)."""
-        if not exe or not os.path.isfile(exe):
-            self._stop_patch_animation()
-            return
-        def worker():
-            try:
-                need = os.path.isfile(_patch_source_path()) and not _patch_is_applied(exe)
-            except Exception:
-                need = False
-            self.after(0, lambda: self._start_patch_animation() if need else self._stop_patch_animation())
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _start_patch_animation(self):
-        if self._patch_animating: return
-        self._patch_animating = True
-        self._patch_anim_phase = 0
-        self._animate_patch_btn()
-
-    def _animate_patch_btn(self):
-        if not self._patch_animating: return
-        bg, fg = ("#1a3d2a", "#80d8aa") if self._patch_anim_phase % 2 == 0 else ("#0d2419", "#50aa7a")
-        try: self._patch_btn.config(bg=bg, fg=fg)
-        except Exception: return
-        self._patch_anim_phase += 1
-        self._patch_anim_job = self.after(450, self._animate_patch_btn)
-
-    def _stop_patch_animation(self):
-        self._patch_animating = False
-        if self._patch_anim_job:
-            try: self.after_cancel(self._patch_anim_job)
-            except Exception: pass
-            self._patch_anim_job = None
-        try: self._patch_btn.config(bg=SURF2, fg=PARCH)
-        except Exception: pass
-
-    def _on_patch_click(self):
-        exe = self.v_exe.get().strip()
-        if not exe or not os.path.isfile(exe):
-            messagebox.showerror("Game not found",
-                "Please set the path to 'A Township Tale.exe' above first.", parent=self)
-            return
-
-        def worker():
-            try:
-                result = apply_patch(exe)
-                messages = {
-                    "downloaded": "Downloaded the latest Tavern patch from GitHub and applied it.",
-                    "bundled": "Couldn't reach GitHub, so the version bundled with this "
-                               "launcher was applied instead.",
-                    "current": "Already up to date — no changes were needed.",
-                }
-                msg = messages.get(result, "Root.Township.dll has been replaced with the Tavern patch.")
-                self.after(0, lambda: (
-                    messagebox.showinfo("Patch applied", msg, parent=self),
-                    self._refresh_patch_alert(exe)))
-            except RuntimeError as e:
-                self.after(0, lambda err=str(e): messagebox.showerror("Patch failed", err, parent=self))
+            self.after(0, lambda: setattr(self, "_setup_needs_attention", need))
         threading.Thread(target=worker, daemon=True).start()
 
     def _open_saves(self):
@@ -627,7 +559,7 @@ class ServerLauncher(tk.Tk):
                 f.write(console_token)
         except: pass
         if not self._auth_on:
-            start_auth_service(self._print)
+            start_auth_service(self._print, os.path.dirname(exe))
             self._auth_on = True
         args = [exe, "/force_offline",
                 "/access_token", access, "/refresh_token", refresh,
