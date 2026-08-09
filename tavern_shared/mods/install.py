@@ -264,7 +264,7 @@ def install_library_dependency(game_dir, lib, on_progress):
     })
 
 
-def install_mod_closure(game_dir, mod, index, repo_bases, on_progress, version=None):
+def install_mod_closure(game_dir, mod, index, repo_bases, on_progress, side, version=None):
     """Installs a mod AND its full closure, the flow a single COMMUNITY MODS
     click runs. `mod` is the ModSummary the user picked; its manifest is
     fetched at `version` if given, else mod.highest() (the ordinary
@@ -275,6 +275,10 @@ def install_mod_closure(game_dir, mod, index, repo_bases, on_progress, version=N
     cycle/depth/diamond/library conflict is surfaced (and every manifest
     fetched) BEFORE anything touches disk. A mod with no dependencies is just
     the degenerate case: empty closure, one install_mod.
+
+    `side` is this launcher's own ("client" or "server"), passed straight to
+    resolve_dependencies so a dependency that can't run here is left out rather
+    than installed into a process that would crash loading it.
 
     Manifests fetched during a single closure are cached, so a diamond (two mods
     needing the same dependency) fetches it once."""
@@ -287,7 +291,7 @@ def install_mod_closure(game_dir, mod, index, repo_bases, on_progress, version=N
         return fetched[key]
 
     root = fetch(mod.id, version or mod.highest(), mod.source_repo)
-    deps = resolve_dependencies([root], index, fetch)
+    deps = resolve_dependencies([root], index, fetch, side)
     all_mods = [root] + deps
     libs = collect_library_dependencies(all_mods)     # raises on conflict before any download
 

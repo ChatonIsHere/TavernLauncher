@@ -161,7 +161,11 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
     def fetch_manifest(mod_id, version, source_repo):
         return _fetch_manifest(repo_bases, mod_id, version, prefer_repo=source_repo)
 
-    dependencies = resolve_dependencies(roots, index, fetch_manifest) if roots else []
+    # "client" is fixed, not a parameter: this is the join flow, which only ever
+    # runs in the client launcher, and the server's own side is resolved
+    # independently by whatever installed its mods (the server launcher, or
+    # TavernLib's ModReconciler on a headless host).
+    dependencies = resolve_dependencies(roots, index, fetch_manifest, "client") if roots else []
     for dep in dependencies:
         reason.setdefault(dep.id, "dependency")
 
@@ -543,5 +547,5 @@ def resolve_missing_mods(missing, index, repo_bases):
     def fetch_manifest(mod_id, version, source_repo):
         return _fetch_manifest(repo_bases, mod_id, version, prefer_repo=source_repo)
 
-    dependencies = resolve_dependencies(roots, index, fetch_manifest) if roots else []
+    dependencies = resolve_dependencies(roots, index, fetch_manifest, "client") if roots else []
     return roots, dependencies

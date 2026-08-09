@@ -1,6 +1,6 @@
 """Dependency closure and by-id resolution (latest.json / latest.<major>.json)."""
 from tavern_shared.mods import repos
-from tavern_shared.mods.errors import ModManagerError
+from tavern_shared.mods.errors import ModManagerError, _warn
 from tavern_shared.mods.manifest import _manifest_from_dict
 from tavern_shared.mods.repos import _norm
 from tavern_shared.mods.version import _parse_version
@@ -21,10 +21,35 @@ from tavern_shared.mods.version import _parse_version
 MAX_DEPENDENCY_DEPTH = 5
 
 
-def resolve_dependencies(roots, summary_index, fetch_manifest):
+SIDES = ("client", "server")
+
+
+def _runs_on(manifest, side):
+    """Whether this mod can load at all in a `side` process, straight off its own
+    manifest's client_side/server_side. Read from the per-version MANIFEST, never
+    from a ModSummary: the manifest requires both fields (a missing one is a parse
+    error), while a summary defaults them to False, so a hand-rolled third-party
+    index omitting them would otherwise prune the dependency on both sides."""
+    return manifest.client_side if side == "client" else manifest.server_side
+
+
+def resolve_dependencies(roots, summary_index, fetch_manifest, side):
     """Resolves the full dependency *closure* of one OR MORE root mods, returning
     a flat, deduplicated list of ModManifests (the roots themselves not included;
     the caller already has them).
+
+    `side` is "client" or "server" -- the kind of process this closure is being
+    installed into -- and is mandatory, with no default. A dependency that can't
+    run on that side is dropped, along with everything only it needed. That is a
+    derivation, not a guess: server_side false means the mod cannot load in a
+    server process at all, so nothing running in a server process can hard-depend
+    on it, and "M depends on D" where D is client-only has exactly one coherent
+    reading -- M's client half needs D. (A mod whose server half genuinely
+    referenced a client-only assembly would be unloadable no matter what we did
+    here; installing D wouldn't save it, since D doesn't work there either. That
+    case is a manifest bug, and belongs to submission validation, not to us.)
+    Dropping is reported through _warn rather than done silently: a quiet prune is
+    indistinguishable from a broken resolver.
 
     Two inputs beyond the roots:
       - summary_index: the collision-resolved list[ModSummary] from fetch_indexes.
@@ -50,6 +75,11 @@ def resolve_dependencies(roots, summary_index, fetch_manifest):
       - Chain too deep: a strictly acyclic chain longer than MAX_DEPENDENCY_DEPTH.
       - Diamond conflict: two branches need the same id at incompatible majors;
         raises naming both requiring mods and both constraints."""
+    if side not in SIDES:
+        raise ModManagerError(
+            f"resolve_dependencies needs side={' or '.join(map(repr, SIDES))}, "
+            f"got {side!r}.")
+
     summ = {}            # (id, major) -> ModSummary
     for s in summary_index:
         summ[(s.id, s.major)] = s
@@ -59,8 +89,17 @@ def resolve_dependencies(roots, summary_index, fetch_manifest):
     req_major = {}       # id -> locked major
     req_min = {}         # id -> highest min-version tuple required so far
     req_by = {}          # id -> (mod name, constraint str) of first requirer, for messages
+    pruned = {}          # id -> the wrong-side ModManifest, so it's fetched at most once
 
     def add_requirement(dep_id, min_v, requirer, chain):
+        if dep_id in pruned:
+            # Already established this one can't run here. Still reported, so a
+            # second requirer of the same wrong-side dep isn't invisible, but not
+            # re-fetched and not re-walked.
+            _warn(f"{requirer} depends on '{dep_id}', which doesn't run on the "
+                  f"{side}; skipped.")
+            return
+
         try:
             mv = _parse_version(min_v)
         except ModManagerError as e:
@@ -76,9 +115,6 @@ def resolve_dependencies(roots, summary_index, fetch_manifest):
                 f"(major {major}). These majors can't be satisfied together.")
 
         new_min = mv if dep_id not in req_min else max(req_min[dep_id], mv)
-        req_major[dep_id] = major
-        req_min[dep_id] = new_min
-        req_by.setdefault(dep_id, (requirer, min_v))
 
         summary = summ.get((dep_id, major))
         available = summary.versions if summary else []
@@ -91,11 +127,30 @@ def resolve_dependencies(roots, summary_index, fetch_manifest):
                 f"(available: {have}). Is the right repository added?")
         pick_version = max(candidates, key=_parse_version)
 
+        def record():
+            req_major[dep_id] = major
+            req_min[dep_id] = new_min
+            req_by.setdefault(dep_id, (requirer, min_v))
+
         prev = chosen.get(dep_id)
-        if prev is None or prev.version != pick_version:
-            manifest = fetch_manifest(dep_id, pick_version, summary.source_repo)
-            chosen[dep_id] = manifest
-            visit(manifest, chain + [dep_id])
+        if prev is not None and prev.version == pick_version:
+            record()         # already selected at this exact version
+            return
+
+        manifest = fetch_manifest(dep_id, pick_version, summary.source_repo)
+        if not _runs_on(manifest, side):
+            # Pruned BEFORE its constraints are recorded, so a mod we aren't
+            # installing can't go on to raise a diamond conflict against a later
+            # requirer, and its own dependencies are never walked -- nothing
+            # reached only through it is needed either.
+            pruned[dep_id] = manifest
+            _warn(f"{requirer} depends on '{dep_id}' {pick_version}, which doesn't "
+                  f"run on the {side}; skipped, along with anything only it needed.")
+            return
+
+        record()
+        chosen[dep_id] = manifest
+        visit(manifest, chain + [dep_id])
 
     def visit(mod, chain):
         if len(chain) > MAX_DEPENDENCY_DEPTH:
