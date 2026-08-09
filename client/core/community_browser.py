@@ -92,7 +92,7 @@ class CommunityBrowser(tk.Toplevel):
             self._servers = data if isinstance(data, list) else []
             self.after(0, self._populate)
         except Exception as e:
-            self.after(0, lambda: self._status.set(
+            self.after(0, lambda e=e: self._status.set(
                 f"Could not reach community list — {e}"))
 
     def _sort_by(self, col):
