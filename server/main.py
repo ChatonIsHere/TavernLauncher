@@ -38,6 +38,12 @@ def _write_error_log(err_text):
         pass
 
 
+# Tell the mod manager which config file it is working against -- the server's
+# own, not the client's. Same placement and reasoning as client/main.py.
+from tavern_shared.mods import hostcfg as _mods_hostcfg
+from server.core.data_store import load_cfg as _load_cfg, save_cfg as _save_cfg
+_mods_hostcfg.set_config_accessors(_load_cfg, _save_cfg)
+
 from server.core import addon_loader
 addon_loader.load_enabled_addons("server", _write_error_log)
 
