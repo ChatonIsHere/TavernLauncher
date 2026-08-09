@@ -8,6 +8,7 @@ and per-version manifests by URL) and the download/hash helpers. No network.
 Run from TavernLauncher/:  python -m unittest -v   or   python tests/test_modmanager.py
 """
 
+import contextlib
 import hashlib
 import io
 import json
@@ -352,7 +353,7 @@ class Resolution(unittest.TestCase):
         index = [summary("dep.k", ["1.1.0", "1.4.0"]), summary("dep.k", ["2.1.0"])]
         fetch = self._store(make_manifest("dep.k", "1.4.0"))
         root = make_manifest("root.m", "1.0.0", dependencies={"dep.k": "1.2.0"})
-        got = mm.resolve_dependencies([root], index, fetch)
+        got = mm.resolve_dependencies([root], index, fetch, side="client")
         self.assertEqual([m.version for m in got], ["1.4.0"])   # not 2.1.0, not 1.1.0
 
     def test_diamond_conflict_raises(self):
@@ -362,7 +363,7 @@ class Resolution(unittest.TestCase):
         a = make_manifest("a.a", "1.0.0", dependencies={"dep.k": "1.0.0"})
         b = make_manifest("b.b", "1.0.0", dependencies={"dep.k": "2.0.0"})
         with self.assertRaises(mm.ModManagerError):
-            mm.resolve_dependencies([a, b], index, fetch)
+            mm.resolve_dependencies([a, b], index, fetch, side="client")
 
     def test_cycle_raises(self):
         index = [summary("a.a", ["1.0.0"]), summary("b.b", ["1.0.0"])]
@@ -370,12 +371,165 @@ class Resolution(unittest.TestCase):
         b = make_manifest("b.b", "1.0.0", dependencies={"a.a": "1.0.0"})
         fetch = self._store(a, b)
         with self.assertRaises(mm.ModManagerError):
-            mm.resolve_dependencies([a], index, fetch)
+            mm.resolve_dependencies([a], index, fetch, side="client")
 
     def test_missing_dependency_raises(self):
         root = make_manifest("root.m", "1.0.0", dependencies={"nope.x": "1.0.0"})
         with self.assertRaises(mm.ModManagerError):
-            mm.resolve_dependencies([root], [], self._store())
+            mm.resolve_dependencies([root], [], self._store(), side="client")
+
+
+class SideFilteredResolution(unittest.TestCase):
+    """A dependency that can't run on the side being installed into is dropped,
+    along with anything only it needed.
+
+    The motivating case: a mod that runs on both sides, whose client half needs a
+    client-only support mod. Installing it on a server used to pull that support
+    mod in and crash the server loading it."""
+
+    def _store(self, *manifests):
+        d = {}
+        for m in manifests:
+            d[(m.id, m.version)] = m
+        return lambda mid, ver, src: d[(mid, ver)]
+
+    def _tracking_store(self, *manifests):
+        """Same, but records which ids were actually fetched - the only way to
+        show a pruned subtree is never WALKED, as opposed to walked and then
+        filtered out of the result."""
+        d = {}
+        for m in manifests:
+            d[(m.id, m.version)] = m
+        fetched = []
+
+        def fetch(mid, ver, src):
+            fetched.append(mid)
+            return d[(mid, ver)]
+        return fetch, fetched
+
+    # A dual-side root whose dependency only runs on clients.
+    def _dual_root_with_client_only_dep(self):
+        index = [summary("ui.kit", ["1.0.0"], client=True, server=False)]
+        dep = make_manifest("ui.kit", "1.0.0", client_side=True, server_side=False)
+        root = make_manifest("dual.m", "1.0.0", dependencies={"ui.kit": "1.0.0"})
+        return index, dep, root
+
+    def test_client_only_dependency_pruned_on_server(self):
+        index, dep, root = self._dual_root_with_client_only_dep()
+        got = mm.resolve_dependencies([root], index, self._store(dep), side="server")
+        self.assertEqual(got, [])
+
+    def test_same_dependency_kept_on_client(self):
+        # Identical inputs to the test above; only the side differs. The pair is
+        # the point: one input, two correct answers.
+        index, dep, root = self._dual_root_with_client_only_dep()
+        got = mm.resolve_dependencies([root], index, self._store(dep), side="client")
+        self.assertEqual([m.id for m in got], ["ui.kit"])
+
+    def test_server_only_dependency_pruned_on_client(self):
+        index = [summary("db.tools", ["1.0.0"], client=False, server=True)]
+        dep = make_manifest("db.tools", "1.0.0", client_side=False, server_side=True)
+        root = make_manifest("dual.m", "1.0.0", dependencies={"db.tools": "1.0.0"})
+        self.assertEqual(mm.resolve_dependencies([root], index, self._store(dep),
+                                                  side="client"), [])
+        self.assertEqual([m.id for m in mm.resolve_dependencies(
+            [root], index, self._store(dep), side="server")], ["db.tools"])
+
+    def test_dual_side_dependency_kept_on_both(self):
+        index = [summary("shared.d", ["1.0.0"])]
+        dep = make_manifest("shared.d", "1.0.0")
+        root = make_manifest("root.m", "1.0.0", dependencies={"shared.d": "1.0.0"})
+        for side in ("client", "server"):
+            got = mm.resolve_dependencies([root], index, self._store(dep), side=side)
+            self.assertEqual([m.id for m in got], ["shared.d"], side)
+
+    def test_subtree_under_pruned_dependency_is_never_walked(self):
+        index = [summary("ui.kit", ["1.0.0"], client=True, server=False),
+                 summary("deep.d", ["1.0.0"])]
+        dep = make_manifest("ui.kit", "1.0.0", client_side=True, server_side=False,
+                            dependencies={"deep.d": "1.0.0"})
+        deep = make_manifest("deep.d", "1.0.0")
+        root = make_manifest("dual.m", "1.0.0", dependencies={"ui.kit": "1.0.0"})
+        fetch, fetched = self._tracking_store(dep, deep)
+        self.assertEqual(mm.resolve_dependencies([root], index, fetch, side="server"), [])
+        # ui.kit is fetched (its manifest is what decides the side), deep.d never is.
+        self.assertEqual(fetched, ["ui.kit"])
+
+    def test_dependency_also_reachable_by_a_valid_path_still_arrives(self):
+        """Pruning ui.kit must not take shared.d with it when something else
+        needs shared.d in its own right. Pruning is 'drop what only IT needed'."""
+        index = [summary("ui.kit", ["1.0.0"], client=True, server=False),
+                 summary("shared.d", ["1.0.0"])]
+        ui = make_manifest("ui.kit", "1.0.0", client_side=True, server_side=False,
+                           dependencies={"shared.d": "1.0.0"})
+        shared = make_manifest("shared.d", "1.0.0")
+        # a is visited first, so shared.d is first reached THROUGH the pruned dep.
+        a = make_manifest("a.a", "1.0.0", dependencies={"ui.kit": "1.0.0"})
+        b = make_manifest("b.b", "1.0.0", dependencies={"shared.d": "1.0.0"})
+        got = mm.resolve_dependencies([a, b], index, self._store(ui, shared), side="server")
+        self.assertEqual([m.id for m in got], ["shared.d"])
+
+    def test_pruned_dependency_raises_no_diamond_conflict(self):
+        """A mod we aren't installing must not be able to fail the whole resolve
+        over a version disagreement about itself - the reason its constraints are
+        recorded only after the side check passes."""
+        index = [summary("ui.kit", ["1.0.0"], client=True, server=False),
+                 summary("ui.kit", ["2.0.0"], client=True, server=False)]
+        ui1 = make_manifest("ui.kit", "1.0.0", client_side=True, server_side=False)
+        a = make_manifest("a.a", "1.0.0", dependencies={"ui.kit": "1.0.0"})
+        b = make_manifest("b.b", "1.0.0", dependencies={"ui.kit": "2.0.0"})
+        self.assertEqual(mm.resolve_dependencies([a, b], index, self._store(ui1),
+                                                  side="server"), [])
+        # The same disagreement is still a hard error on the side that installs it.
+        with self.assertRaises(mm.ModManagerError):
+            mm.resolve_dependencies([a, b], index, self._store(ui1), side="client")
+
+    def test_wrong_side_dependency_fetched_only_once(self):
+        index = [summary("ui.kit", ["1.0.0"], client=True, server=False)]
+        ui = make_manifest("ui.kit", "1.0.0", client_side=True, server_side=False)
+        a = make_manifest("a.a", "1.0.0", dependencies={"ui.kit": "1.0.0"})
+        b = make_manifest("b.b", "1.0.0", dependencies={"ui.kit": "1.0.0"})
+        fetch, fetched = self._tracking_store(ui)
+        self.assertEqual(mm.resolve_dependencies([a, b], index, fetch, side="server"), [])
+        self.assertEqual(fetched, ["ui.kit"])
+
+    def test_pruning_is_reported_not_silent(self):
+        index, dep, root = self._dual_root_with_client_only_dep()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mm.resolve_dependencies([root], index, self._store(dep), side="server")
+        msg = err.getvalue()
+        self.assertIn("ui.kit", msg)
+        self.assertIn("server", msg)
+
+    def test_second_requirer_of_a_pruned_dependency_also_reported(self):
+        index = [summary("ui.kit", ["1.0.0"], client=True, server=False)]
+        ui = make_manifest("ui.kit", "1.0.0", client_side=True, server_side=False)
+        a = make_manifest("a.a", "1.0.0", dependencies={"ui.kit": "1.0.0"})
+        b = make_manifest("b.b", "1.0.0", dependencies={"ui.kit": "1.0.0"})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mm.resolve_dependencies([a, b], index, self._store(ui), side="server")
+        # Fetched once (test above), but both requirers still say so.
+        self.assertEqual(err.getvalue().count("ui.kit"), 2)
+
+    def test_roots_are_not_side_filtered(self):
+        """Only DEPENDENCIES are filtered. A root is what the caller explicitly
+        asked for, and list_mods already keeps a wrong-side mod out of the browse
+        list it's picked from; silently resolving to nothing here would just hide
+        a caller bug."""
+        index = [summary("shared.d", ["1.0.0"])]
+        dep = make_manifest("shared.d", "1.0.0")
+        root = make_manifest("client.only", "1.0.0", client_side=True, server_side=False,
+                             dependencies={"shared.d": "1.0.0"})
+        got = mm.resolve_dependencies([root], index, self._store(dep), side="server")
+        self.assertEqual([m.id for m in got], ["shared.d"])
+
+    def test_side_is_mandatory_and_validated(self):
+        root = make_manifest("root.m", "1.0.0")
+        for bad in (None, "", "both", "Client", "SERVER", 0):
+            with self.assertRaises(mm.ModManagerError, msg=repr(bad)):
+                mm.resolve_dependencies([root], [], self._store(), side=bad)
 
 
 class Libraries(unittest.TestCase):
@@ -472,7 +626,7 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
 
         index = [summary("dep.k", ["1.0.0"]), summary("root.m", ["1.0.0"])]
         root_summary = summary("root.m", ["1.0.0"])
-        mm.install_mod_closure(self.game, root_summary, index, [self.BASE], self.progress.append)
+        mm.install_mod_closure(self.game, root_summary, index, [self.BASE], self.progress.append, side="client")
 
         # Each mod lands in its own folder, Mods/<id>/, with the dll inside.
         self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "root.m", "root.m.dll")))
@@ -502,7 +656,7 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
         self._publish("v.v", "2.0.0")
         index = [summary("v.v", ["1.0.0", "2.0.0"])]
         mm.install_mod_closure(self.game, summary("v.v", ["1.0.0", "2.0.0"]), index,
-                               [self.BASE], self.progress.append, version="1.0.0")
+                               [self.BASE], self.progress.append, version="1.0.0", side="client")
         mod_meta = read_json(os.path.join(self.game, "Mods", "v.v", "manifest.json"))
         self.assertEqual(mod_meta["version"], "1.0.0")
 
@@ -512,7 +666,7 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
         index = [summary("bad.m", ["1.0.0"])]
         with self.assertRaises(mm.ModManagerError):
             mm.install_mod_closure(self.game, summary("bad.m", ["1.0.0"]), index,
-                                   [self.BASE], self.progress.append)
+                                   [self.BASE], self.progress.append, side="client")
         # No mod folder and no staging left behind.
         self.assertFalse(os.path.exists(os.path.join(self.game, "Mods", "bad.m")))
         self.assertFalse(os.path.exists(os.path.join(self.game, "Mods", ".bad.m.installing")))
@@ -521,7 +675,7 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
         self._publish("s.s", "1.0.0")
         index = [summary("s.s", ["1.0.0"])]
         mm.install_mod_closure(self.game, summary("s.s", ["1.0.0"]), index,
-                               [self.BASE], self.progress.append)
+                               [self.BASE], self.progress.append, side="client")
         self.assertEqual(mm.mod_status(self.game, "s.s", [summary("s.s", ["1.0.0"])]), "current")
         self.assertEqual(mm.mod_status(self.game, "s.s", [summary("s.s", ["1.0.0", "1.1.0"])]), "outdated")
 
@@ -531,7 +685,7 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
         self._publish("u.m", "1.0.0", library_dependencies=[dict(lib)])
         index = [summary("u.m", ["1.0.0"])]
         mm.install_mod_closure(self.game, summary("u.m", ["1.0.0"]), index,
-                               [self.BASE], self.progress.append)
+                               [self.BASE], self.progress.append, side="client")
 
         self.assertTrue(mm.uninstall_mod(self.game, "u.m"))
         self.assertFalse(os.path.exists(os.path.join(self.game, "Mods", "u.m")))
@@ -547,9 +701,9 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
         self._publish("b.m", "1.0.0", library_dependencies=[dict(lib)])
         index = [summary("a.m", ["1.0.0"]), summary("b.m", ["1.0.0"])]
         mm.install_mod_closure(self.game, summary("a.m", ["1.0.0"]), index,
-                               [self.BASE], self.progress.append)
+                               [self.BASE], self.progress.append, side="client")
         mm.install_mod_closure(self.game, summary("b.m", ["1.0.0"]), index,
-                               [self.BASE], self.progress.append)
+                               [self.BASE], self.progress.append, side="client")
 
         # Removing a leaves the library, since b still needs it.
         mm.uninstall_mod(self.game, "a.m")
@@ -565,7 +719,7 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
         self._publish("d.m", "1.0.0")
         index = [summary("d.m", ["1.0.0"])]
         mm.install_mod_closure(self.game, summary("d.m", ["1.0.0"]), index,
-                               [self.BASE], self.progress.append)
+                               [self.BASE], self.progress.append, side="client")
         folder = os.path.join(self.game, "Mods", "d.m")
         record = os.path.join(folder, "manifest.json")
         disabled = os.path.join(folder, "manifest.disabled.json")
@@ -594,7 +748,7 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
         self._publish("n.m", "1.0.0")
         index = [summary("n.m", ["1.0.0"])]
         mm.install_mod_closure(self.game, summary("n.m", ["1.0.0"]), index,
-                               [self.BASE], self.progress.append)
+                               [self.BASE], self.progress.append, side="client")
         # Enabling an already-enabled mod, or disabling twice, is a no-op.
         self.assertFalse(mm.enable_mod(self.game, "n.m"))
         self.assertTrue(mm.disable_mod(self.game, "n.m"))
@@ -604,7 +758,7 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
         self._publish("z.m", "1.0.0")
         index = [summary("z.m", ["1.0.0"])]
         mm.install_mod_closure(self.game, summary("z.m", ["1.0.0"]), index,
-                               [self.BASE], self.progress.append)
+                               [self.BASE], self.progress.append, side="client")
         self.assertTrue(mm.disable_mod(self.game, "z.m"))
         self.assertTrue(mm.uninstall_mod(self.game, "z.m"))
         self.assertFalse(os.path.exists(os.path.join(self.game, "Mods", "z.m")))
@@ -618,7 +772,7 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
         self._publish("t.m", "1.0.0", library_dependencies=[dict(lib)])
         index = [summary("t.m", ["1.0.0"])]
         mm.install_mod_closure(self.game, summary("t.m", ["1.0.0"]), index,
-                               [self.BASE], self.progress.append)
+                               [self.BASE], self.progress.append, side="client")
         game_root = os.path.normcase(os.path.abspath(self.game)) + os.sep
         self.assertTrue(self.dl_dirs)
         for d in self.dl_dirs:
@@ -640,9 +794,9 @@ class HandshakeSnapshot(_FakeInstallFixture, unittest.TestCase):
         self._publish("z.z", "1.0.0")
         self._publish("a.a", "2.1.0")
         mm.install_mod_closure(self.game, summary("z.z", ["1.0.0"]), [summary("z.z", ["1.0.0"])],
-                               [self.BASE], self.progress.append)
+                               [self.BASE], self.progress.append, side="client")
         mm.install_mod_closure(self.game, summary("a.a", ["2.1.0"]), [summary("a.a", ["2.1.0"])],
-                               [self.BASE], self.progress.append)
+                               [self.BASE], self.progress.append, side="client")
 
         mods_hash, count, entries = mm.handshake_snapshot(self.game)
         self.assertEqual(count, 2)
@@ -661,7 +815,7 @@ class HandshakeSnapshot(_FakeInstallFixture, unittest.TestCase):
         against the old answer and can skip a mod that became mandatory."""
         self._publish("p.p", "1.0.0")
         mm.install_mod_closure(self.game, summary("p.p", ["1.0.0"]), [summary("p.p", ["1.0.0"])],
-                               [self.BASE], self.progress.append)
+                               [self.BASE], self.progress.append, side="client")
         before, _, entries = mm.handshake_snapshot(self.game)
         self.assertIs(entries[0]["parity_required"], True)
 
@@ -681,7 +835,7 @@ class HandshakeSnapshot(_FakeInstallFixture, unittest.TestCase):
     def test_disabled_mod_excluded_from_snapshot(self):
         self._publish("d.d", "1.0.0")
         mm.install_mod_closure(self.game, summary("d.d", ["1.0.0"]), [summary("d.d", ["1.0.0"])],
-                               [self.BASE], self.progress.append)
+                               [self.BASE], self.progress.append, side="client")
         mm.disable_mod(self.game, "d.d")
 
         mods_hash, count, entries = mm.handshake_snapshot(self.game)
@@ -692,12 +846,12 @@ class HandshakeSnapshot(_FakeInstallFixture, unittest.TestCase):
     def test_hash_changes_when_a_version_changes(self):
         self._publish("v.v", "1.0.0")
         mm.install_mod_closure(self.game, summary("v.v", ["1.0.0"]), [summary("v.v", ["1.0.0"])],
-                               [self.BASE], self.progress.append)
+                               [self.BASE], self.progress.append, side="client")
         before, _, _ = mm.handshake_snapshot(self.game)
 
         self._publish("v.v", "1.1.0")
         mm.install_mod_closure(self.game, summary("v.v", ["1.1.0"]), [summary("v.v", ["1.1.0"])],
-                               [self.BASE], self.progress.append)
+                               [self.BASE], self.progress.append, side="client")
         after, _, _ = mm.handshake_snapshot(self.game)
 
         self.assertNotEqual(before, after)
@@ -720,7 +874,7 @@ class ClientModCache(_FakeInstallFixture, unittest.TestCase):
     def _install(self, mod_id, version, **over):
         self._publish(mod_id, version, **over)
         mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
-                               [self.BASE], self.progress.append)
+                               [self.BASE], self.progress.append, side="client")
 
     def test_store_then_restore_round_trip(self):
         self._install("c.m", "1.0.0")
@@ -824,7 +978,7 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
     def _install(self, mod_id, version, **over):
         self._publish(mod_id, version, **over)
         mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
-                               [self.BASE], self.progress.append)
+                               [self.BASE], self.progress.append, side="client")
 
     def _entry(self, plan, mod_id):
         return next(e for e in plan.entries if e.mod_id == mod_id)
@@ -963,7 +1117,7 @@ class ModDiff(_FakeInstallFixture, unittest.TestCase):
     def _install(self, mod_id, version, **over):
         self._publish(mod_id, version, **over)
         mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
-                               [self.BASE], self.progress.append)
+                               [self.BASE], self.progress.append, side="client")
 
     def _diff(self, server_mods, index):
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
@@ -1109,7 +1263,7 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
     def _install(self, mod_id, version, **over):
         self._publish(mod_id, version, **over)
         mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
-                               [self.BASE], self.progress.append)
+                               [self.BASE], self.progress.append, side="client")
 
     def test_downloads_missing_required_mod_and_caches_it(self):
         self._publish("dl.m", "1.0.0")
@@ -1381,7 +1535,7 @@ class Parity(_FakeInstallFixture, unittest.TestCase):
     def _install(self, mod_id, version, **over):
         self._publish(mod_id, version, **over)
         mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
-                               [self.BASE], self.progress.append)
+                               [self.BASE], self.progress.append, side="client")
 
     @staticmethod
     def _srv(mod_id, version, required=None, client=True, server=True):
@@ -1651,7 +1805,7 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
     def _install(self, mod_id, version, **over):
         self._publish(mod_id, version, **over)
         mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
-                               [self.BASE], self.progress.append)
+                               [self.BASE], self.progress.append, side="client")
 
     def _publish_latest(self, mod_id, version, **over):
         """Like _publish, but also serves it at latest.json, so bare-id
@@ -1686,7 +1840,7 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
     def test_import_resolves_bare_id_via_latest(self):
         self._publish_latest("lat.m", "2.0.0")
         modlist = {"schema": 1, "repos": [], "mods": ["lat.m"]}
-        plan = mm.import_modlist(modlist, [], [self.BASE])
+        plan = mm.import_modlist(modlist, [], [self.BASE], side="client")
         self.assertFalse(plan.blocking)
         self.assertEqual([(m.id, m.version) for m in plan.roots], [("lat.m", "2.0.0")])
 
@@ -1694,7 +1848,7 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         self._publish("pin.m", "1.0.0")
         self._publish("pin.m", "2.0.0")
         modlist = {"schema": 1, "repos": [], "mods": ["pin.m@1.0.0"]}
-        plan = mm.import_modlist(modlist, [], [self.BASE])
+        plan = mm.import_modlist(modlist, [], [self.BASE], side="client")
         self.assertEqual([(m.id, m.version) for m in plan.roots], [("pin.m", "1.0.0")])
 
     def test_import_pulls_in_dependencies(self):
@@ -1702,13 +1856,13 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         self._publish_latest("root.m", "1.0.0", dependencies={"dep.k": "1.0.0"})
         index = [summary("dep.k", ["1.0.0"])]
         modlist = {"schema": 1, "repos": [], "mods": ["root.m"]}
-        plan = mm.import_modlist(modlist, index, [self.BASE])
+        plan = mm.import_modlist(modlist, index, [self.BASE], side="client")
         self.assertEqual([m.id for m in plan.roots], ["root.m"])
         self.assertEqual([m.id for m in plan.dependencies], ["dep.k"])
 
     def test_import_unresolved_entry_blocks(self):
         modlist = {"schema": 1, "repos": ["Some/Pack"], "mods": ["ghost.m@1.0.0"]}
-        plan = mm.import_modlist(modlist, [], [self.BASE])
+        plan = mm.import_modlist(modlist, [], [self.BASE], side="client")
         self.assertTrue(plan.blocking)
         self.assertEqual(plan.unresolved, [("ghost.m", "1.0.0")])
         self.assertEqual(plan.hinted_repos, ["Some/Pack"])
@@ -1716,14 +1870,14 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
     def test_import_rejects_unsupported_schema(self):
         modlist = {"schema": 2, "repos": [], "mods": []}
         with self.assertRaises(mm.ModManagerError):
-            mm.import_modlist(modlist, [], [self.BASE])
+            mm.import_modlist(modlist, [], [self.BASE], side="client")
 
     def test_apply_import_installs_roots_and_dependencies(self):
         self._publish("dep.k", "1.0.0")
         self._publish_latest("root.m", "1.0.0", dependencies={"dep.k": "1.0.0"})
         index = [summary("dep.k", ["1.0.0"])]
         modlist = {"schema": 1, "repos": [], "mods": ["root.m"]}
-        plan = mm.import_modlist(modlist, index, [self.BASE])
+        plan = mm.import_modlist(modlist, index, [self.BASE], side="client")
 
         mm.apply_import(self.game, plan, self.progress.append)
         self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "root.m", "root.m.dll")))
@@ -1734,7 +1888,7 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         self._install("drop.m", "1.0.0")
         self._publish_latest("keep.m", "1.0.0")
         modlist = {"schema": 1, "repos": [], "mods": ["keep.m"]}
-        plan = mm.import_modlist(modlist, [], [self.BASE])
+        plan = mm.import_modlist(modlist, [], [self.BASE], side="client")
 
         mm.apply_import(self.game, plan, self.progress.append)
 
@@ -1748,7 +1902,7 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         self._publish_latest("root.m", "1.0.0", dependencies={"dep.k": "1.0.0"})
         index = [summary("dep.k", ["1.0.0"])]
         modlist = {"schema": 1, "repos": [], "mods": ["root.m"]}
-        plan = mm.import_modlist(modlist, index, [self.BASE])
+        plan = mm.import_modlist(modlist, index, [self.BASE], side="client")
 
         mm.apply_import(self.game, plan, self.progress.append)
 
@@ -1759,7 +1913,7 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         self._install("dis.m", "1.0.0")
         mm.disable_mod(self.game, "dis.m")
         modlist = {"schema": 1, "repos": [], "mods": []}
-        plan = mm.import_modlist(modlist, [], [self.BASE])
+        plan = mm.import_modlist(modlist, [], [self.BASE], side="client")
 
         mm.apply_import(self.game, plan, self.progress.append)
 
@@ -1771,7 +1925,7 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         self._install("drop.m", "1.0.0")
         self._publish_latest("keep.m", "1.0.0")
         modlist = {"schema": 1, "repos": [], "mods": ["keep.m"]}
-        plan = mm.import_modlist(modlist, [], [self.BASE])
+        plan = mm.import_modlist(modlist, [], [self.BASE], side="client")
 
         self.assertEqual(mm.modlist_import_disables(self.game, plan), ["drop.m"])
         installed = {r["id"]: r["enabled"] for r in mm.list_installed_mods(self.game)}
@@ -1779,7 +1933,7 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
 
     def test_apply_import_blocking_plan_raises_without_installing(self):
         modlist = {"schema": 1, "repos": [], "mods": ["ghost.m"]}
-        plan = mm.import_modlist(modlist, [], [self.BASE])
+        plan = mm.import_modlist(modlist, [], [self.BASE], side="client")
         with self.assertRaises(mm.ModManagerError):
             mm.apply_import(self.game, plan)
         self.assertFalse(os.path.exists(os.path.join(self.game, "Mods")))
@@ -1791,7 +1945,7 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         # on import, same as a real repo would.
         self.manifests[f"{self.BASE}/manifests/rt/m/latest.json"] = self.manifests[
             f"{self.BASE}/manifests/rt/m/1.0.0.json"]
-        plan = mm.import_modlist(exported, [], [self.BASE])
+        plan = mm.import_modlist(exported, [], [self.BASE], side="client")
         self.assertFalse(plan.blocking)
         self.assertEqual([m.id for m in plan.roots], ["rt.m"])
 
@@ -1855,7 +2009,7 @@ class ZipBundleInstall(unittest.TestCase):
     def _install(self, mod_id):
         index = [summary(mod_id, ["1.0.0"])]
         mm.install_mod_closure(self.game, summary(mod_id, ["1.0.0"]), index,
-                               [self.BASE], self.progress.append)
+                               [self.BASE], self.progress.append, side="client")
 
     def test_zip_bundle_extracts_into_mod_folder(self):
         self._publish_zip("bundle.m", "1.0.0", [

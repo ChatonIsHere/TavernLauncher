@@ -429,7 +429,7 @@ class CommunityModsWindow(tk.Toplevel):
                 install_mod_closure(
                     self._game_dir, mod, index, repos,
                     lambda m: self.after(0, lambda: self._status.set(m)),
-                    version=version)
+                    self._side, version=version)
                 self.after(0, lambda: self._finish(f"{label} installed."))
             except Exception as e:
                 self.after(0, lambda e=e: self._finish(f"Install failed: {e}"))
