@@ -423,9 +423,8 @@ def mod_status(game_dir, mod_id, index):
 def list_mods(index, side):
     """The merged index (list[ModSummary]) collapsed to one row per id (highest
     major), filtered to the caller's side: side="client" keeps client_side mods,
-    side="server" keeps server_side ones; att_client and att_server each pass
-    their own, so a server-only mod never shows in the client's browse list and
-    vice versa. The only listing accessor the UI needs (libraries never appear in
+    side="server" keeps server_side ones; each launcher passes its own, so a
+    server-only mod never shows in the client's browse list and vice versa. The only listing accessor the UI needs (libraries never appear in
     an index; they're inline library_dependencies on a parent manifest)."""
     best = {}    # id -> ModSummary with the highest version seen
     for s in index:
