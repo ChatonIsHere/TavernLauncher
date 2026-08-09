@@ -102,8 +102,8 @@ def adopt_installed_mods(game_dir):
     """Copies everything currently installed in Mods/ (and the UserLibs/
     libraries they pin) into the cache, without touching Mods/ itself.
     Idempotent - already-cached versions are skipped - so it's safe to call on
-    every join; att_client calls it from _reconcile_mods_before_launch, before
-    any plan is computed or applied.
+    every join; the client launcher calls it from _build_mod_plan, before any
+    plan is computed or applied.
 
     Running it before a render is what makes the cache's "switching servers is
     a file move, never a re-download" promise actually hold. Anything that

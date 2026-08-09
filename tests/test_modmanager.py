@@ -1,5 +1,5 @@
 """
-Tests for modmanager.py.
+Tests for the community mod manager (tavern_shared/mods/).
 
 repository.json holds slim ModSummary rows; the full manifest for each
 version is fetched on demand. Tests stub _get_json (serves repository.json
@@ -1136,7 +1136,8 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "cch.m", "cch.m.dll")))
 
     def test_adopting_first_preserves_the_version_a_render_replaces(self):
-        """The reason att_client calls adopt_installed_mods before planning.
+        """The reason the client launcher calls adopt_installed_mods before
+        planning (see _build_mod_plan).
 
         A mod installed straight to Mods/ (Community Mods window, or an older
         launcher with no cache) is unknown to the cache. Rendering a server's
