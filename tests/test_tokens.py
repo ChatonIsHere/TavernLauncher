@@ -13,7 +13,7 @@ import base64
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import att_client as ac
+from client.core import auth as ac
 
 
 def payload(token):

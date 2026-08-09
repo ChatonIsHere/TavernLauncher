@@ -7,7 +7,9 @@ import os
 import shutil
 
 from tavern_shared.paths import _app_dir, _sha256_file
-from tavern_shared.mod_install import _download_with_progress
+from tavern_shared.mod_install import (
+    _download_with_progress, _load_mod_meta, _save_mod_meta,
+)
 
 PATCH_DOWNLOAD_URL = "https://github.com/ModdingTavern/TavernDefaults/releases/latest/download/themoddingtavern.dll"
 
@@ -33,20 +35,30 @@ def _patch_target_path(game_exe):
 
 
 def _patch_is_applied(game_exe):
-    """True if the installed Root.Township.dll's content exactly matches the
-    local Patch/themoddingtavern.dll. This is a real on-disk comparison, not
-    a remembered "I clicked this before" flag — so if the client launcher
-    already patched a given game install, the server launcher (or vice
-    versa) correctly sees it as already done too, as long as they're both
-    pointed at the same game folder. No re-patching, no re-flashing."""
-    src = _patch_source_path()
+    """True if the installed Root.Township.dll matches the hash apply_patch
+    most recently confirmed writing there, recorded in the per-game-dir meta
+    file (see _load_mod_meta) rather than compared against the local
+    Patch/themoddingtavern.dll fallback copy.
+
+    Comparing against the bundled copy broke as soon as apply_patch actually
+    used its GitHub download, which is the common case whenever GitHub is
+    reachable: the installed file matched what had genuinely just been
+    applied, but not a bundled reference that is either stale or missing
+    entirely, so this reported "not applied" immediately after a successful
+    patch. Hashing what we ourselves last wrote is correct regardless of
+    which source supplied it.
+
+    The meta file lives in game_dir, not in per-launcher state, so if the
+    client launcher already patched a given game install the server launcher
+    (or vice versa) still sees it as done, as long as both point at the same
+    game folder. No re-patching, no re-flashing."""
+    game_dir = os.path.dirname(game_exe)
     dst = _patch_target_path(game_exe)
+    recorded = _load_mod_meta(game_dir).get("patch_sha256")
+    if not recorded or not os.path.isfile(dst):
+        return False
     try:
-        if not (os.path.isfile(src) and os.path.isfile(dst)):
-            return False
-        if os.path.getsize(src) != os.path.getsize(dst):
-            return False
-        return _sha256_file(src) == _sha256_file(dst)
+        return _sha256_file(dst) == recorded
     except OSError:
         return False
 
@@ -62,6 +74,7 @@ def apply_patch(game_exe, on_progress=None):
     if on_progress is None:
         on_progress = lambda msg: None
 
+    game_dir = os.path.dirname(game_exe)
     dst = _patch_target_path(game_exe)
     managed_dir = os.path.dirname(dst)
     if not os.path.isdir(managed_dir):
@@ -87,23 +100,32 @@ def apply_patch(game_exe, on_progress=None):
             source = "bundled"
 
         new_hash = _sha256_file(tmp_dest)
-        if os.path.isfile(dst) and _sha256_file(dst) == new_hash:
-            # Already exactly what we'd install — skip the write entirely
-            # rather than rewriting (and re-triggering AV scanning of) a
-            # file that's already correct.
-            return "current"
+        already_current = os.path.isfile(dst) and _sha256_file(dst) == new_hash
+        if not already_current:
+            # Not already exactly what we'd install — swap it in. (If it
+            # already matches, skip the write entirely rather than rewriting,
+            # and re-triggering AV scanning of, a file that's already
+            # correct.)
+            os.replace(tmp_dest, dst)  # atomic on Windows — always a full swap, never a partial one
+            if not os.path.isfile(dst) or _sha256_file(dst) != new_hash:
+                raise RuntimeError(
+                    "The file was written without any error, but checking it afterward "
+                    "shows it doesn't match what was just installed. This usually means "
+                    "something on this PC silently blocked the write — most commonly "
+                    "Windows' Controlled Folder Access, or antivirus real-time protection. "
+                    "Try adding an exclusion for the game's install folder in Windows "
+                    "Security (or your antivirus), or temporarily disabling Controlled "
+                    "Folder Access, then try again.")
 
-        os.replace(tmp_dest, dst)  # atomic on Windows — always a full swap, never a partial one
-        if not os.path.isfile(dst) or _sha256_file(dst) != new_hash:
-            raise RuntimeError(
-                "The file was written without any error, but checking it afterward "
-                "shows it doesn't match what was just installed. This usually means "
-                "something on this PC silently blocked the write — most commonly "
-                "Windows' Controlled Folder Access, or antivirus real-time protection. "
-                "Try adding an exclusion for the game's install folder in Windows "
-                "Security (or your antivirus), or temporarily disabling Controlled "
-                "Folder Access, then try again.")
-        return source
+        # Record what is now confirmed to be sitting at dst, so
+        # _patch_is_applied (any launcher, any time) can recognise it without
+        # comparing against the local Patch/ fallback copy, which may be
+        # stale or absent by the time that runs.
+        meta = _load_mod_meta(game_dir)
+        meta["patch_sha256"] = new_hash
+        _save_mod_meta(game_dir, meta)
+
+        return "current" if already_current else source
     finally:
         try:
             if os.path.isfile(tmp_dest):
