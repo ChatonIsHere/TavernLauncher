@@ -46,22 +46,37 @@ def parity_required(d):
     independently, like a client performance tweak that happens to ship a server
     piece.
 
-    Mandatory, with no default: every shape that carries this field is written
-    by tooling that knows about it, so a missing one means the data predates the
-    field or came from something that doesn't implement it, and guessing on its
-    behalf is exactly what would let a required mod be silently treated as
-    optional. Callers decide what to do with the error - a manifest becomes
-    unresolvable, an index entry or an install record is skipped with a warning.
+    Mandatory, with no default, and it must be an actual boolean: every shape
+    that carries this field is written by tooling that knows about it, so a
+    missing or malformed one means the data predates the field or came from
+    something that doesn't implement it, and guessing on its behalf is exactly
+    what would let a required mod be silently treated as optional. Callers
+    decide what to do with the error - a manifest becomes unresolvable, an index
+    entry or an install record is skipped with a warning.
 
-    Only a literal False relaxes it, so a present-but-malformed value (a string,
-    a None, a 0) still reads as required rather than being trusted."""
+    A present-but-malformed value (a string "false", a None, a 0) raises, on the
+    same terms as an absent one. It used to read as required, which was safe on
+    its own but put this out of step with TavernLib's ModParityField.Read, which
+    throws - so one hand-rolled third-party manifest installed through the
+    launcher and was unresolvable on a headless host, for the same bytes. Having
+    one answer on both sides matters more than which answer it is, and refusing
+    data nobody can interpret is the one that gets the manifest fixed rather
+    than quietly published broken."""
     if "parity_required" not in d:
         raise ModManagerError(
             f"'{d.get('id', '?')}' has no parity_required field. It's required: "
             f"true if a client joining a server running this mod must have this "
             f"exact version, false if the server shouldn't block the join over "
             f"it. A mod installed before this field existed needs reinstalling.")
-    return d["parity_required"] is not False
+    value = d["parity_required"]
+    # isinstance(1, bool) is False in Python, so an int 0/1 is rejected too.
+    if not isinstance(value, bool):
+        raise ModManagerError(
+            f"'{d.get('id', '?')}' has a parity_required of {value!r}, which "
+            f"isn't true or false. It must be a real boolean: true if a client "
+            f"joining a server running this mod must have this exact version, "
+            f"false if the server shouldn't block the join over it.")
+    return value
 
 
 @dataclass
@@ -203,10 +218,11 @@ def _summary_from_dict(d, mod_id, source_repo):
         return None
     try:
         required = parity_required(d)
-    except ModManagerError:
+    except ModManagerError as e:
         # One malformed entry shouldn't cost the whole index. Skipped rather
         # than guessed at, same as an entry with no usable versions.
-        _warn(f"index entry for {mod_id} has no parity_required field, skipped.")
+        _warn(f"index entry for {mod_id} has no usable parity_required "
+              f"({e}), skipped.")
         return None
     return ModSummary(
         id=mod_id,

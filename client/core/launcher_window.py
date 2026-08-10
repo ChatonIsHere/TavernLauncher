@@ -1029,6 +1029,18 @@ class ClientLauncher(tk.Tk):
                                   pinned, declined)
         except mods.ModManagerError as e:
             return "error", str(e)
+
+        # A pin naming something no configured source carries. Reported in the
+        # log rather than by opening the comparison window: it's the player's
+        # own setting, it has nothing to do with this server, and it would
+        # otherwise be a modal on every single join until they fixed it.
+        # Marshalled onto the UI thread because _print writes to a Tk widget
+        # and this method runs on a worker.
+        for mod_id, version in plan.unresolved_pins:
+            self.after(0, lambda i=mod_id, v=version: self._print(
+                f"Your pinned mod {i} ({v}) isn't in any source you've added, "
+                f"so it can't be installed. This doesn't affect joining - "
+                f"remove the pin in Mod Manager to stop this notice.", "warn"))
         return "plan", (plan, server_mods)
 
     def _verify_mod_parity(self, game_dir, server_mods):

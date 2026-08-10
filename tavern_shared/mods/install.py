@@ -102,10 +102,18 @@ def _safe_extract_zip(zip_path, dest_dir):
         written = 0
         for info in infos:
             name = info.filename
-            # Absolute paths and drive letters never belong in a mod archive.
-            if name.startswith(("/", "\\")) or (len(name) >= 2 and name[1] == ":"):
+            # Absolute paths never belong in a mod archive, and a colon
+            # anywhere is refused rather than just a drive letter in position
+            # 1: on NTFS "mod.dll:payload" writes an alternate data stream
+            # hanging off mod.dll instead of a file, which the realpath
+            # containment check below reads as staying inside dest_root.
+            if name.startswith(("/", "\\")):
                 raise ModManagerError(
                     f"Unsafe archive entry {name!r}: absolute path.")
+            if ":" in name:
+                raise ModManagerError(
+                    f"Unsafe archive entry {name!r}: contains a colon (drive "
+                    f"letter or NTFS alternate data stream).")
             # Symlinks (unix mode in the high 16 bits of external_attr) could
             # point outside the folder; refuse them outright.
             mode = (info.external_attr >> 16) & 0xFFFF
@@ -446,8 +454,8 @@ def list_installed_mods(game_dir):
     """Every installed mod's record, in both enabled/disabled states: the per-mod
     folders (enabled Mods/<id>/manifest.json or disabled
     Mods/<id>/manifest.disabled.json). A record counts only if it carries an "id"
-    and a "parity_required", so a library sidecar, a bare marker, or a record
-    written before parity_required existed is ignored. Each returned record gains
+    and a usable "parity_required", so a library sidecar, a bare marker, or a
+    record written before parity_required existed is ignored. Each returned record gains
     an in-memory "enabled" value, not written to disk: True (loaded) or False
     (disabled). Every installed mod's client_side/server_side flags are available
     from these records, so this is the read side for both the UI's status refresh
@@ -455,11 +463,11 @@ def list_installed_mods(game_dir):
     uninstall_mod also uses it to see which libraries the remaining mods still
     pin.
 
-    A pre-parity_required record is skipped rather than assumed required,
-    because assuming is what would let a mod the server actually requires be
-    reported as something a client may decline. Skipping is recoverable: the mod
-    reads as not installed, so the next plan reinstalls it and the new record
-    carries the field."""
+    A record whose parity_required is absent OR unreadable is skipped rather
+    than assumed required, because assuming is what would let a mod the server
+    actually requires be reported as something a client may decline. Skipping is
+    recoverable: the mod reads as not installed, so the next plan reinstalls it
+    and the new record carries a usable field."""
     out = {}     # id -> record
     mods_dir = _mods_base(game_dir)
     if not os.path.isdir(mods_dir):
@@ -477,10 +485,17 @@ def list_installed_mods(game_dir):
             rec = _read_sidecar(os.path.join(full, DISABLED_RECORD_NAME))
             enabled = False
         if rec and rec.get("id"):
-            if "parity_required" not in rec:
-                _warn(f"installed mod {rec['id']} has a record with no "
-                      f"parity_required field, so it predates that field and is "
-                      f"being ignored; reinstall it to fix.")
+            # Asked through parity_required rather than a bare key check, so a
+            # record carrying an unusable value is skipped on the same terms as
+            # one missing the field entirely - both mean nothing here can say
+            # whether a joining client has to match this mod, and both are
+            # fixed the same way. Also keeps handshake_snapshot below, which
+            # re-reads the field on these same records, unable to raise.
+            try:
+                parity_required(rec)
+            except ModManagerError as e:
+                _warn(f"installed mod {rec['id']} has an unusable record ({e}), "
+                      f"so it is being ignored; reinstall it to fix.")
                 continue
             rec["enabled"] = enabled       # in-memory only; not on disk
             out[rec["id"]] = rec

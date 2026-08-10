@@ -2,6 +2,7 @@
 in the host app's own config dict."""
 from tavern_shared.mods.errors import ModManagerError
 from tavern_shared.mods.hostcfg import require_save_cfg, save_cfg
+from tavern_shared.mods.version import _parse_version
 
 
 # Config key for the client's always-on pin list: a flat list of
@@ -67,13 +68,31 @@ def add_pin(cfg, entry):
     """Adds (or updates) a pin. entry is "id" or "id@version" - see
     _parse_pin_entry. Replaces any existing pin for the same mod id rather
     than allowing two pins for one mod to disagree. Saves via the injected
-    save_cfg, same convention as add_repo/remove_repo."""
+    save_cfg, same convention as add_repo/remove_repo.
+
+    The shape is checked here rather than left to resolution, because a pin is
+    unioned into EVERY join: a typo'd id accepted here is one that fails to
+    resolve against every server the user ever visits, showing up as a puzzling
+    row on each of them, long after the moment it could be connected to what
+    was typed. Only the shape - whether a source actually carries this mod is a
+    question for plan_join, which reports it without blocking the join."""
     entry = (entry or "").strip()
     if not entry:
         raise ModManagerError("Enter a mod id, e.g. Author.ModId or Author.ModId@1.2.0.")
-    mod_id, _version = _parse_pin_entry(entry)
-    if not mod_id:
-        raise ModManagerError(f"'{entry}' isn't a valid mod id.")
+    mod_id, version = _parse_pin_entry(entry)
+    # The same '<github-user>.<github-repo>' split every by-id manifest fetch
+    # depends on (see _fetch_manifest_leaf, which can't resolve anything else).
+    if not mod_id or "." not in mod_id:
+        raise ModManagerError(
+            f"'{entry}' isn't a valid mod id. Ids look like Author.ModId, "
+            f"optionally with an exact version: Author.ModId@1.2.0.")
+    if version is not None:
+        try:
+            _parse_version(version)
+        except ModManagerError as e:
+            raise ModManagerError(
+                f"'{entry}' doesn't pin a usable version: {e} Leave the "
+                f"@version off to always track the latest release.")
     pinned = [p for p in list_pinned(cfg) if _parse_pin_entry(p)[0] != mod_id]
     pinned.append(entry)
     cfg[CFG_PINNED_KEY] = pinned
