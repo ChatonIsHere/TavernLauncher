@@ -19,7 +19,7 @@ def _tavern_data_dir():
 def _safe_basename(name):
     """Last-line path-traversal guard, applied to mod.filename and every
     library_dependencies.filename right before it touches disk. Raises if name
-    has any directory part, contains '/' or '\\', or is '.' / '..'.
+    has any directory part, contains '/' or '\\' or ':', or is '.' / '..'.
 
     Re-checked here at write time regardless of any upstream validation: a
     manifest fetched from an unreviewed third-party repo can't be trusted to
@@ -29,6 +29,13 @@ def _safe_basename(name):
         raise ModManagerError(f"Unsafe filename {name!r}.")
     if "/" in name or "\\" in name:
         raise ModManagerError(f"Filename {name!r} must not contain a path separator.")
+    # A colon is a drive separator ("C:evil.dll" writes to another directory
+    # entirely) and, on NTFS, the alternate-data-stream separator: "mod.dll:x"
+    # opens a hidden stream on mod.dll rather than a file of its own.
+    # os.path.basename doesn't treat either as a directory part, so neither
+    # check above catches it. No legal Windows filename contains one.
+    if ":" in name:
+        raise ModManagerError(f"Filename {name!r} must not contain a colon.")
     if os.path.basename(name) != name:
         raise ModManagerError(f"Filename {name!r} must be a bare basename.")
     return name
