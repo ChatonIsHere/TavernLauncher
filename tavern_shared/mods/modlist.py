@@ -83,6 +83,15 @@ def import_modlist(modlist, index, repo_bases, side):
         return _fetch_manifest(repo_bases, mod_id, ver, prefer_repo=source_repo)
 
     dependencies = resolve_dependencies(roots, index, fetch_manifest, side) if roots else []
+
+    # Surfaced at plan time so the confirmation the user is shown is one that
+    # can actually be carried out, rather than one that dies partway through
+    # apply_import. Skipped when something is unresolved: that error names a
+    # mod the user has to go and find a source for, which is the thing to fix
+    # first, and a blocking plan never reaches apply_import anyway.
+    if not unresolved:
+        collect_library_dependencies(roots + dependencies)
+
     return ImportPlan(roots=roots, dependencies=dependencies, unresolved=unresolved,
                       hinted_repos=list(modlist.get("repos", [])))
 
@@ -116,10 +125,17 @@ def apply_import(game_dir, plan, on_progress=None):
             "configured source; fix that before importing it.")
     progress = on_progress or (lambda *_a: None)
     all_mods = plan.roots + plan.dependencies
+    # Collected BEFORE the first install, not between the two loops: this
+    # raises on a library conflict (two mods pinning the same filename at
+    # different hashes), and doing it afterwards meant every mod was already on
+    # disk by the time it did - a half-applied import, mods installed but the
+    # disable pass never reached. Same check-then-act rule install_mod_closure
+    # follows for exactly this reason.
+    libs = collect_library_dependencies(all_mods)
     for mod in all_mods:
         progress(f"Installing {mod.id} {mod.version}")
         install_mod(game_dir, mod, progress)
-    for lib in collect_library_dependencies(all_mods):
+    for lib in libs:
         progress(f"Installing library {lib.filename}")
         install_library_dependency(game_dir, lib, progress)
 

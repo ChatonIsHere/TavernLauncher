@@ -7,7 +7,7 @@ from tavern_shared.mods.cache import (
     _cache_library_dir, _cache_mod_dir, cache_restore_library,
     cache_restore_mod, cache_store_library, cache_store_mod,
 )
-from tavern_shared.mods.errors import ModManagerError
+from tavern_shared.mods.errors import ModManagerError, _warn
 from tavern_shared.mods.install import (
     _read_mod_record, _read_sidecar, collect_library_dependencies, disable_mod,
     enable_mod, install_library_dependency, install_mod, list_installed_mods,
@@ -40,29 +40,44 @@ class JoinPlan:
     entries: list           # list[PlanEntry] - the full computed active set
     to_deactivate: list      # mod ids enabled in Mods/ that aren't in the active set
     libraries: list         # list[LibraryDependency] the active set needs
-    missing: list           # [(mod_id, version)] required by the server, unresolvable from
+    missing: list           # [(mod_id, version)] required by the SERVER, unresolvable from
                              # any repo the client has configured - blocks launching
-    needs_repo: list        # [(mod_id, version, source_repo)] resolvable, but only from a
-                             # repo the client hasn't added - not blocking on
-                             # its own; surfaced so the user can add the repo and re-check
+    needs_repo: list        # [(mod_id, version, source_repo)] required by the server and
+                             # resolvable, but only from a repo the client hasn't added -
+                             # not blocking on its own; surfaced so the user can add the
+                             # repo and re-check
     pin_conflicts: list      # [(mod_id, pinned_version, server_version)] - a pinned mod's
-                             # exact version disagrees with what the server requires; the
+                             # exact version disagrees with what the server runs; the
                              # user decides whether to unpin or accept the server's version
     declined: list = None    # [(mod_id, version)] mods this server runs and doesn't require
                              # that the user has already said no to. Not in the active set
                              # and not touched on disk; carried so the comparison can show
                              # them and let the choice be taken back
+    unresolved_pins: list = None
+                             # [(mod_id, version_or_"latest")] the user's OWN always-on pins
+                             # that resolve from nowhere - a typo'd id, or a version its
+                             # author has since unpublished. Kept strictly apart from
+                             # `missing` because the two have opposite consequences: a
+                             # server's required mod being unavailable makes the join
+                             # impossible, whereas a broken pin is the client's own setting
+                             # and no server ever asked for it. Folding them together (as
+                             # this once did) meant one bad pin blocked EVERY join, on every
+                             # server, reported as though the server had demanded it.
 
     def __post_init__(self):
         if self.declined is None:
             self.declined = []
+        if self.unresolved_pins is None:
+            self.unresolved_pins = []
 
     @property
     def blocking(self):
         """True if this plan can't safely be applied at all - some mod the
         server actually requires isn't resolvable from anywhere the client
         knows of. needs_repo alone never blocks: it's
-        information for the user to act on, not a launch stopper by itself."""
+        information for the user to act on, not a launch stopper by itself.
+        Neither does unresolved_pins: nothing the server asked for is missing,
+        so the join itself is fine."""
         return bool(self.missing)
 
 
@@ -111,23 +126,42 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
     roots = []
     missing = []
     needs_repo = []
+    unresolved_pins = []
     reason = {}         # mod_id -> "required" | "recommended" | "pinned", first tag wins
     exact_pin = {}      # mod_id -> pinned version (None if pinned to latest)
 
     def resolve_root(mod_id, version, tag):
+        """Resolves one root, routing a failure by WHO asked for it. The three
+        tags have genuinely different consequences and must not share a bucket:
+        only something the server requires can make a join impossible."""
         try:
             manifest = _fetch_manifest(repo_bases, mod_id, version)
         except ModManagerError:
-            hint = hinted_repo.get(mod_id)
-            if hint and _norm(hint) not in [_norm(b) for b in repo_bases]:
-                needs_repo.append((mod_id, version, hint))
+            if tag == "pinned":
+                # The user's own always-on pin, which this server never asked
+                # for. Reported so a broken pin is visible and fixable, but
+                # never blocking - refusing to launch would punish the player
+                # on every server for a setting unrelated to any of them.
+                unresolved_pins.append((mod_id, version))
+                _warn(f"pinned mod '{mod_id}' {version} isn't available from any "
+                      f"configured source; it won't be installed, and it doesn't "
+                      f"affect joining.")
             elif tag == "recommended":
                 # Unresolvable and not actually required: silently doing without
                 # it beats blocking or nagging over a mod the server allows the
-                # client not to have.
-                pass
+                # client not to have. Checked BEFORE the repo hint below, so a
+                # recommendation never lands in needs_repo - every consumer of
+                # that list treats its entries as things the server requires,
+                # and a row saying "required" about a mod the server would let
+                # you join without is simply untrue.
+                _warn(f"'{mod_id}' {version} is recommended by this server but "
+                      f"isn't available from any configured source; skipped.")
             else:
-                missing.append((mod_id, version))
+                hint = hinted_repo.get(mod_id)
+                if hint and _norm(hint) not in [_norm(b) for b in repo_bases]:
+                    needs_repo.append((mod_id, version, hint))
+                else:
+                    missing.append((mod_id, version))
             return
         roots.append(manifest)
         reason[mod_id] = tag
@@ -147,15 +181,31 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
         if version is None:
             matches = [s for s in index if s.id == mod_id]
             if not matches:
-                missing.append((mod_id, "latest"))
+                # Same reasoning as resolve_root's "pinned" branch: the user's
+                # own pin naming something no configured source carries, not a
+                # demand from this server.
+                unresolved_pins.append((mod_id, "latest"))
+                _warn(f"pinned mod '{mod_id}' isn't in any configured source's "
+                      f"index; it won't be installed, and it doesn't affect joining.")
                 continue
             version = max((v for s in matches for v in s.versions), key=_parse_version)
         resolve_root(mod_id, version, "pinned")
 
+    # A conflict is precisely "the plan is about to install a version other
+    # than the one you pinned", so it's keyed off what actually resolved as a
+    # root, not off what the server merely lists. That covers recommendations
+    # as well as requirements - a recommendation overrules a pin just the same,
+    # and leaving those out meant the pin was silently overridden with nothing
+    # on screen to say so. It also excludes a mod that was declined or failed
+    # to resolve: neither is being installed, so neither is overruling
+    # anything, and reporting one would open the comparison window on every
+    # join over a change that isn't happening.
+    server_versions = {**recommended, **required}
     pin_conflicts = [
-        (mod_id, pinned_version, required[mod_id])
+        (mod_id, pinned_version, server_versions[mod_id])
         for mod_id, pinned_version in exact_pin.items()
-        if mod_id in required and pinned_version and pinned_version != required[mod_id]
+        if pinned_version and reason.get(mod_id) in ("required", "recommended")
+        and pinned_version != server_versions[mod_id]
     ]
 
     def fetch_manifest(mod_id, version, source_repo):
@@ -192,7 +242,7 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
 
     return JoinPlan(entries=entries, to_deactivate=to_deactivate, libraries=libraries,
                     missing=missing, needs_repo=needs_repo, pin_conflicts=pin_conflicts,
-                    declined=skipped)
+                    declined=skipped, unresolved_pins=unresolved_pins)
 
 
 # Client-vs-server comparison
@@ -281,7 +331,11 @@ class DiffRow:
 
     @property
     def blocking(self):
-        return self.action == ACTION_MISSING
+        """Only a mod the SERVER requires can stop a join. An unavailable mod
+        the user pinned themselves gets the same ACTION_MISSING row - it is
+        genuinely missing and worth seeing - but carries reason "pinned", and
+        nothing about it makes this server unjoinable."""
+        return self.action == ACTION_MISSING and self.reason == "required"
 
 
 def build_mod_diff(game_dir, server_mods, plan):
@@ -318,7 +372,10 @@ def build_mod_diff(game_dir, server_mods, plan):
             action = ACTION_UPDATE if older else ACTION_DOWNGRADE
         pv_sv = conflicts.get(e.mod_id)
         recommended = e.reason == "recommended"
-        if pv_sv:
+        if pv_sv and recommended:
+            note = (f"your pin says {pv_sv[0]}, this server runs {pv_sv[1]}; it "
+                    f"doesn't require it, so skipping keeps your pinned version")
+        elif pv_sv:
             note = f"your pin says {pv_sv[0]}, the server requires {pv_sv[1]}"
         elif recommended:
             note = ("this server recommends it but doesn't require it; skipping "
@@ -386,6 +443,24 @@ def build_mod_diff(game_dir, server_mods, plan):
             client_enabled=False, action=ACTION_NEEDS_REPO, reason="required",
             optional=False, source_repo=repo,
             note=f"add {_repo_shorthand(repo)} as a source, then check again",
+            name=rec.get("name", mod_id)))
+        seen.add(mod_id)
+
+    # server_version stays empty: this server never asked for it, which is
+    # exactly what distinguishes these rows from plan.missing above. reason
+    # "pinned" is what keeps DiffRow.blocking false, so an unfixable pin can
+    # be seen without disabling Apply.
+    for mod_id, version in plan.unresolved_pins:
+        if mod_id in seen:
+            continue
+        rec = installed.get(mod_id, {})
+        rows.append(DiffRow(
+            mod_id=mod_id, server_version="", client_version=rec.get("version", ""),
+            client_enabled=bool(rec.get("enabled")), action=ACTION_MISSING,
+            reason="pinned", optional=False, source_repo="",
+            note=f"you pinned this ({version}), but no source you've added has "
+                 f"it. This server doesn't run it either, so it won't stop you "
+                 f"joining - remove the pin in Mod Manager to clear this.",
             name=rec.get("name", mod_id)))
         seen.add(mod_id)
 

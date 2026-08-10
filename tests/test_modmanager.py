@@ -136,6 +136,15 @@ class VersionAndPath(unittest.TestCase):
                 mm._safe_basename(name)
         self.assertEqual(mm._safe_basename("Fine.dll"), "Fine.dll")
 
+    def test_safe_basename_rejects_colons(self):
+        """A drive-relative name and, on NTFS, an alternate data stream:
+        "mod.dll:payload" writes a hidden stream hanging off mod.dll rather
+        than a file of its own. os.path.basename treats neither as a directory
+        part, so the traversal checks above let both through."""
+        for name in ("C:evil.dll", "mod.dll:payload", "x:", ":stream"):
+            with self.assertRaises(mm.ModManagerError):
+                mm._safe_basename(name)
+
 
 class ManifestParsing(unittest.TestCase):
     def test_unknown_major_is_skipped_not_misparsed(self):
@@ -321,6 +330,27 @@ class PinnedModsConfig(unittest.TestCase):
             mm.add_pin({}, "")
         with self.assertRaises(mm.ModManagerError):
             mm.add_pin({}, "   ")
+
+    def test_add_pin_rejects_an_id_that_could_never_resolve(self):
+        """Caught at the moment it is typed. A pin is unioned into every join,
+        so one accepted here fails against every server the user ever visits,
+        far from anything that would explain why."""
+        for bad in ("QuestGiver", "@1.0.0", "  @1.0.0"):
+            with self.assertRaises(mm.ModManagerError, msg=bad):
+                mm.add_pin({}, bad)
+
+    def test_add_pin_rejects_an_unusable_version(self):
+        for bad in ("Acme.QuestGiver@", "Acme.QuestGiver@1.0",
+                    "Acme.QuestGiver@latest", "Acme.QuestGiver@v1.0.0"):
+            with self.assertRaises(mm.ModManagerError, msg=bad):
+                mm.add_pin({}, bad)
+
+    def test_add_pin_leaves_the_list_untouched_when_it_rejects(self):
+        cfg = {}
+        mm.add_pin(cfg, "Acme.QuestGiver")
+        with self.assertRaises(mm.ModManagerError):
+            mm.add_pin(cfg, "nope")
+        self.assertEqual(mm.list_pinned(cfg), ["Acme.QuestGiver"])
 
     def test_remove_pin_by_bare_id_or_pinned_form(self):
         cfg = {}
@@ -983,6 +1013,12 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
     def _entry(self, plan, mod_id):
         return next(e for e in plan.entries if e.mod_id == mod_id)
 
+    @staticmethod
+    def _srv(mod_id, version, client=True, server=True, required=None):
+        return {"id": mod_id, "version": version,
+                "client_side": client, "server_side": server,
+                "parity_required": True if required is None else required}
+
     def test_required_mod_becomes_active_entry(self):
         self._publish("req.m", "1.0.0")
         server_mods = [{"id": "req.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
@@ -1045,6 +1081,92 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
         plan = mm.plan_join(self.game, [], index, [self.BASE], pinned=["pin.m@1.0.0"])
         entry = self._entry(plan, "pin.m")
         self.assertEqual(entry.version, "1.0.0")
+
+    def test_an_unresolvable_pin_does_not_block_the_join(self):
+        """A pin is the user's own setting, unioned into every join. Routing a
+        broken one into `missing` (as this once did) meant one typo'd or
+        unpublished pin blocked EVERY server, reported as though the server had
+        demanded it."""
+        plan = mm.plan_join(self.game, [], [], [self.BASE], pinned=["ghost.pin"])
+        self.assertFalse(plan.blocking)
+        self.assertEqual(plan.missing, [])
+        self.assertEqual(plan.unresolved_pins, [("ghost.pin", "latest")])
+
+    def test_an_unresolvable_exact_pin_does_not_block_either(self):
+        """The version-pinned path resolves through a different branch than the
+        track-latest one above, so it gets its own case."""
+        plan = mm.plan_join(self.game, [], [summary("gone.pin", ["9.9.9"])],
+                            [self.BASE], pinned=["gone.pin@9.9.9"])
+        self.assertFalse(plan.blocking)
+        self.assertEqual(plan.missing, [])
+        self.assertEqual(plan.unresolved_pins, [("gone.pin", "9.9.9")])
+
+    def test_a_broken_pin_still_lets_a_real_server_mod_resolve(self):
+        """The whole point: the join goes ahead, carrying everything the server
+        actually asked for."""
+        self._publish("req.m", "1.0.0")
+        server_mods = [self._srv("req.m", "1.0.0")]
+        plan = mm.plan_join(self.game, server_mods, [summary("req.m", ["1.0.0"])],
+                            [self.BASE], pinned=["ghost.pin"])
+        self.assertFalse(plan.blocking)
+        self.assertEqual([e.mod_id for e in plan.entries], ["req.m"])
+        self.assertEqual(plan.unresolved_pins, [("ghost.pin", "latest")])
+
+    def test_a_recommended_mod_from_an_unadded_repo_is_not_needs_repo(self):
+        """needs_repo means "add this or you can't join". A recommendation is
+        never that, and every consumer of the list labels its entries required,
+        so putting one there stated the opposite of the truth - and forced the
+        comparison window open on every join over a mod the server would have
+        let the player in without."""
+        server_mods = [{"id": "opt.elsewhere", "version": "1.0.0", "client_side": True,
+                        "server_side": True, "parity_required": False,
+                        "source_repo": self.OTHER}]
+        plan = mm.plan_join(self.game, server_mods, [], [self.BASE])
+        self.assertFalse(plan.blocking)
+        self.assertEqual(plan.needs_repo, [])
+        self.assertEqual(plan.missing, [])
+        self.assertEqual(plan.entries, [])
+
+    def test_a_required_mod_from_an_unadded_repo_is_still_needs_repo(self):
+        """The reordering above must not cost the required case its hint."""
+        server_mods = [{"id": "req.elsewhere", "version": "1.0.0", "client_side": True,
+                        "server_side": True, "parity_required": True,
+                        "source_repo": self.OTHER}]
+        plan = mm.plan_join(self.game, server_mods, [], [self.BASE])
+        self.assertEqual(plan.needs_repo, [("req.elsewhere", "1.0.0", self.OTHER)])
+
+    def test_pin_conflict_is_reported_for_a_recommended_mod_too(self):
+        """The plan installs the server's version either way, so a pin that
+        disagrees is overruled. Checking only `required` meant that happened
+        with nothing on screen to say so."""
+        self._publish("rec.conf", "1.0.0", parity_required=False)
+        self._publish("rec.conf", "2.0.0", parity_required=False)
+        server_mods = [self._srv("rec.conf", "1.0.0", required=False)]
+        index = [summary("rec.conf", ["1.0.0"]), summary("rec.conf", ["2.0.0"])]
+        plan = mm.plan_join(self.game, server_mods, index, [self.BASE],
+                            pinned=["rec.conf@2.0.0"])
+        self.assertEqual(plan.pin_conflicts, [("rec.conf", "2.0.0", "1.0.0")])
+
+    def test_a_declined_recommendation_is_not_a_pin_conflict(self):
+        """Nothing is being installed over the pin, so nothing is overruling
+        it. Reporting one anyway would open the comparison window on every join
+        over a change that isn't happening."""
+        self._publish("rec.conf", "1.0.0", parity_required=False)
+        self._publish("rec.conf", "2.0.0", parity_required=False)
+        server_mods = [self._srv("rec.conf", "1.0.0", required=False)]
+        index = [summary("rec.conf", ["1.0.0"]), summary("rec.conf", ["2.0.0"])]
+        plan = mm.plan_join(self.game, server_mods, index, [self.BASE],
+                            pinned=["rec.conf@2.0.0"], declined=["rec.conf"])
+        self.assertEqual(plan.pin_conflicts, [])
+
+    def test_an_unresolvable_required_mod_is_not_also_a_pin_conflict(self):
+        """It's already reported as blocking; a second complaint about the
+        version it would have been is noise."""
+        server_mods = [self._srv("ghost.m", "1.0.0")]
+        plan = mm.plan_join(self.game, server_mods, [], [self.BASE],
+                            pinned=["ghost.m@2.0.0"])
+        self.assertTrue(plan.blocking)
+        self.assertEqual(plan.pin_conflicts, [])
 
     def test_pin_conflict_when_server_requires_a_different_exact_version(self):
         self._publish("conf.m", "2.0.0")
@@ -1234,6 +1356,34 @@ class ModDiff(_FakeInstallFixture, unittest.TestCase):
         order = [r.action for r in mm.build_mod_diff(self.game, server_mods, plan)]
         self.assertEqual(order[0], mm.ACTION_MISSING)
         self.assertLess(order.index(mm.ACTION_INSTALL), order.index(mm.ACTION_DEACTIVATE))
+
+    def test_an_unresolvable_pin_gets_a_visible_but_non_blocking_row(self):
+        """Shown, because a pin that silently does nothing is worse than one
+        that says why - but not blocking, since no server asked for it. The
+        empty server column is what tells the two apart on screen."""
+        server_mods = [self._srv("d.fine", "1.0.0")]
+        self._publish("d.fine", "1.0.0")
+        plan = mm.plan_join(self.game, server_mods, [summary("d.fine", ["1.0.0"])],
+                            [self.BASE], pinned=["ghost.pin"])
+        rows = {r.mod_id: r for r in mm.build_mod_diff(self.game, server_mods, plan)}
+
+        row = rows["ghost.pin"]
+        self.assertEqual(row.action, mm.ACTION_MISSING)
+        self.assertEqual(row.reason, "pinned")
+        self.assertEqual(row.server_version, "")
+        self.assertFalse(row.blocking)
+        # No toggle: it isn't a choice, there is simply nothing to install.
+        self.assertFalse(row.optional)
+        self.assertIn("pinned", row.note)
+
+    def test_a_server_required_missing_mod_still_blocks(self):
+        """The counterpart to the row above - same action, opposite verdict,
+        told apart only by `reason`."""
+        server_mods = [self._srv("d.ghost", "1.0.0")]
+        plan = mm.plan_join(self.game, server_mods, [], [self.BASE])
+        rows = {r.mod_id: r for r in mm.build_mod_diff(self.game, server_mods, plan)}
+        self.assertEqual(rows["d.ghost"].action, mm.ACTION_MISSING)
+        self.assertTrue(rows["d.ghost"].blocking)
 
     def test_pin_conflict_annotates_the_row_without_duplicating_it(self):
         self._publish("d.pin", "1.0.0")
@@ -1552,46 +1702,66 @@ class Parity(_FakeInstallFixture, unittest.TestCase):
             mm.parity_required({"id": "a.b"})
         self.assertIn("parity_required", str(caught.exception))
 
-    def test_unknown_parity_reads_as_required(self):
-        """Present but malformed still fails closed: an unreviewed source must
-        not be able to downgrade a mod the server needs by inventing a value."""
-        for bad in ("false", "", None, 0, [], "optional"):
-            self.assertTrue(mm.parity_required({"parity_required": bad}), bad)
+    def test_malformed_parity_is_an_error_not_a_coercion(self):
+        """Rejected outright rather than read as required. Failing closed would
+        be safe on its own, but TavernLib's ModParityField.Read throws on the
+        same bytes, so coercing here meant one third-party manifest installed
+        via the launcher and was unresolvable on a headless host. 0 and 1 are
+        included deliberately: isinstance(1, bool) is False in Python, so an int
+        is not quietly accepted as a boolean."""
+        for bad in ("false", "true", "", None, 0, 1, [], {}, "optional"):
+            with self.assertRaises(mm.ModManagerError, msg=repr(bad)):
+                mm.parity_required({"id": "a.b", "parity_required": bad})
 
-    def test_only_a_real_false_relaxes_it(self):
+    def test_only_a_real_bool_is_accepted(self):
         self.assertFalse(mm.parity_required({"parity_required": False}))
+        self.assertTrue(mm.parity_required({"parity_required": True}))
 
     def test_a_manifest_without_the_field_is_rejected(self):
-        """Published manifests must state it outright. The lenient reader above
-        is for places it can legitimately be absent - a record written before
-        the field existed, an older server's handshake entry - not for a
-        manifest being published now."""
+        """Published manifests must state it outright."""
         d = manifest_dict("no.parity", "1.0.0")
         d.pop("parity_required")
         with self.assertRaises(mm.ModManagerError) as caught:
             mm._manifest_from_dict(d, self.BASE)
         self.assertIn("parity_required", str(caught.exception))
 
+    def _break_record(self, mod_id, mutate):
+        record_path = mm._mod_record_path(self.game, mod_id)
+        with io.open(record_path, encoding="utf-8") as f:
+            record = json.load(f)
+        mutate(record)
+        with io.open(record_path, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+
     def test_a_record_without_the_field_is_ignored_not_assumed(self):
         """A record predating the field can't be read, so the mod counts as not
         installed rather than being assumed required. Recoverable: the next plan
         reinstalls it and the new record carries the field."""
         self._install("p.old", "1.0.0")
-        record_path = mm._mod_record_path(self.game, "p.old")
-        with io.open(record_path, encoding="utf-8") as f:
-            record = json.load(f)
-        del record["parity_required"]
-        with io.open(record_path, "w", encoding="utf-8") as f:
-            json.dump(record, f)
+        self._break_record("p.old", lambda r: r.pop("parity_required"))
 
         self.assertEqual(mm.list_installed_mods(self.game), [])
         self.assertEqual(mm.handshake_snapshot(self.game)[2], [])
         # The files are still there, so reinstalling is what fixes it.
         self.assertTrue(os.path.isdir(mm._mod_dir_path(self.game, "p.old")))
 
-    def test_an_index_entry_without_the_field_is_skipped(self):
+    def test_a_record_with_a_malformed_field_is_ignored_too(self):
+        """Same treatment as an absent one, and for the same reason: neither can
+        say whether a joining client has to match. It also keeps
+        handshake_snapshot, which re-reads the field off these same records,
+        unable to raise partway through building a fingerprint."""
+        self._install("p.junk", "1.0.0")
+        self._break_record("p.junk", lambda r: r.update(parity_required="yes"))
+
+        self.assertEqual(mm.list_installed_mods(self.game), [])
+        self.assertEqual(mm.handshake_snapshot(self.game)[2], [])
+
+    def test_an_index_entry_without_a_usable_field_is_skipped(self):
+        """One bad entry is dropped; the rest of the index still loads."""
         d = {"name": "M", "author": "a", "description": "",
              "client_side": True, "server_side": True, "versions": ["1.0.0"]}
+        self.assertIsNone(mm._summary_from_dict(d, "no.parity", self.BASE))
+        d["parity_required"] = "yes"
         self.assertIsNone(mm._summary_from_dict(d, "no.parity", self.BASE))
         d["parity_required"] = True
         self.assertIsNotNone(mm._summary_from_dict(d, "no.parity", self.BASE))
@@ -1872,6 +2042,44 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         with self.assertRaises(mm.ModManagerError):
             mm.import_modlist(modlist, [], [self.BASE], side="client")
 
+    def _publish_conflicting_pair(self):
+        """Two mods pinning the same library filename at different content -
+        the library equivalent of a diamond conflict, which
+        collect_library_dependencies refuses."""
+        def lib(url, sha):
+            return {"name": "Shared", "download_url": url,
+                    "sha256": sha, "filename": "Shared.dll"}
+        self._publish_latest("one.m", "1.0.0",
+                             library_dependencies=[lib("https://x/a.dll", "a" * 64)])
+        self._publish_latest("two.m", "1.0.0",
+                             library_dependencies=[lib("https://x/b.dll", "b" * 64)])
+
+    def test_import_surfaces_a_library_conflict_at_plan_time(self):
+        """Raised while resolving, so the confirmation the user is shown is one
+        that can actually be carried out."""
+        self._publish_conflicting_pair()
+        modlist = {"schema": 1, "repos": [], "mods": ["one.m", "two.m"]}
+        with self.assertRaises(mm.ModManagerError) as caught:
+            mm.import_modlist(modlist, [], [self.BASE], side="client")
+        self.assertIn("Shared.dll", str(caught.exception))
+
+    def test_apply_import_installs_nothing_on_a_library_conflict(self):
+        """apply_import has to be safe on its own, not merely unreachable with a
+        bad plan. Collecting libraries only between the two loops meant every
+        mod was already on disk by the time the conflict raised - installed, but
+        with the disable pass never reached: a half-applied import."""
+        self._publish_conflicting_pair()
+        plan = mm.ImportPlan(
+            roots=[mm._fetch_manifest([self.BASE], "one.m", "1.0.0"),
+                   mm._fetch_manifest([self.BASE], "two.m", "1.0.0")],
+            dependencies=[], unresolved=[], hinted_repos=[])
+
+        with self.assertRaises(mm.ModManagerError):
+            mm.apply_import(self.game, plan, self.progress.append)
+
+        self.assertEqual(mm.list_installed_mods(self.game), [])
+        self.assertFalse(os.path.exists(os.path.join(self.game, "Mods", "one.m")))
+
     def test_apply_import_installs_roots_and_dependencies(self):
         self._publish("dep.k", "1.0.0")
         self._publish_latest("root.m", "1.0.0", dependencies={"dep.k": "1.0.0"})
@@ -2040,6 +2248,22 @@ class ZipBundleInstall(unittest.TestCase):
         with self.assertRaises(mm.ModManagerError):
             self._install("abs.m")
         self.assertFalse(os.path.exists(os.path.join(self.game, "Mods", "abs.m")))
+
+    def test_zip_alternate_data_stream_entry_rejected(self):
+        """"mod.dll:payload" is an NTFS stream hanging off mod.dll, not a file.
+        It contains no separator and no "..", so the traversal guard reads it as
+        an ordinary relative name and realpath resolves it inside the mod
+        folder - the containment check passes and a hidden stream gets written."""
+        self._publish_zip("ads.m", "1.0.0", [("ok.dll:payload", b"hidden")])
+        with self.assertRaises(mm.ModManagerError):
+            self._install("ads.m")
+        self.assertFalse(os.path.exists(os.path.join(self.game, "Mods", "ads.m")))
+
+    def test_zip_drive_relative_entry_rejected(self):
+        self._publish_zip("drv.m", "1.0.0", [("C:evil.dll", b"x")])
+        with self.assertRaises(mm.ModManagerError):
+            self._install("drv.m")
+        self.assertFalse(os.path.exists(os.path.join(self.game, "Mods", "drv.m")))
 
     def test_zip_symlink_entry_rejected(self):
         symlink_attr = 0o120777 << 16
