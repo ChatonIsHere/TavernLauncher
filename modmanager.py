@@ -292,11 +292,10 @@ def parity_required(d):
     piece.
 
     Mandatory, with no default: every shape that carries this field is written
-    by tooling that knows about it, so a missing one means the data predates the
-    field or came from something that doesn't implement it, and guessing on its
-    behalf is exactly what would let a required mod be silently treated as
-    optional. Callers decide what to do with the error - a manifest becomes
-    unresolvable, an index entry or an install record is skipped with a warning.
+    by tooling that knows about it, so a missing one means the data is malformed,
+    and guessing on its behalf is exactly what would let a required mod be
+    silently treated as optional. Raises rather than defaulting; callers decide
+    what to do with the error.
 
     Only a literal False relaxes it, so a present-but-malformed value (a string,
     a None, a 0) still reads as required rather than being trusted."""
@@ -305,7 +304,7 @@ def parity_required(d):
             f"'{d.get('id', '?')}' has no parity_required field. It's required: "
             f"true if a client joining a server running this mod must have this "
             f"exact version, false if the server shouldn't block the join over "
-            f"it. A mod installed before this field existed needs reinstalling.")
+            f"it.")
     return d["parity_required"] is not False
 
 
@@ -1078,6 +1077,48 @@ def _reset_dir(path):
     os.makedirs(path, exist_ok=True)
 
 
+def _displaced_base(game_dir):
+    # Where a Mods/<name>/ folder we didn't install goes when a mod of the same
+    # id needs that path. Dot-prefixed, so nothing that scans Mods/ - MelonLoader,
+    # list_installed_mods, list_untracked_mods - sees what's parked in here.
+    return os.path.join(_mods_base(game_dir), ".displaced")
+
+
+def _clear_install_path(game_dir, mod_id):
+    """Frees Mods/<id>/ for an install. A previous install of ours is deleted -
+    it's being replaced, and it's already cached if anything wanted it kept. A
+    folder we DIDN'T install is moved into Mods/.displaced/ instead, never
+    deleted: those are someone's own files, and silently destroying them is the
+    one outcome nothing here can undo.
+
+    Ours vs. theirs is decided by whether a readable record is present - exactly
+    the test both listers use, so a folder can't count as untracked for listing
+    and as ours for deletion. TavernLib's ClearInstallPath does the same."""
+    mod_dir = _mod_dir_path(game_dir, mod_id)
+    if not os.path.isdir(mod_dir):
+        return None
+
+    if _read_mod_record(game_dir, mod_id) is not None:
+        shutil.rmtree(mod_dir)
+        return None
+
+    base = _displaced_base(game_dir)
+    os.makedirs(base, exist_ok=True)
+    name = _safe_basename(mod_id)
+    dest = os.path.join(base, name)
+    # Counter rather than a timestamp: displacing the same name twice has to keep
+    # both, and a deterministic suffix is one a person can predict.
+    n = 2
+    while os.path.exists(dest):
+        dest = os.path.join(base, f"{name}.{n}")
+        n += 1
+    os.replace(mod_dir, dest)
+    _warn(f"Mods/{name}/ already existed and wasn't installed by this launcher; "
+          f"moved it to Mods/.displaced/{os.path.basename(dest)}/ rather than "
+          f"deleting it. Nothing loads from there.")
+    return dest
+
+
 def install_mod(game_dir, mod, on_progress):
     """Installs one mod into its own folder, Mods/<id>/, and writes the record +
     MelonLoader marker Mods/<id>/manifest.json inside it.
@@ -1106,8 +1147,7 @@ def install_mod(game_dir, mod, on_progress):
         _write_sidecar(os.path.join(staging, RECORD_NAME), _mod_record(mod))
 
         # Swap staging -> Mods/<id>/ atomically, clearing any prior install first.
-        if os.path.isdir(mod_dir):
-            shutil.rmtree(mod_dir)
+        _clear_install_path(game_dir, mod.id)
         os.replace(staging, mod_dir)
     finally:
         if os.path.isdir(staging):
@@ -1338,21 +1378,20 @@ def list_mods(index, side):
 def list_installed_mods(game_dir):
     """Every installed mod's record, in both enabled/disabled states: the per-mod
     folders (enabled Mods/<id>/manifest.json or disabled
-    Mods/<id>/manifest.disabled.json). A record counts only if it carries an "id"
-    and a "parity_required", so a library sidecar, a bare marker, or a record
-    written before parity_required existed is ignored. Each returned record gains
-    an in-memory "enabled" value, not written to disk: True (loaded) or False
-    (disabled). Every installed mod's client_side/server_side flags are available
-    from these records, so this is the read side for both the UI's status refresh
-    and whatever assembles the server's mod list for the pre-join check.
-    uninstall_mod also uses it to see which libraries the remaining mods still
-    pin.
+    Mods/<id>/manifest.disabled.json). A record counts only if it carries an
+    "id", so a library sidecar or a bare marker is ignored. Each returned record
+    gains an in-memory "enabled" value, not written to disk: True (loaded) or
+    False (disabled). Every installed mod's client_side/server_side flags are
+    available from these records, so this is the read side for both the UI's
+    status refresh and whatever assembles the server's mod list for the pre-join
+    check. uninstall_mod also uses it to see which libraries the remaining mods
+    still pin.
 
-    A pre-parity_required record is skipped rather than assumed required,
-    because assuming is what would let a mod the server actually requires be
-    reported as something a client may decline. Skipping is recoverable: the mod
-    reads as not installed, so the next plan reinstalls it and the new record
-    carries the field."""
+    Records are assumed fully valid - every one we write carries every field, so
+    a record missing one is corrupt rather than old. Nothing is filtered or
+    defaulted on that basis here; parity_required() raises when it's read, which
+    surfaces the corruption loudly instead of quietly demoting the mod to
+    untracked."""
     out = {}     # id -> record
     mods_dir = _mods_base(game_dir)
     if not os.path.isdir(mods_dir):
@@ -1370,11 +1409,6 @@ def list_installed_mods(game_dir):
             rec = _read_sidecar(os.path.join(full, DISABLED_RECORD_NAME))
             enabled = False
         if rec and rec.get("id"):
-            if "parity_required" not in rec:
-                _warn(f"installed mod {rec['id']} has a record with no "
-                      f"parity_required field, so it predates that field and is "
-                      f"being ignored; reinstall it to fix.")
-                continue
             rec["enabled"] = enabled       # in-memory only; not on disk
             out[rec["id"]] = rec
     return list(out.values())
@@ -1382,20 +1416,27 @@ def list_installed_mods(game_dir):
 
 def list_untracked_mods(game_dir):
     """Everything sitting in Mods/ that MelonLoader can load but this manager
-    doesn't own (docs/mod-manager-design.md "Untracked mods"): a loose root
-    Mods/*.dll (the classic drag-a-dll-in manual install, invisible to
+    doesn't own (CommunityMods/docs/REPO_STRUCTURE.md "Untracked mods"): a loose
+    root Mods/*.dll (the classic drag-a-dll-in manual install, invisible to
     list_installed_mods since it never looks at files, only subfolders), or a
-    first-level Mods/<name>/ folder that list_installed_mods didn't already
-    claim - a foreign manifest.json, or one predating parity_required (see the
-    skip-with-warning above). Each entry is {"name", "kind" ("file"/"folder"),
-    "enabled"}. Deliberately surfacing-and-toggling only, per the design doc:
-    there's no manifest we trust to reconcile a version/update against, so
-    this never appears anywhere near install/update, only enable/disable."""
+    first-level Mods/<name>/ folder carrying a manifest.json this manager didn't
+    write. Untracked means genuinely foreign, never "ours but stale": every
+    record we write is complete, so nothing of ours can fall in here.
+    Each entry is {"name", "kind" ("file"/"folder"), "enabled"}. Deliberately
+    surfacing-and-toggling only, per that doc: there's no manifest we trust to
+    reconcile a version/update against, so this never appears anywhere near
+    install/update, only enable/disable. TavernLib's ListUntrackedMods is the
+    same listing for headless servers, and the two have to report the same set
+    for the same folder.
+
+    A folder counts on a record file EXISTING, not on it parsing: MelonLoader's
+    folder marker is an existence check with the content unread, so a folder
+    whose manifest.json is unparseable junk still loads and still has to be
+    reported."""
     out = []
     mods_dir = _mods_base(game_dir)
     if not os.path.isdir(mods_dir):
         return out
-    claimed = {_safe_basename(rec["id"]) for rec in list_installed_mods(game_dir)}
     for name in os.listdir(mods_dir):
         full = os.path.join(mods_dir, name)
         if name.startswith((".", "~")):
@@ -1407,16 +1448,20 @@ def list_untracked_mods(game_dir):
             elif lower.endswith(".dll.disabled"):
                 out.append({"name": name[:-len(".disabled")], "kind": "file", "enabled": False})
         elif os.path.isdir(full):
-            if name in claimed:
+            # "Claimed" is tested per folder with the exact predicate
+            # list_installed_mods uses, rather than against the set of record
+            # ids it returned: that lister keys its result by the id INSIDE the
+            # record, so a folder whose name and record id disagree would miss
+            # an id-set lookup and be reported as untracked as well as
+            # installed. Same input, same question, one answer.
+            if _read_mod_record(game_dir, name) is not None:
                 continue
-            rec = _read_sidecar(os.path.join(full, RECORD_NAME))
-            enabled = True
-            if not rec:
-                rec = _read_sidecar(os.path.join(full, DISABLED_RECORD_NAME))
-                enabled = False
-            if rec is None:
-                continue    # empty/junk folder - nothing MelonLoader would load
-            out.append({"name": name, "kind": "folder", "enabled": enabled})
+            if os.path.isfile(os.path.join(full, RECORD_NAME)):
+                out.append({"name": name, "kind": "folder", "enabled": True})
+            elif os.path.isfile(os.path.join(full, DISABLED_RECORD_NAME)):
+                out.append({"name": name, "kind": "folder", "enabled": False})
+            # Neither present: an empty or junk folder MelonLoader wouldn't
+            # load either, so there's nothing to report.
     return out
 
 
@@ -1426,54 +1471,109 @@ def disable_untracked_dll(game_dir, filename):
     disable_mod's manifest rename. A root dll has no manifest to hide behind
     and MelonLoader always loads any Mods/*.dll it finds, so the rename
     itself has to be what stops it loading. Returns True if it was there and
-    enabled, False if not."""
-    src = os.path.join(_mods_base(game_dir), filename)
+    enabled, False if not.
+
+    Refuses rather than clobbering an existing .disabled: that file is someone
+    else's mod, and a rename that quietly destroys it is the one outcome nothing
+    here can undo. TavernLib's DisableUntrackedDll refuses the same way."""
+    src = os.path.join(_mods_base(game_dir), _safe_basename(filename))
+    dest = src + ".disabled"
     if not os.path.isfile(src):
         return False
-    os.replace(src, src + ".disabled")
+    if os.path.exists(dest):
+        raise ModManagerError(f"{os.path.basename(dest)!r} already exists; "
+                              f"remove or rename it first.")
+    os.replace(src, dest)
     return True
 
 
 def enable_untracked_dll(game_dir, filename):
     """Reverses disable_untracked_dll. Returns True if it was disabled and is
-    now enabled, False if there was nothing disabled to enable."""
-    src = os.path.join(_mods_base(game_dir), filename) + ".disabled"
+    now enabled, False if there was nothing disabled to enable. Refuses to
+    overwrite an existing enabled file, same as disable_untracked_dll."""
+    dest = os.path.join(_mods_base(game_dir), _safe_basename(filename))
+    src = dest + ".disabled"
     if not os.path.isfile(src):
         return False
-    os.replace(src, os.path.join(_mods_base(game_dir), filename))
+    if os.path.exists(dest):
+        raise ModManagerError(f"{os.path.basename(dest)!r} already exists; "
+                              f"remove or rename it first.")
+    os.replace(src, dest)
     return True
 
 
+def _untracked_stamp(game_dir, entry):
+    """A cheap "has this changed?" marker for one untracked mod: its mtime as
+    whole Unix seconds, never a content hash. This runs on every ping, and
+    hashing every loose DLL in Mods/ that often would cost far more than an
+    advisory is worth. mtime misses an in-place edit that preserves it, which
+    costs a client a stale advisory line until something else moves -
+    acceptable, where missing a changed REQUIRED mod would not be.
+
+    Deliberately mtime alone, not mtime+size: TavernLib's UntrackedStamp has to
+    produce a byte-identical fingerprint, and a directory has no portable size
+    to agree on. A directory's own mtime moves when entries are added or
+    removed, so a folder mod gaining or losing files still re-fingerprints.
+
+    Anything unreadable stamps "?" rather than raising: a mod vanishing
+    mid-scan must not take the whole handshake down with it."""
+    try:
+        return str(int(os.stat(os.path.join(_mods_base(game_dir),
+                                            entry["name"])).st_mtime))
+    except OSError:
+        return "?"
+
+
 def handshake_snapshot(game_dir):
-    """Fingerprint of every currently-ENABLED installed mod, for the ping/pong
+    """Fingerprint of every currently-ENABLED mod in Mods/, for the ping/pong
     mod-sync check. Disabled mods are excluded: they aren't loaded, so a
-    joining client shouldn't be asked to match them. Returns
-    (mods_hash, mods_count, mods_list):
-    - mods_hash: sha256 of the sorted "id@version" list, joined with newlines.
+    joining client shouldn't be asked about them. Returns
+    (mods_hash, mods_count, mods_list, untracked_list):
+    - mods_hash: sha256 of the fingerprint lines below, joined with newlines.
       A client caches this per server; an unchanged hash means it already has
       the full list and skips the extra round trip.
-    - mods_count: len(mods_list), sent alongside the hash in the pong so a
-      client can sanity-check its cache without decoding anything.
-    - mods_list: every entry as {"id", "version", "client_side", "server_side",
-      "parity_required", "source_repo"}, sorted by id: what the separate,
-      length-prefixed
-      "mods_list" request sends on a cache miss. source_repo is a HINT only:
-      plan_join uses it to tell a client which repo a required
-      mod not resolvable from any of the client's configured repos would come
-      from, so the user can add it explicitly; it's never resolved into a
-      pull on its own, same rule as everywhere else this field appears (the
-      modlist's `repos`, the rejection payload's `missing` entries)."""
+    - mods_count: len(mods_list) - MANAGED mods only, deliberately. It's sent
+      in the pong so a client can sanity-check its cached mods list without
+      decoding anything, and that list is the managed one; folding untracked
+      mods into the number would make it disagree with what it's checking.
+    - mods_list: every managed entry as {"id", "version", "client_side",
+      "server_side", "parity_required", "source_repo"}, sorted by id: what the
+      separate, length-prefixed "mods_list" request sends on a cache miss.
+      source_repo is a HINT only: plan_join uses it to tell a client which repo
+      a required mod not resolvable from any of the client's configured repos
+      would come from, so the user can add it explicitly; it's never resolved
+      into a pull on its own, same rule as everywhere else this field appears
+      (the modlist's `repos`, the rejection payload's `missing` entries).
+    - untracked_list: every enabled untracked mod as {"name", "kind"}, sorted
+      by name. A SEPARATE list, never merged into mods_list, because plan_join
+      consumes that one: an entry with no id or version would either crash it or
+      have to be special-cased in the middle of resolution. Kept apart, it can
+      only reach code that asked for it.
+
+    The advisory is honest about being an advisory. All a server can say about
+    an untracked mod is its name and shape - no id, version, or source - so a
+    client can display it but can never resolve, install, or verify it, and is
+    never blocked over one. It exists so a silent divergence becomes a visible
+    one.
+
+    Untracked entries ARE part of mods_hash, though. A client caches the whole
+    list against this hash, so leaving them out would let an operator drop a new
+    DLL into Mods/ and have every already-connected client keep reporting the
+    old set until something else happened to move the hash."""
     mods = sorted((m for m in list_installed_mods(game_dir) if m.get("enabled")),
                   key=lambda m: m["id"])
+    untracked = sorted((u for u in list_untracked_mods(game_dir) if u["enabled"]),
+                       key=lambda u: u["name"].lower())
     # parity_required is part of the fingerprint, not just the list. A server
     # can flip a mod between required and recommended without its version
     # moving, and a client caches this whole list against this hash - so leaving
     # it out would let a client keep planning against the old answer until it
     # restarted, and skip a mod that had since become mandatory.
-    fingerprint = "\n".join(
-        f"{m['id']}@{m.get('version', '')}@{'req' if parity_required(m) else 'opt'}"
-        for m in mods)
-    mods_hash = hashlib.sha256(fingerprint.encode()).hexdigest()
+    lines = [f"{m['id']}@{m.get('version', '')}@{'req' if parity_required(m) else 'opt'}"
+             for m in mods]
+    lines += [f"untracked:{u['name']}@{_untracked_stamp(game_dir, u)}"
+              for u in untracked]
+    mods_hash = hashlib.sha256("\n".join(lines).encode()).hexdigest()
     mods_list = [
         {"id": m["id"], "version": m.get("version", ""),
          "client_side": bool(m.get("client_side", False)),
@@ -1482,7 +1582,8 @@ def handshake_snapshot(game_dir):
          "source_repo": m.get("source_repo", "")}
         for m in mods
     ]
-    return mods_hash, len(mods_list), mods_list
+    untracked_list = [{"name": u["name"], "kind": u["kind"]} for u in untracked]
+    return mods_hash, len(mods_list), mods_list, untracked_list
 
 
 # Client mod cache
@@ -1566,10 +1667,9 @@ def clear_mod_cache():
     library). Mods/ itself is untouched - this only resets the
     switch-servers-without-redownloading optimization, forcing the next
     install or join to fetch fresh from source instead of reusing a local
-    copy. The fix for a cache entry that's gone stale, e.g. one written
-    before a manifest field parity_required() now requires existed - since
-    the cache is keyed on id+version alone, a version bump upstream is the
-    only thing that normally invalidates an entry."""
+    copy. The fix for a cache entry that's gone stale or corrupt - since the
+    cache is keyed on id+version alone, a version bump upstream is the only
+    thing that normally invalidates an entry."""
     base = _cache_base()
     if os.path.isdir(base):
         shutil.rmtree(base)
@@ -1605,8 +1705,10 @@ def adopt_installed_mods(game_dir):
 def cache_restore_mod(game_dir, mod_id, version):
     """Copies a cached mod version into Mods/<id>/, enabled, replacing
     whatever's currently there (assembled in staging, swapped in atomically -
-    same pattern install_mod uses). Raises if that exact version isn't
-    cached."""
+    same pattern install_mod uses). A folder we didn't install is displaced
+    rather than replaced, same as install_mod: this runs on every join that
+    switches versions, so it's the likeliest of the two to meet one. Raises if
+    that exact version isn't cached."""
     src = _cache_mod_dir(mod_id, version)
     if not os.path.isdir(src):
         raise ModManagerError(f"'{mod_id}' {version} isn't in the local cache.")
@@ -1616,8 +1718,7 @@ def cache_restore_mod(game_dir, mod_id, version):
     if os.path.isdir(staging):
         shutil.rmtree(staging, ignore_errors=True)
     shutil.copytree(src, staging)
-    if os.path.isdir(dest):
-        shutil.rmtree(dest)
+    _clear_install_path(game_dir, mod_id)
     os.makedirs(_mods_base(game_dir), exist_ok=True)
     os.replace(staging, dest)
 
@@ -2228,6 +2329,16 @@ def resolve_missing_mods(missing, index, repo_bases):
 # where the pack's author expects its
 # mods to come from, never resolved into a URL or added as a source by any
 # importer; resolution only ever uses the importer's OWN configured repos.
+#
+# `untracked` records what the exporting machine was running that this manager
+# didn't install. It is a SEPARATE key, never entries in `mods`, and that's
+# load-bearing rather than tidiness: `mods` is parsed as id/id@version by
+# TavernLib's ModsListEntry too, so a "CoolMod.dll" in there would be resolved
+# against the trusted repos on every headless boot - failing every time, or
+# worse, matching some unrelated mod that happens to share the name. Kept out of
+# `mods`, it can only ever be read by something that asked for it. Purely
+# informational: an importer displays it so a pack is reproducible by hand, and
+# never installs, resolves, or disables anything from it.
 
 MODLIST_SCHEMA = 1
 
@@ -2239,16 +2350,28 @@ def export_modlist(game_dir, cfg, pin_versions=False):
     reference); pin_versions=True writes "id@version" for every entry, an
     exact reproducible snapshot of what's installed right now. `repos` is
     list_repos_named(cfg)'s shorthands - this launcher's configured sources,
-    for a human reading the file or a pack curator documenting it."""
+    for a human reading the file or a pack curator documenting it.
+
+    Enabled untracked mods go in `untracked` as {"name", "kind"}, so a modlist
+    describes the machine honestly instead of quietly under-reporting it. Same
+    enabled-only rule as `mods`, for the same reason: the file records the
+    active set, not everything present on disk. All an exporter can honestly say
+    about one is what it's called and what shape it is - there's no id, version,
+    or source to record, which is exactly why no importer can act on it."""
     entries = []
     for m in sorted(list_installed_mods(game_dir), key=lambda r: r["id"]):
         if not m.get("enabled"):
             continue
         entries.append(f"{m['id']}@{m['version']}" if pin_versions else m["id"])
+    untracked = [{"name": u["name"], "kind": u["kind"]}
+                 for u in sorted(list_untracked_mods(game_dir),
+                                 key=lambda u: u["name"].lower())
+                 if u["enabled"]]
     return {
         "schema": MODLIST_SCHEMA,
         "repos": sorted(list_repos_named(cfg).keys()),
         "mods": entries,
+        "untracked": untracked,
     }
 
 
@@ -2258,6 +2381,10 @@ class ImportPlan:
     dependencies: list     # list[ModManifest], resolve_dependencies' closure
     unresolved: list       # [(mod_id, version_or_None)] - not found in any configured repo
     hinted_repos: list     # the modlist's own informational `repos` field, for display
+    untracked: list        # the modlist's `untracked` entries, for display ONLY - never
+                            # installed, resolved, or matched against what's on disk. What
+                            # the exporting machine ran that nothing can reproduce
+                            # automatically, so the user knows what's left to do by hand.
 
     @property
     def blocking(self):
@@ -2274,7 +2401,12 @@ def import_modlist(modlist, index, repo_bases):
     by-id / exact-version resolution install already uses. An entry not
     resolvable from any configured repo is reported unresolved (with the
     modlist's hinted `repos` surfaced alongside it, so the user knows what to
-    go add) rather than silently skipped or auto-added from its shorthand."""
+    go add) rather than silently skipped or auto-added from its shorthand.
+
+    An `untracked` block is carried through to the plan for display and is
+    otherwise inert: nothing in it is resolved, installed, or compared against
+    what's on disk. There's no id or version in one to resolve, and inventing a
+    match by filename is exactly the guess that would install the wrong thing."""
     if modlist.get("schema") != MODLIST_SCHEMA:
         raise ModManagerError(
             f"This modlist is schema {modlist.get('schema')!r}; this launcher "
@@ -2294,8 +2426,10 @@ def import_modlist(modlist, index, repo_bases):
         return _fetch_manifest(repo_bases, mod_id, ver, prefer_repo=source_repo)
 
     dependencies = resolve_dependencies(roots, index, fetch_manifest) if roots else []
+    untracked = [u for u in (modlist.get("untracked") or []) if u.get("name")]
     return ImportPlan(roots=roots, dependencies=dependencies, unresolved=unresolved,
-                      hinted_repos=list(modlist.get("repos", [])))
+                      hinted_repos=list(modlist.get("repos", [])),
+                      untracked=untracked)
 
 
 def modlist_import_disables(game_dir, plan):
@@ -3984,7 +4118,14 @@ class ModManagerWindow(tk.Toplevel):
             modlist = export_modlist(self._game_dir, _load_cfg(), pin_versions=pin)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(modlist, f, indent=2)
-            self._status.set(f"Exported {len(modlist['mods'])} mod(s) to {os.path.basename(path)}.")
+            # Untracked mods are counted separately, not folded into the total:
+            # importing this file won't install them, so a single number would
+            # promise more than the file can deliver.
+            note = (f" {len(modlist['untracked'])} untracked mod(s) are listed for "
+                    f"reference but won't be installed by an import."
+                    if modlist["untracked"] else "")
+            self._status.set(
+                f"Exported {len(modlist['mods'])} mod(s) to {os.path.basename(path)}.{note}")
         except Exception as e:
             messagebox.showerror("Export failed", str(e), parent=self)
 
@@ -4029,11 +4170,21 @@ class ModManagerWindow(tk.Toplevel):
             lines += [f"  • {mid}" + (f" {v}" if v else "") for mid, v in plan.unresolved]
             if plan.hinted_repos:
                 lines.append("This modlist expects sources: " + ", ".join(plan.hinted_repos))
+        # Listed last and phrased as a to-do, not a failure: nothing here blocks
+        # the import, and there's nothing the launcher could do about it anyway.
+        # Saying so beats an import that quietly reproduces less than the file
+        # describes.
+        if plan.untracked:
+            lines.append("Not included - the machine this came from also ran these, "
+                         "installed by hand. Copy them across yourself if you need them:")
+            lines += [f"  • {u['name']}" for u in plan.untracked]
         if plan.blocking:
             messagebox.showerror("Modlist has unresolved mods", "\n".join(lines), parent=self)
             return
         if not all_mods and not to_disable:
             messagebox.showinfo("Nothing to import",
+                "\n".join(lines + ["", "There's nothing new to install or disable."])
+                if plan.untracked else
                 "This modlist has nothing new to install or disable.", parent=self)
             return
         if not messagebox.askyesno("Import modlist",

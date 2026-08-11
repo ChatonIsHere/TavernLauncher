@@ -585,13 +585,141 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
             self.assertTrue(os.path.normcase(d).startswith(game_root))
 
 
+class UntrackedMods(_FakeInstallFixture, unittest.TestCase):
+    """Mods sitting in Mods/ that MelonLoader loads but this manager didn't
+    install. TavernLib's ListUntrackedMods is the same listing for headless
+    servers, so anything asserted here is a claim about both."""
+
+    def _mods(self, *parts):
+        path = os.path.join(self.game, "Mods", *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return path
+
+    def _write(self, relative, content=""):
+        path = self._mods(*relative.split("/"))
+        with io.open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return path
+
+    def _install(self, mod_id, version="1.0.0"):
+        self._publish(mod_id, version)
+        mm.install_mod_closure(self.game, summary(mod_id, [version]),
+                               [summary(mod_id, [version])], [self.BASE],
+                               self.progress.append)
+
+    def _names(self):
+        return {u["name"]: u for u in mm.list_untracked_mods(self.game)}
+
+    # -- loose root dlls ------------------------------------------------------
+
+    def test_a_loose_root_dll_is_reported_enabled(self):
+        self._write("Manual.dll")
+        self.assertEqual(self._names(),
+                         {"Manual.dll": {"name": "Manual.dll", "kind": "file", "enabled": True}})
+
+    def test_a_disabled_dll_reports_under_its_enabled_name(self):
+        """So the same string toggles it either way - the caller never has to
+        know about the suffix."""
+        self._write("Manual.dll.disabled")
+        self.assertEqual(self._names(),
+                         {"Manual.dll": {"name": "Manual.dll", "kind": "file", "enabled": False}})
+
+    def test_toggling_a_loose_dll_round_trips(self):
+        self._write("Manual.dll")
+        self.assertTrue(mm.disable_untracked_dll(self.game, "Manual.dll"))
+        self.assertFalse(self._names()["Manual.dll"]["enabled"])
+        self.assertFalse(os.path.isfile(self._mods("Manual.dll")))
+
+        self.assertTrue(mm.enable_untracked_dll(self.game, "Manual.dll"))
+        self.assertTrue(self._names()["Manual.dll"]["enabled"])
+        self.assertTrue(os.path.isfile(self._mods("Manual.dll")))
+
+    def test_toggling_reports_false_when_there_is_nothing_to_do(self):
+        self.assertFalse(mm.disable_untracked_dll(self.game, "Absent.dll"))
+        self.assertFalse(mm.enable_untracked_dll(self.game, "Absent.dll"))
+
+    def test_toggling_refuses_to_clobber_the_file_on_the_other_side(self):
+        """Both names occupied at once is someone else's doing, and the rename
+        that resolves it would destroy a mod file irrecoverably."""
+        self._write("Manual.dll", "enabled copy")
+        self._write("Manual.dll.disabled", "disabled copy")
+
+        with self.assertRaises(mm.ModManagerError):
+            mm.disable_untracked_dll(self.game, "Manual.dll")
+        with self.assertRaises(mm.ModManagerError):
+            mm.enable_untracked_dll(self.game, "Manual.dll")
+
+        with io.open(self._mods("Manual.dll"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "enabled copy")
+        with io.open(self._mods("Manual.dll.disabled"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "disabled copy")
+
+    def test_a_non_dll_root_file_is_not_a_mod(self):
+        self._write("notes.txt")
+        self._write("config.json", "{}")
+        self.assertEqual(self._names(), {})
+
+    # -- foreign folders ------------------------------------------------------
+
+    def test_a_folder_with_a_foreign_manifest_is_reported(self):
+        self._write("LegacyHUD/manifest.json", json.dumps({"whatever": True}))
+        self.assertEqual(self._names(),
+                         {"LegacyHUD": {"name": "LegacyHUD", "kind": "folder", "enabled": True}})
+
+    def test_a_folder_whose_manifest_is_junk_is_still_reported(self):
+        """MelonLoader's folder marker is an existence check with the content
+        unread, so a folder with an unparseable manifest.json loads exactly like
+        one with a valid manifest. Listing it on whether the JSON parses would
+        hide a mod that is genuinely running."""
+        self._write("BrokenHUD/manifest.json", "not json at all {{{")
+        self.assertEqual(self._names(),
+                         {"BrokenHUD": {"name": "BrokenHUD", "kind": "folder", "enabled": True}})
+
+    def test_a_folder_with_only_a_disabled_marker_is_reported_disabled(self):
+        self._write("LegacyHUD/manifest.disabled.json", json.dumps({"whatever": True}))
+        self.assertEqual(self._names(),
+                         {"LegacyHUD": {"name": "LegacyHUD", "kind": "folder", "enabled": False}})
+
+    def test_an_empty_folder_is_not_reported(self):
+        os.makedirs(self._mods("Empty"), exist_ok=True)
+        self._write("JustFiles/README.txt")
+        self.assertEqual(self._names(), {})
+
+    def test_our_own_staging_and_ignore_folders_are_skipped(self):
+        self._write(".p.p.installing/manifest.json", json.dumps({"id": "p.p"}))
+        self._write("~backup/manifest.json", json.dumps({"id": "p.p"}))
+        self.assertEqual(self._names(), {})
+
+    # -- the boundary with managed mods ---------------------------------------
+
+    def test_a_managed_mod_is_never_reported_as_untracked(self):
+        self._install("p.p")
+        self.assertEqual([m["id"] for m in mm.list_installed_mods(self.game)], ["p.p"])
+        self.assertEqual(self._names(), {})
+
+    def test_a_disabled_managed_mod_is_still_not_untracked(self):
+        """Disabling renames the record to manifest.disabled.json, which is
+        exactly the shape a foreign disabled folder has. The two are told apart
+        by whether the record reads as ours, not by which file is present."""
+        self._install("p.p")
+        self.assertTrue(mm.disable_mod(self.game, "p.p"))
+        self.assertEqual(self._names(), {})
+
+    def test_a_managed_mod_and_a_manual_one_coexist(self):
+        self._install("p.p")
+        self._write("Manual.dll")
+        self._write("LegacyHUD/manifest.json", json.dumps({"whatever": True}))
+        self.assertEqual([m["id"] for m in mm.list_installed_mods(self.game)], ["p.p"])
+        self.assertEqual(set(self._names()), {"Manual.dll", "LegacyHUD"})
+
+
 class HandshakeSnapshot(_FakeInstallFixture, unittest.TestCase):
     """handshake_snapshot(game_dir) - the ping/pong mod-sync fingerprint.
     Reuses the fake download/hash wiring to actually install mods, then
     checks the snapshot it produces."""
 
     def test_empty_mods_dir_gives_empty_snapshot(self):
-        mods_hash, count, entries = mm.handshake_snapshot(self.game)
+        mods_hash, count, entries, _ = mm.handshake_snapshot(self.game)
         self.assertEqual(count, 0)
         self.assertEqual(entries, [])
         self.assertEqual(mods_hash, hashlib.sha256(b"").hexdigest())
@@ -604,7 +732,7 @@ class HandshakeSnapshot(_FakeInstallFixture, unittest.TestCase):
         mm.install_mod_closure(self.game, summary("a.a", ["2.1.0"]), [summary("a.a", ["2.1.0"])],
                                [self.BASE], self.progress.append)
 
-        mods_hash, count, entries = mm.handshake_snapshot(self.game)
+        mods_hash, count, entries, _ = mm.handshake_snapshot(self.game)
         self.assertEqual(count, 2)
         self.assertEqual([e["id"] for e in entries], ["a.a", "z.z"])
         self.assertEqual(entries[0]["version"], "2.1.0")
@@ -622,7 +750,7 @@ class HandshakeSnapshot(_FakeInstallFixture, unittest.TestCase):
         self._publish("p.p", "1.0.0")
         mm.install_mod_closure(self.game, summary("p.p", ["1.0.0"]), [summary("p.p", ["1.0.0"])],
                                [self.BASE], self.progress.append)
-        before, _, entries = mm.handshake_snapshot(self.game)
+        before, _, entries, _ = mm.handshake_snapshot(self.game)
         self.assertIs(entries[0]["parity_required"], True)
 
         # Same mod, same version, parity relaxed - exactly the case a version
@@ -634,7 +762,7 @@ class HandshakeSnapshot(_FakeInstallFixture, unittest.TestCase):
         with io.open(record_path, "w", encoding="utf-8") as f:
             json.dump(record, f)
 
-        after, _, entries = mm.handshake_snapshot(self.game)
+        after, _, entries, _ = mm.handshake_snapshot(self.game)
         self.assertIs(entries[0]["parity_required"], False)
         self.assertNotEqual(before, after)
 
@@ -644,7 +772,7 @@ class HandshakeSnapshot(_FakeInstallFixture, unittest.TestCase):
                                [self.BASE], self.progress.append)
         mm.disable_mod(self.game, "d.d")
 
-        mods_hash, count, entries = mm.handshake_snapshot(self.game)
+        mods_hash, count, entries, _ = mm.handshake_snapshot(self.game)
         self.assertEqual(count, 0)
         self.assertEqual(entries, [])
         self.assertEqual(mods_hash, hashlib.sha256(b"").hexdigest())
@@ -653,14 +781,165 @@ class HandshakeSnapshot(_FakeInstallFixture, unittest.TestCase):
         self._publish("v.v", "1.0.0")
         mm.install_mod_closure(self.game, summary("v.v", ["1.0.0"]), [summary("v.v", ["1.0.0"])],
                                [self.BASE], self.progress.append)
-        before, _, _ = mm.handshake_snapshot(self.game)
+        before, _, _, _ = mm.handshake_snapshot(self.game)
 
         self._publish("v.v", "1.1.0")
         mm.install_mod_closure(self.game, summary("v.v", ["1.1.0"]), [summary("v.v", ["1.1.0"])],
                                [self.BASE], self.progress.append)
-        after, _, _ = mm.handshake_snapshot(self.game)
+        after, _, _, _ = mm.handshake_snapshot(self.game)
 
         self.assertNotEqual(before, after)
+
+    # -- untracked mods in the handshake --------------------------------------
+
+    def _untracked(self, name, content="x"):
+        path = os.path.join(self.game, "Mods", name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with io.open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def test_untracked_mods_are_reported_separately_from_managed_ones(self):
+        """Never merged into the mods list: plan_join resolves every entry it's
+        handed, and one with no id or version has nothing to resolve."""
+        self._publish("m.m", "1.0.0")
+        mm.install_mod_closure(self.game, summary("m.m", ["1.0.0"]),
+                               [summary("m.m", ["1.0.0"])], [self.BASE],
+                               self.progress.append)
+        self._untracked("Manual.dll")
+
+        _, count, entries, untracked = mm.handshake_snapshot(self.game)
+        self.assertEqual([e["id"] for e in entries], ["m.m"])
+        self.assertEqual(untracked, [{"name": "Manual.dll", "kind": "file"}])
+        # Count tracks the managed list a client sanity-checks against, so an
+        # untracked mod must not inflate it.
+        self.assertEqual(count, 1)
+
+    def test_a_disabled_untracked_mod_is_not_reported(self):
+        """Same rule as a disabled managed mod: it isn't loaded, so there's
+        nothing to tell a joining client about."""
+        self._untracked("Manual.dll")
+        mm.disable_untracked_dll(self.game, "Manual.dll")
+        _, _, _, untracked = mm.handshake_snapshot(self.game)
+        self.assertEqual(untracked, [])
+
+    def test_the_hash_covers_untracked_mods(self):
+        """Otherwise an operator drops a DLL into Mods/ and every client keeps
+        reporting the old set until something else happens to move the hash."""
+        before, _, _, _ = mm.handshake_snapshot(self.game)
+        self._untracked("Manual.dll")
+        after, _, _, _ = mm.handshake_snapshot(self.game)
+        self.assertNotEqual(before, after)
+
+    def test_the_hash_moves_when_an_untracked_mod_is_toggled(self):
+        self._untracked("Manual.dll")
+        before, _, _, _ = mm.handshake_snapshot(self.game)
+        mm.disable_untracked_dll(self.game, "Manual.dll")
+        after, _, _, _ = mm.handshake_snapshot(self.game)
+        self.assertNotEqual(before, after)
+
+    def test_the_hash_moves_when_an_untracked_mod_is_rewritten(self):
+        """A replaced DLL under the same name is a different mod, and the stamp
+        (mtime) is what catches it - the name alone wouldn't."""
+        self._untracked("Manual.dll")
+        before, _, _, _ = mm.handshake_snapshot(self.game)
+        path = os.path.join(self.game, "Mods", "Manual.dll")
+        os.utime(path, (1_700_000_000, 1_700_000_000))
+        after, _, _, _ = mm.handshake_snapshot(self.game)
+        self.assertNotEqual(before, after)
+
+    def test_the_hash_is_stable_when_nothing_changed(self):
+        """The whole point of the cache key: an unchanged server must not keep
+        invalidating every client's cached list."""
+        self._untracked("Manual.dll")
+        self.assertEqual(mm.handshake_snapshot(self.game)[0],
+                         mm.handshake_snapshot(self.game)[0])
+
+
+class DisplacedFolders(_FakeInstallFixture, unittest.TestCase):
+    """Installing over a Mods/<id>/ folder we didn't create moves it aside
+    instead of deleting it. TavernLib's ClearInstallPath does the same thing for
+    headless servers, where there's nobody to prompt."""
+
+    def setUp(self):
+        super().setUp()
+        self.data_dir = tempfile.mkdtemp(prefix="tavern_appdata_")
+        self._saved_data_dir = mm._tavern_data_dir
+        mm._tavern_data_dir = lambda: self.data_dir
+        self.addCleanup(lambda: setattr(mm, "_tavern_data_dir", self._saved_data_dir))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data_dir, ignore_errors=True))
+
+    def _install(self, mod_id, version="1.0.0"):
+        self._publish(mod_id, version)
+        mm.install_mod_closure(self.game, summary(mod_id, [version]),
+                               [summary(mod_id, [version])], [self.BASE],
+                               self.progress.append)
+
+    def _foreign(self, name, marker="theirs"):
+        """A folder at Mods/<name>/ that isn't ours: a manifest with no id, so it
+        reads as untracked exactly like a hand-installed mod would."""
+        folder = os.path.join(self.game, "Mods", name)
+        os.makedirs(folder, exist_ok=True)
+        with io.open(os.path.join(folder, "manifest.json"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"theirs": True}))
+        with io.open(os.path.join(folder, "payload.txt"), "w", encoding="utf-8") as f:
+            f.write(marker)
+        return folder
+
+    def _displaced(self, *parts):
+        return os.path.join(self.game, "Mods", ".displaced", *parts)
+
+    def test_installing_over_a_foreign_folder_moves_it_aside(self):
+        self._foreign("p.p", marker="irreplaceable")
+        self._install("p.p")
+
+        # The install landed...
+        self.assertEqual([m["id"] for m in mm.list_installed_mods(self.game)], ["p.p"])
+        # ...and their files survived intact rather than being deleted.
+        with io.open(self._displaced("p.p", "payload.txt"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "irreplaceable")
+
+    def test_reinstalling_over_our_own_folder_just_replaces_it(self):
+        """Nothing is displaced when the folder is ours - it's being replaced,
+        and it's cached already if anything wanted it kept. Otherwise every
+        routine update would litter .displaced/."""
+        self._install("p.p", "1.0.0")
+        self._install("p.p", "1.1.0")
+        self.assertFalse(os.path.exists(self._displaced()))
+
+    def test_displacing_the_same_name_twice_keeps_both(self):
+        self._foreign("p.p", marker="first")
+        self._install("p.p")
+        self._foreign("p.p", marker="second")
+        self._install("p.p")
+
+        with io.open(self._displaced("p.p", "payload.txt"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "first")
+        with io.open(self._displaced("p.p.2", "payload.txt"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "second")
+
+    def test_a_displaced_folder_is_invisible_to_both_listers(self):
+        """Dot-prefixed, so it's skipped as an install staging dir would be. If
+        it showed up as untracked, the operator would be told a mod is loading
+        when nothing loads from .displaced/ at all."""
+        self._foreign("p.p")
+        self._install("p.p")
+
+        self.assertEqual(mm.list_untracked_mods(self.game), [])
+        self.assertEqual([m["id"] for m in mm.list_installed_mods(self.game)], ["p.p"])
+
+    def test_restoring_from_cache_displaces_too(self):
+        """The likelier of the two paths to meet a foreign folder: it runs on
+        every join that switches a mod's version, not just on a fresh install."""
+        self._install("p.p")
+        mm.cache_store_mod(self.game, "p.p")
+        __import__("shutil").rmtree(os.path.join(self.game, "Mods", "p.p"))
+        self._foreign("p.p", marker="theirs, mid-join")
+
+        mm.cache_restore_mod(self.game, "p.p", "1.0.0")
+
+        self.assertEqual([m["id"] for m in mm.list_installed_mods(self.game)], ["p.p"])
+        with io.open(self._displaced("p.p", "payload.txt"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "theirs, mid-join")
 
 
 class ClientModCache(_FakeInstallFixture, unittest.TestCase):
@@ -1319,10 +1598,11 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
 class Parity(_FakeInstallFixture, unittest.TestCase):
     """parity: whether a server running a mod obliges the client to match it.
 
-    "required" is the old behaviour and the default, so anything published
-    before the field existed keeps the guarantee it shipped with. "optional"
-    means the server won't refuse a join over it, so the client is offered it
-    and may decline."""
+    "required" is the stricter answer, so it's what a malformed value falls back
+    to - an unreviewed source must not be able to downgrade a mod a server needs
+    by inventing one. "optional" means the server won't refuse a join over it,
+    so the client is offered the mod and may decline. Absent entirely is neither:
+    that's malformed data, and every reader rejects it."""
 
     def setUp(self):
         super().setUp()
@@ -1362,20 +1642,20 @@ class Parity(_FakeInstallFixture, unittest.TestCase):
         self.assertFalse(mm.parity_required({"parity_required": False}))
 
     def test_a_manifest_without_the_field_is_rejected(self):
-        """Published manifests must state it outright. The lenient reader above
-        is for places it can legitimately be absent - a record written before
-        the field existed, an older server's handshake entry - not for a
-        manifest being published now."""
+        """Every published manifest states it outright, so one that doesn't is
+        malformed rather than merely old."""
         d = manifest_dict("no.parity", "1.0.0")
         d.pop("parity_required")
         with self.assertRaises(mm.ModManagerError) as caught:
             mm._manifest_from_dict(d, self.BASE)
         self.assertIn("parity_required", str(caught.exception))
 
-    def test_a_record_without_the_field_is_ignored_not_assumed(self):
-        """A record predating the field can't be read, so the mod counts as not
-        installed rather than being assumed required. Recoverable: the next plan
-        reinstalls it and the new record carries the field."""
+    def test_a_record_without_the_field_fails_loudly_not_silently(self):
+        """Every record we write carries the field, so one that doesn't is
+        corrupt. Nothing filters it out on that basis: it stays in the installed
+        list, and the read raises where it's actually needed. The alternative -
+        quietly dropping it - would report a mod the server really is running as
+        not installed at all, and demote it to untracked in the launcher."""
         self._install("p.old", "1.0.0")
         record_path = mm._mod_record_path(self.game, "p.old")
         with io.open(record_path, encoding="utf-8") as f:
@@ -1384,10 +1664,12 @@ class Parity(_FakeInstallFixture, unittest.TestCase):
         with io.open(record_path, "w", encoding="utf-8") as f:
             json.dump(record, f)
 
-        self.assertEqual(mm.list_installed_mods(self.game), [])
-        self.assertEqual(mm.handshake_snapshot(self.game)[2], [])
-        # The files are still there, so reinstalling is what fixes it.
-        self.assertTrue(os.path.isdir(mm._mod_dir_path(self.game, "p.old")))
+        self.assertEqual([m["id"] for m in mm.list_installed_mods(self.game)], ["p.old"])
+        with self.assertRaises(mm.ModManagerError) as caught:
+            mm.handshake_snapshot(self.game)
+        self.assertIn("parity_required", str(caught.exception))
+        # Still a managed mod, not something the untracked lister picks up.
+        self.assertEqual(mm.list_untracked_mods(self.game), [])
 
     def test_an_index_entry_without_the_field_is_skipped(self):
         d = {"name": "M", "author": "a", "description": "",
@@ -1414,7 +1696,7 @@ class Parity(_FakeInstallFixture, unittest.TestCase):
         rec = mm._read_mod_record(self.game, "p.opt")
         self.assertIs(rec["parity_required"], False)
 
-        _, _, mods = mm.handshake_snapshot(self.game)
+        _, _, mods, _ = mm.handshake_snapshot(self.game)
         by_id = {m["id"]: m for m in mods}
         self.assertIs(by_id["p.opt"]["parity_required"], False)
         self.assertIs(by_id["p.req"]["parity_required"], True)
@@ -1643,6 +1925,95 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         plan = mm.import_modlist(modlist, [], [self.BASE])
         self.assertFalse(plan.blocking)
         self.assertEqual([(m.id, m.version) for m in plan.roots], [("lat.m", "2.0.0")])
+
+    # -- untracked mods in a modlist -----------------------------------------
+
+    def _untracked(self, name, content=""):
+        path = os.path.join(self.game, "Mods", name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with io.open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def test_export_records_untracked_mods_separately_from_mods(self):
+        """Never inside `mods`: TavernLib parses every entry there as an id and
+        would resolve "Manual.dll" against the trusted repos on each boot."""
+        self._install("en.m", "1.0.0")
+        self._untracked("Manual.dll")
+
+        out = mm.export_modlist(self.game, {})
+        self.assertEqual(out["mods"], ["en.m"])
+        self.assertEqual(out["untracked"], [{"name": "Manual.dll", "kind": "file"}])
+
+    def test_export_skips_disabled_untracked_mods(self):
+        """Same enabled-only rule as `mods` - the file records the active set,
+        not everything sitting on disk."""
+        self._untracked("On.dll")
+        self._untracked("Off.dll")
+        mm.disable_untracked_dll(self.game, "Off.dll")
+
+        out = mm.export_modlist(self.game, {})
+        self.assertEqual([u["name"] for u in out["untracked"]], ["On.dll"])
+
+    def test_export_has_the_key_even_with_nothing_untracked(self):
+        """Always present, so a reader never has to tell "none" from "an
+        exporter too old to say"."""
+        self._install("en.m", "1.0.0")
+        self.assertEqual(mm.export_modlist(self.game, {})["untracked"], [])
+
+    def test_import_carries_untracked_through_without_resolving_it(self):
+        self._publish_latest("lat.m", "2.0.0")
+        modlist = {"schema": 1, "repos": [], "mods": ["lat.m"],
+                   "untracked": [{"name": "Manual.dll", "kind": "file"}]}
+        plan = mm.import_modlist(modlist, [], [self.BASE])
+
+        self.assertFalse(plan.blocking)
+        self.assertEqual(plan.untracked, [{"name": "Manual.dll", "kind": "file"}])
+        # Display only: it never becomes something to install, and never counts
+        # as unresolved either - there was nothing to resolve in the first place.
+        self.assertEqual([m.id for m in plan.roots], ["lat.m"])
+        self.assertEqual(plan.unresolved, [])
+
+    def test_an_untracked_block_never_blocks_an_import(self):
+        modlist = {"schema": 1, "repos": [], "mods": [],
+                   "untracked": [{"name": "Manual.dll", "kind": "file"}]}
+        plan = mm.import_modlist(modlist, [], [self.BASE])
+        self.assertFalse(plan.blocking)
+
+    def test_a_modlist_with_no_untracked_key_still_imports(self):
+        """Every modlist written before the key existed, and every hand-written
+        one, has to keep working."""
+        self._publish_latest("lat.m", "2.0.0")
+        plan = mm.import_modlist({"schema": 1, "repos": [], "mods": ["lat.m"]},
+                                 [], [self.BASE])
+        self.assertEqual(plan.untracked, [])
+
+    def test_importing_never_disables_the_importers_own_untracked_mods(self):
+        """The invariant: nothing automatic touches an untracked mod. A modlist
+        that doesn't mention your hand-installed mod is not a request to remove
+        it - only `mods` describes an active set anyone can act on."""
+        self._publish_latest("lat.m", "2.0.0")
+        self._install("mine.m", "1.0.0")
+        self._untracked("Manual.dll")
+
+        plan = mm.import_modlist({"schema": 1, "repos": [], "mods": ["lat.m"]},
+                                 [], [self.BASE])
+        # The managed mod is on the disable list; the untracked one isn't there
+        # to be listed at all.
+        self.assertEqual(mm.modlist_import_disables(self.game, plan), ["mine.m"])
+
+        mm.apply_import(self.game, plan, self.progress.append)
+        self.assertEqual([u["name"] for u in mm.list_untracked_mods(self.game)],
+                         ["Manual.dll"])
+        self.assertTrue(mm.list_untracked_mods(self.game)[0]["enabled"])
+
+    def test_export_import_round_trips_the_untracked_block(self):
+        self._publish_latest("lat.m", "2.0.0")
+        self._install("lat.m", "2.0.0")
+        self._untracked("Manual.dll")
+
+        exported = mm.export_modlist(self.game, {})
+        plan = mm.import_modlist(exported, [], [self.BASE])
+        self.assertEqual([u["name"] for u in plan.untracked], ["Manual.dll"])
 
     def test_import_resolves_pinned_exact_version(self):
         self._publish("pin.m", "1.0.0")
