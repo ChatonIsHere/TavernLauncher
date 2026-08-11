@@ -548,8 +548,15 @@ def _recv_framed(s, timeout):
 
 
 def fetch_server_mods(host, timeout=10):
-    """Fetches the server's full installed-mods list: every currently-enabled
-    mod as {"id","version","client_side","server_side"}.
+    """Fetches the server's full mod list. Returns (mods, untracked):
+    - mods: every currently-enabled MANAGED mod as
+      {"id","version","client_side","server_side","parity_required",...}. This
+      is what plan_join resolves against.
+    - untracked: every enabled mod the server runs that its own manager didn't
+      install, as {"name","kind"}. Advisory only - there's no id or version to
+      resolve, so it's shown and never acted on, and a server that doesn't send
+      the key (an older TavernLib/launcher) simply yields [].
+
     Only called on a mods_hash cache miss (or right before a join); the
     ordinary ping/pong stays a single small recv, this is the one request that
     needs proper length-prefixed framing since a large mod list can genuinely
@@ -569,7 +576,8 @@ def fetch_server_mods(host, timeout=10):
     resp = json.loads(body.decode())
     if resp.get("status") != "ok":
         raise Exception(resp.get("message", "Server rejected the mods list request."))
-    return resp.get("mods", [])
+    untracked = [u for u in (resp.get("untracked") or []) if u.get("name")]
+    return resp.get("mods", []), untracked
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  JWT
@@ -4503,10 +4511,15 @@ class ClientLauncher(tk.Tk):
         self._setup_anim_job   = None
         self._setup_anim_phase = 0
         self._exe_check_job   = None
-        # Join-time mod reconciliation cache: host -> (mods_hash, mods_list),
-        # so rejoining a server whose mods haven't changed since last time
-        # skips the extra "mods_list" round trip entirely (see _get_server_mods).
+        # Join-time mod reconciliation cache: host -> (mods_hash, mods_list,
+        # untracked), so rejoining a server whose mods haven't changed since
+        # last time skips the extra "mods_list" round trip entirely (see
+        # _get_server_mods). The server's untracked mods are cached alongside
+        # rather than refetched, so a cache hit still has something to report.
         self._mods_list_cache = {}
+        # What the last _get_server_mods call learned the server runs but
+        # couldn't identify. Advisory only; see _report_server_untracked.
+        self._server_untracked = []
         self._mod_manager_win = None
         self._build_ui()
         self._load()
@@ -5188,7 +5201,13 @@ class ClientLauncher(tk.Tk):
         rejoining a server whose mods haven't changed since the last check
         skips the extra "mods_list" round trip entirely. Returns [] if the
         server doesn't send mods_hash at all (an older TavernLib/launcher) -
-        reconciliation is then a no-op, same as a server with no mods."""
+        reconciliation is then a no-op, same as a server with no mods.
+
+        Any untracked mods the server reported are stashed in
+        self._server_untracked for the caller to surface (see
+        _report_server_untracked); they're never returned here, because what
+        comes back from this feeds plan_join, which resolves every entry it's
+        given."""
         try:
             resp, _ms = ping_server(host)
         except Exception:
@@ -5198,14 +5217,34 @@ class ClientLauncher(tk.Tk):
             return []
         cached = self._mods_list_cache.get(host)
         if cached and cached[0] == mods_hash:
+            self._server_untracked = cached[2]
             return cached[1]
         try:
-            mods = fetch_server_mods(host)
+            mods, untracked = fetch_server_mods(host)
         except Exception as e:
             self._print(f"Could not fetch the server's mod list: {e}", "warn")
             return []
-        self._mods_list_cache[host] = (mods_hash, mods)
+        self._mods_list_cache[host] = (mods_hash, mods, untracked)
+        self._server_untracked = untracked
         return mods
+
+    def _report_server_untracked(self):
+        """Tells the user about mods the server runs that it couldn't identify.
+
+        Deliberately not phrased as a problem and never able to stop anything:
+        the server can't tell us an id, a version, or where to get one, so
+        there's nothing to install and nothing to match. What it replaces is
+        worse - the mod affecting the session with no sign it exists. Printed
+        once per check/join, after the real mod comparison, so it can't be
+        mistaken for part of it."""
+        if not self._server_untracked:
+            return
+        for entry in self._server_untracked:
+            self._print(f"  • {entry['name']}", "warn")
+        self._print("This server runs the mods above, which it didn't install "
+                    "through a mod manager. Your launcher can't identify or "
+                    "install them, and the server won't stop you joining "
+                    "without them.", "warn")
 
     # Sync Mods (the button beside the Check Server result)
 
@@ -5250,6 +5289,7 @@ class ClientLauncher(tk.Tk):
         owner; an all-matching one is the answer to the question they asked by
         pressing the button."""
         self._set_sync_busy(False)
+        self._report_server_untracked()
         if kind == "skip":
             self._print(payload, "warn")
             return
@@ -5347,6 +5387,10 @@ class ClientLauncher(tk.Tk):
         prompts for nothing, so each caller decides for itself what a given
         outcome means. Safe to call off the UI thread.
 
+        Clears self._server_untracked on the way in: several of the early exits
+        below return before the server is ever contacted, and a stale advisory
+        from the last server checked would then be reported against this one.
+
         Returns (kind, payload):
           ("skip",  reason)               nothing to sync against, which is a
                                           normal outcome: MelonLoader/TavernLib
@@ -5355,6 +5399,7 @@ class ClientLauncher(tk.Tk):
           ("error", message)              the server's mods couldn't be resolved
           ("plan",  (plan, server_mods))  a usable plan, possibly blocking
         """
+        self._server_untracked = []
         if not (_melonloader_installed(game_dir) and _tavernlib_installed(game_dir)):
             return "skip", ("Community mods need MelonLoader and TavernLib "
                             "installed before they can load. Install them from "
@@ -5414,7 +5459,7 @@ class ClientLauncher(tk.Tk):
         required = {m["id"]: m["version"] for m in server_mods
                     if m.get("client_side")
                     and _modmanager.parity_required(m)}
-        _, _, installed_mods = _modmanager.handshake_snapshot(game_dir)
+        _, _, installed_mods, _ = _modmanager.handshake_snapshot(game_dir)
         have = {m["id"]: m["version"] for m in installed_mods}
         return [(mid, ver, have.get(mid)) for mid, ver in required.items()
                 if have.get(mid) != ver]
@@ -5466,6 +5511,10 @@ class ClientLauncher(tk.Tk):
             on_ready()
 
         def planned(kind, payload):
+            # Before any branch below, including the ones that go straight on to
+            # launch: this is advisory, so it must never depend on the plan
+            # having turned out a particular way.
+            self._report_server_untracked()
             if kind == "skip":
                 self._set_sync_busy(False)
                 on_ready()                    # fail open, never block a join
@@ -5627,7 +5676,11 @@ class ClientLauncher(tk.Tk):
         # see build_tokens' mods_claim.
         mods_claim = ""
         try:
-            _, _, mods_list = _modmanager.handshake_snapshot(os.path.dirname(exe))
+            _, _, mods_list, _ = _modmanager.handshake_snapshot(os.path.dirname(exe))
+            # Managed mods only. The claim exists for the server's exact-version
+            # parity check, and an untracked mod has no id or version to check -
+            # ModParity.ValidateClient only ever looks up ids the SERVER
+            # requires, so naming ours would be noise it would discard anyway.
             mods_claim = json.dumps({m["id"]: m["version"] for m in mods_list})
         except Exception as e:
             self._print(f"Could not read installed mods for the join handshake: {e}", "warn")
