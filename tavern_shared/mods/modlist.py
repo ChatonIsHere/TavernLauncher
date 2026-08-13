@@ -1,10 +1,20 @@
-"""Import/export of a portable modlist document."""
+"""Import/export of a portable modlist document.
+
+`untracked` records what the exporting machine was running that this manager
+didn't install. It is a SEPARATE key, never entries in `mods`, and that's
+load-bearing rather than tidiness: `mods` is parsed as id/id@version by
+TavernLib's ModsListEntry too, so a "CoolMod.dll" in there would be resolved
+against the trusted repos on every headless boot - failing every time, or
+worse, matching some unrelated mod that happens to share the name. Kept out of
+`mods`, it can only ever be read by something that asked for it. Purely
+informational: an importer displays it so a pack is reproducible by hand, and
+never installs, resolves, or disables anything from it."""
 from dataclasses import dataclass
 
 from tavern_shared.mods.errors import ModManagerError
 from tavern_shared.mods.install import (
     collect_library_dependencies, disable_mod, install_library_dependency,
-    install_mod, list_installed_mods,
+    install_mod, list_installed_mods, list_untracked_mods,
 )
 from tavern_shared.mods.pins import _parse_pin_entry
 from tavern_shared.mods.repos import list_repos_named
@@ -23,16 +33,28 @@ def export_modlist(game_dir, cfg, pin_versions=False):
     reference); pin_versions=True writes "id@version" for every entry, an
     exact reproducible snapshot of what's installed right now. `repos` is
     list_repos_named(cfg)'s shorthands - this launcher's configured sources,
-    for a human reading the file or a pack curator documenting it."""
+    for a human reading the file or a pack curator documenting it.
+
+    Enabled untracked mods go in `untracked` as {"name", "kind"}, so a modlist
+    describes the machine honestly instead of quietly under-reporting it. Same
+    enabled-only rule as `mods`, for the same reason: the file records the
+    active set, not everything present on disk. All an exporter can honestly say
+    about one is what it's called and what shape it is - there's no id, version,
+    or source to record, which is exactly why no importer can act on it."""
     entries = []
     for m in sorted(list_installed_mods(game_dir), key=lambda r: r["id"]):
         if not m.get("enabled"):
             continue
         entries.append(f"{m['id']}@{m['version']}" if pin_versions else m["id"])
+    untracked = [{"name": u["name"], "kind": u["kind"]}
+                 for u in sorted(list_untracked_mods(game_dir),
+                                 key=lambda u: u["name"].lower())
+                 if u["enabled"]]
     return {
         "schema": MODLIST_SCHEMA,
         "repos": sorted(list_repos_named(cfg).keys()),
         "mods": entries,
+        "untracked": untracked,
     }
 
 
@@ -42,6 +64,10 @@ class ImportPlan:
     dependencies: list     # list[ModManifest], resolve_dependencies' closure
     unresolved: list       # [(mod_id, version_or_None)] - not found in any configured repo
     hinted_repos: list     # the modlist's own informational `repos` field, for display
+    untracked: list        # the modlist's `untracked` entries, for display ONLY - never
+                           # installed, resolved, or matched against what's on disk. What
+                           # the exporting machine ran that nothing can reproduce
+                           # automatically, so the user knows what's left to do by hand.
 
     @property
     def blocking(self):
@@ -63,7 +89,12 @@ def import_modlist(modlist, index, repo_bases, side):
     `side` is the importing launcher's own, since the manager window this runs
     from is shared by both. A modlist exported on a client can name mods whose
     dependencies are client-only; importing it on a server resolves the same
-    entries but leaves those dependencies out."""
+    entries but leaves those dependencies out.
+
+    An `untracked` block is carried through to the plan for display and is
+    otherwise inert: nothing in it is resolved, installed, or compared against
+    what's on disk. There's no id or version in one to resolve, and inventing a
+    match by filename is exactly the guess that would install the wrong thing."""
     if modlist.get("schema") != MODLIST_SCHEMA:
         raise ModManagerError(
             f"This modlist is schema {modlist.get('schema')!r}; this launcher "
@@ -92,8 +123,10 @@ def import_modlist(modlist, index, repo_bases, side):
     if not unresolved:
         collect_library_dependencies(roots + dependencies)
 
+    untracked = [u for u in (modlist.get("untracked") or []) if u.get("name")]
     return ImportPlan(roots=roots, dependencies=dependencies, unresolved=unresolved,
-                      hinted_repos=list(modlist.get("repos", [])))
+                      hinted_repos=list(modlist.get("repos", [])),
+                      untracked=untracked)
 
 
 def modlist_import_disables(game_dir, plan):

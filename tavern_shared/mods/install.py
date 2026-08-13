@@ -13,7 +13,7 @@ from tavern_shared.paths import _sha256_file
 
 from tavern_shared.mods.errors import ModManagerError, _warn
 from tavern_shared.mods.layout import (
-    DISABLED_RECORD_NAME, RECORD_NAME, _disabled_record_path,
+    DISABLED_RECORD_NAME, RECORD_NAME, _disabled_record_path, _displaced_base,
     _library_sidecar_path, _mod_dir_path, _mod_record_path, _mods_base,
     _safe_basename, _staging_path, _userlibs_dir,
 )
@@ -192,6 +192,42 @@ def _reset_dir(path):
     os.makedirs(path, exist_ok=True)
 
 
+def _clear_install_path(game_dir, mod_id):
+    """Frees Mods/<id>/ for an install. A previous install of ours is deleted -
+    it's being replaced, and it's already cached if anything wanted it kept. A
+    folder we DIDN'T install is moved into Mods/.displaced/ instead, never
+    deleted: those are someone's own files, and silently destroying them is the
+    one outcome nothing here can undo.
+
+    Ours vs. theirs is decided by whether a usable record is present - exactly
+    the test list_installed_mods and list_untracked_mods apply, so a folder
+    can't count as untracked for listing and as ours for deletion. TavernLib's
+    ClearInstallPath does the same."""
+    mod_dir = _mod_dir_path(game_dir, mod_id)
+    if not os.path.isdir(mod_dir):
+        return None
+
+    if _owned_mod_record(game_dir, mod_id) is not None:
+        shutil.rmtree(mod_dir)
+        return None
+
+    base = _displaced_base(game_dir)
+    os.makedirs(base, exist_ok=True)
+    name = _safe_basename(mod_id)
+    dest = os.path.join(base, name)
+    # Counter rather than a timestamp: displacing the same name twice has to keep
+    # both, and a deterministic suffix is one a person can predict.
+    n = 2
+    while os.path.exists(dest):
+        dest = os.path.join(base, f"{name}.{n}")
+        n += 1
+    os.replace(mod_dir, dest)
+    _warn(f"Mods/{name}/ already existed and wasn't installed by this launcher; "
+          f"moved it to Mods/.displaced/{os.path.basename(dest)}/ rather than "
+          f"deleting it. Nothing loads from there.")
+    return dest
+
+
 def install_mod(game_dir, mod, on_progress):
     """Installs one mod into its own folder, Mods/<id>/, and writes the record +
     MelonLoader marker Mods/<id>/manifest.json inside it.
@@ -220,8 +256,7 @@ def install_mod(game_dir, mod, on_progress):
         _write_sidecar(os.path.join(staging, RECORD_NAME), _mod_record(mod))
 
         # Swap staging -> Mods/<id>/ atomically, clearing any prior install first.
-        if os.path.isdir(mod_dir):
-            shutil.rmtree(mod_dir)
+        _clear_install_path(game_dir, mod.id)
         os.replace(staging, mod_dir)
     finally:
         if os.path.isdir(staging):
@@ -382,6 +417,26 @@ def _read_mod_record(game_dir, mod_id):
     return None
 
 
+def _owned_mod_record(game_dir, mod_id):
+    """_read_mod_record, further requiring a usable parity_required - the full
+    "is this folder OURS?" test. It has to be the same predicate
+    list_installed_mods applies (id present, parity readable), so that a folder
+    can never read as installed to one caller and as foreign to another:
+    list_untracked_mods uses this to decide what's already claimed, and
+    _clear_install_path uses it to decide delete-vs-displace. TavernLib's
+    ModRecord.Read is the same test (its parity field is Required.Always, so an
+    unusable record reads as no record there too). Returns None for a folder
+    that isn't ours by that test."""
+    rec = _read_mod_record(game_dir, mod_id)
+    if rec is None:
+        return None
+    try:
+        parity_required(rec)
+    except ModManagerError:
+        return None
+    return rec
+
+
 def disable_mod(game_dir, mod_id):
     """Disable an installed folder-layout mod WITHOUT uninstalling it: rename its
     Mods/<id>/manifest.json to manifest.disabled.json. The folder then has no
@@ -507,17 +562,23 @@ def list_untracked_mods(game_dir):
     doesn't own (docs/mod-manager-design.md "Untracked mods"): a loose root
     Mods/*.dll (the classic drag-a-dll-in manual install, invisible to
     list_installed_mods since it never looks at files, only subfolders), or a
-    first-level Mods/<name>/ folder that list_installed_mods didn't already
-    claim - a foreign manifest.json, or one predating parity_required (see the
+    first-level Mods/<name>/ folder that doesn't hold a usable record of ours -
+    a foreign manifest.json, or one of ours gone unusable (see the
     skip-with-warning above). Each entry is {"name", "kind" ("file"/"folder"),
     "enabled"}. Deliberately surfacing-and-toggling only, per the design doc:
     there's no manifest we trust to reconcile a version/update against, so
-    this never appears anywhere near install/update, only enable/disable."""
+    this never appears anywhere near install/update, only enable/disable.
+    TavernLib's ListUntrackedMods is the same listing for headless servers,
+    and the two have to report the same set for the same folder.
+
+    A folder counts on a record file EXISTING, not on it parsing: MelonLoader's
+    folder marker is an existence check with the content unread, so a folder
+    whose manifest.json is unparseable junk still loads and still has to be
+    reported."""
     out = []
     mods_dir = _mods_base(game_dir)
     if not os.path.isdir(mods_dir):
         return out
-    claimed = {_safe_basename(rec["id"]) for rec in list_installed_mods(game_dir)}
     for name in os.listdir(mods_dir):
         full = os.path.join(mods_dir, name)
         if name.startswith((".", "~")):
@@ -529,16 +590,20 @@ def list_untracked_mods(game_dir):
             elif lower.endswith(".dll.disabled"):
                 out.append({"name": name[:-len(".disabled")], "kind": "file", "enabled": False})
         elif os.path.isdir(full):
-            if name in claimed:
+            # "Claimed" is tested per folder with the exact predicate
+            # list_installed_mods uses, rather than against the set of record
+            # ids it returned: that lister keys its result by the id INSIDE the
+            # record, so a folder whose name and record id disagree would miss
+            # an id-set lookup and be reported as untracked as well as
+            # installed. Same input, same question, one answer.
+            if _owned_mod_record(game_dir, name) is not None:
                 continue
-            rec = _read_sidecar(os.path.join(full, RECORD_NAME))
-            enabled = True
-            if not rec:
-                rec = _read_sidecar(os.path.join(full, DISABLED_RECORD_NAME))
-                enabled = False
-            if rec is None:
-                continue    # empty/junk folder - nothing MelonLoader would load
-            out.append({"name": name, "kind": "folder", "enabled": enabled})
+            if os.path.isfile(os.path.join(full, RECORD_NAME)):
+                out.append({"name": name, "kind": "folder", "enabled": True})
+            elif os.path.isfile(os.path.join(full, DISABLED_RECORD_NAME)):
+                out.append({"name": name, "kind": "folder", "enabled": False})
+            # Neither present: an empty or junk folder MelonLoader wouldn't
+            # load either, so there's nothing to report.
     return out
 
 
@@ -548,33 +613,70 @@ def disable_untracked_dll(game_dir, filename):
     disable_mod's manifest rename. A root dll has no manifest to hide behind
     and MelonLoader always loads any Mods/*.dll it finds, so the rename
     itself has to be what stops it loading. Returns True if it was there and
-    enabled, False if not."""
-    src = os.path.join(_mods_base(game_dir), filename)
+    enabled, False if not.
+
+    Refuses rather than clobbering an existing .disabled: that file is someone
+    else's mod, and a rename that quietly destroys it is the one outcome nothing
+    here can undo. TavernLib's DisableUntrackedDll refuses the same way."""
+    src = os.path.join(_mods_base(game_dir), _safe_basename(filename))
+    dest = src + ".disabled"
     if not os.path.isfile(src):
         return False
-    os.replace(src, src + ".disabled")
+    if os.path.exists(dest):
+        raise ModManagerError(f"{os.path.basename(dest)!r} already exists; "
+                              f"remove or rename it first.")
+    os.replace(src, dest)
     return True
 
 
 def enable_untracked_dll(game_dir, filename):
     """Reverses disable_untracked_dll. Returns True if it was disabled and is
-    now enabled, False if there was nothing disabled to enable."""
-    src = os.path.join(_mods_base(game_dir), filename) + ".disabled"
+    now enabled, False if there was nothing disabled to enable. Refuses to
+    overwrite an existing enabled file, same as disable_untracked_dll."""
+    dest = os.path.join(_mods_base(game_dir), _safe_basename(filename))
+    src = dest + ".disabled"
     if not os.path.isfile(src):
         return False
-    os.replace(src, os.path.join(_mods_base(game_dir), filename))
+    if os.path.exists(dest):
+        raise ModManagerError(f"{os.path.basename(dest)!r} already exists; "
+                              f"remove or rename it first.")
+    os.replace(src, dest)
     return True
 
 
+def _untracked_stamp(game_dir, entry):
+    """A cheap "has this changed?" marker for one untracked mod: its mtime as
+    whole Unix seconds, never a content hash. This runs on every ping, and
+    hashing every loose DLL in Mods/ that often would cost far more than an
+    advisory is worth. mtime misses an in-place edit that preserves it, which
+    costs a client a stale advisory line until something else moves -
+    acceptable, where missing a changed REQUIRED mod would not be.
+
+    Deliberately mtime alone, not mtime+size: TavernLib's UntrackedStamp has to
+    produce a byte-identical fingerprint, and a directory has no portable size
+    to agree on. A directory's own mtime moves when entries are added or
+    removed, so a folder mod gaining or losing files still re-fingerprints.
+
+    Anything unreadable stamps "?" rather than raising: a mod vanishing
+    mid-scan must not take the whole handshake down with it."""
+    try:
+        return str(int(os.stat(os.path.join(_mods_base(game_dir),
+                                            entry["name"])).st_mtime))
+    except OSError:
+        return "?"
+
+
 def handshake_snapshot(game_dir):
-    """Fingerprint of every currently-ENABLED installed mod, for the ping/pong
+    """Fingerprint of every currently-ENABLED mod in Mods/, for the ping/pong
     mod-sync check. Disabled mods are excluded: they aren't loaded, so a
-    joining client shouldn't be asked to match them. Returns
-    (mods_hash, mods_count, mods_list):
-    - mods_hash: sha256 of the id-sorted "id@version@req|opt" lines, joined
-      with newlines ("req" when parity_required, "opt" otherwise). A client
-      caches this per server; an unchanged hash means it already has the full
-      list and skips the extra round trip.
+    joining client shouldn't be asked about them. Returns
+    (mods_hash, mods_count, mods_list, untracked_list):
+    - mods_hash: sha256 of the fingerprint lines, joined with newlines: the
+      id-sorted managed "id@version@req|opt" lines ("req" when
+      parity_required, "opt" otherwise), then the name-sorted
+      "untracked:name@stamp" lines (_untracked_stamp). A client caches this
+      per server; an unchanged hash means it already has the full list and
+      skips the extra round trip.
 
       This exact format is a cross-language invariant: TavernLib computes the
       same hash in C# (Backend/Mods/ModHandshake.cs, whose own comment says it
@@ -582,29 +684,50 @@ def handshake_snapshot(game_dir):
       the separator, the ordering, or which fields take part silently breaks
       every join against a server running the other side's build -- the hash
       just never matches, there is no version negotiation, and nothing reports
-      a mismatch as such. Sorting is by id, ordinal on both sides.
-    - mods_count: len(mods_list), sent alongside the hash in the pong so a
-      client can sanity-check its cache without decoding anything.
-    - mods_list: every entry as {"id", "version", "client_side", "server_side",
-      "parity_required", "source_repo"}, sorted by id: what the separate,
-      length-prefixed
-      "mods_list" request sends on a cache miss. source_repo is a HINT only:
-      plan_join uses it to tell a client which repo a required
-      mod not resolvable from any of the client's configured repos would come
-      from, so the user can add it explicitly; it's never resolved into a
-      pull on its own, same rule as everywhere else this field appears (the
-      modlist's `repos`, the rejection payload's `missing` entries)."""
+      a mismatch as such. Sorting is by id, ordinal on both sides; untracked
+      entries sort by lowercased name on both sides.
+    - mods_count: len(mods_list) - MANAGED mods only, deliberately. It's sent
+      in the pong so a client can sanity-check its cached mods list without
+      decoding anything, and that list is the managed one; folding untracked
+      mods into the number would make it disagree with what it's checking.
+    - mods_list: every managed entry as {"id", "version", "client_side",
+      "server_side", "parity_required", "source_repo"}, sorted by id: what the
+      separate, length-prefixed "mods_list" request sends on a cache miss.
+      source_repo is a HINT only: plan_join uses it to tell a client which repo
+      a required mod not resolvable from any of the client's configured repos
+      would come from, so the user can add it explicitly; it's never resolved
+      into a pull on its own, same rule as everywhere else this field appears
+      (the modlist's `repos`, the rejection payload's `missing` entries).
+    - untracked_list: every enabled untracked mod as {"name", "kind"}, sorted
+      by name. A SEPARATE list, never merged into mods_list, because plan_join
+      consumes that one: an entry with no id or version would either crash it or
+      have to be special-cased in the middle of resolution. Kept apart, it can
+      only reach code that asked for it.
+
+    The advisory is honest about being an advisory. All a server can say about
+    an untracked mod is its name and shape - no id, version, or source - so a
+    client can display it but can never resolve, install, or verify it, and is
+    never blocked over one. It exists so a silent divergence becomes a visible
+    one.
+
+    Untracked entries ARE part of mods_hash, though. A client caches the whole
+    list against this hash, so leaving them out would let an operator drop a new
+    DLL into Mods/ and have every already-connected client keep reporting the
+    old set until something else happened to move the hash."""
     mods = sorted((m for m in list_installed_mods(game_dir) if m.get("enabled")),
                   key=lambda m: m["id"])
+    untracked = sorted((u for u in list_untracked_mods(game_dir) if u["enabled"]),
+                       key=lambda u: u["name"].lower())
     # parity_required is part of the fingerprint, not just the list. A server
     # can flip a mod between required and recommended without its version
     # moving, and a client caches this whole list against this hash - so leaving
     # it out would let a client keep planning against the old answer until it
     # restarted, and skip a mod that had since become mandatory.
-    fingerprint = "\n".join(
-        f"{m['id']}@{m.get('version', '')}@{'req' if parity_required(m) else 'opt'}"
-        for m in mods)
-    mods_hash = hashlib.sha256(fingerprint.encode()).hexdigest()
+    lines = [f"{m['id']}@{m.get('version', '')}@{'req' if parity_required(m) else 'opt'}"
+             for m in mods]
+    lines += [f"untracked:{u['name']}@{_untracked_stamp(game_dir, u)}"
+              for u in untracked]
+    mods_hash = hashlib.sha256("\n".join(lines).encode()).hexdigest()
     mods_list = [
         {"id": m["id"], "version": m.get("version", ""),
          "client_side": bool(m.get("client_side", False)),
@@ -613,4 +736,5 @@ def handshake_snapshot(game_dir):
          "source_repo": m.get("source_repo", "")}
         for m in mods
     ]
-    return mods_hash, len(mods_list), mods_list
+    untracked_list = [{"name": u["name"], "kind": u["kind"]} for u in untracked]
+    return mods_hash, len(mods_list), mods_list, untracked_list

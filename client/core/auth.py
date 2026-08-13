@@ -127,14 +127,21 @@ def _recv_framed(s, timeout):
 
 
 def fetch_server_mods(host, timeout=10):
-    """Fetches the server's full installed-mods list: every currently-enabled
-    mod as {"id", "version", "client_side", "server_side", "parity_required",
-    "source_repo"} -- the same six fields handshake_snapshot builds and
-    TavernLib's ModHandshake.Entry serialises, so both kinds of server answer
-    this identically. parity_required decides whether a client must match a mod
-    or may decline it, and source_repo is a hint only (never resolved into a
-    pull on its own); omitting either from a caller's expectations turns a
-    "recommended" mod into a hard join failure.
+    """Fetches the server's full mod list. Returns (mods, untracked):
+    - mods: every currently-enabled MANAGED mod as {"id", "version",
+      "client_side", "server_side", "parity_required", "source_repo"} -- the
+      same six fields handshake_snapshot builds and TavernLib's
+      ModHandshake.Entry serialises, so both kinds of server answer this
+      identically. This is what plan_join resolves against. parity_required
+      decides whether a client must match a mod or may decline it, and
+      source_repo is a hint only (never resolved into a pull on its own);
+      omitting either from a caller's expectations turns a "recommended" mod
+      into a hard join failure.
+    - untracked: every enabled mod the server runs that its own manager didn't
+      install, as {"name", "kind"}. Advisory only - there's no id or version to
+      resolve, so it's shown and never acted on, and a server that doesn't send
+      the key (an older TavernLib/launcher) simply yields [].
+
     Only called on a mods_hash cache miss (or right before a join); the
     ordinary ping/pong stays a single small recv, this is the one request that
     needs proper length-prefixed framing since a large mod list can genuinely
@@ -154,7 +161,8 @@ def fetch_server_mods(host, timeout=10):
     resp = json.loads(body.decode())
     if resp.get("status") != "ok":
         raise Exception(resp.get("message", "Server rejected the mods list request."))
-    return resp.get("mods", [])
+    untracked = [u for u in (resp.get("untracked") or []) if u.get("name")]
+    return resp.get("mods", []), untracked
 
 
 def _b64url(b): return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
