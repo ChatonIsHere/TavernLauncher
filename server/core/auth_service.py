@@ -164,7 +164,7 @@ def _handle_auth(conn, addr, log_fn, game_dir):
             if live_count is not None: resp["player_count"] = live_count
             if live_limit is not None and live_limit > 0: resp["player_limit"] = live_limit
             try:
-                mods_hash, mods_count, _ = mods.handshake_snapshot(game_dir)
+                mods_hash, mods_count, _, _ = mods.handshake_snapshot(game_dir)
                 resp["mods_hash"]  = mods_hash
                 resp["mods_count"] = mods_count
             except Exception as e:
@@ -177,8 +177,12 @@ def _handle_auth(conn, addr, log_fn, game_dir):
         # can outgrow a single recv unlike everything else on this port ──
         if req.get("mods_list"):
             try:
-                _, _, mods_list = mods.handshake_snapshot(game_dir)
-                _send_framed(conn, {"status": "ok", "mods": mods_list})
+                _, _, mods_list, untracked = mods.handshake_snapshot(game_dir)
+                # "untracked" is additive and advisory: a client too old to know
+                # the key ignores it and joins exactly as before, which is the
+                # right outcome for something that never blocks a join anyway.
+                _send_framed(conn, {"status": "ok", "mods": mods_list,
+                                    "untracked": untracked})
             except Exception as e:
                 _send_framed(conn, {"status": "error", "message": str(e)})
             return
