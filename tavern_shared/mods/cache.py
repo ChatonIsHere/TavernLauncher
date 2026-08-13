@@ -6,7 +6,7 @@ import shutil
 from tavern_shared.mods import layout
 from tavern_shared.mods.errors import ModManagerError
 from tavern_shared.mods.install import (
-    _read_mod_record, _read_sidecar, list_installed_mods,
+    _clear_install_path, _read_mod_record, _read_sidecar, list_installed_mods,
 )
 from tavern_shared.mods.layout import (
     DISABLED_RECORD_NAME, RECORD_NAME, _library_sidecar_path, _mod_dir_path,
@@ -128,8 +128,10 @@ def adopt_installed_mods(game_dir):
 def cache_restore_mod(game_dir, mod_id, version):
     """Copies a cached mod version into Mods/<id>/, enabled, replacing
     whatever's currently there (assembled in staging, swapped in atomically -
-    same pattern install_mod uses). Raises if that exact version isn't
-    cached."""
+    same pattern install_mod uses). A folder we didn't install is displaced
+    rather than replaced, same as install_mod: this runs on every join that
+    switches versions, so it's the likeliest of the two to meet one. Raises if
+    that exact version isn't cached."""
     src = _cache_mod_dir(mod_id, version)
     if not os.path.isdir(src):
         raise ModManagerError(f"'{mod_id}' {version} isn't in the local cache.")
@@ -139,8 +141,7 @@ def cache_restore_mod(game_dir, mod_id, version):
     if os.path.isdir(staging):
         shutil.rmtree(staging, ignore_errors=True)
     shutil.copytree(src, staging)
-    if os.path.isdir(dest):
-        shutil.rmtree(dest)
+    _clear_install_path(game_dir, mod_id)
     os.makedirs(_mods_base(game_dir), exist_ok=True)
     os.replace(staging, dest)
 

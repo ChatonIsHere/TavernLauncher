@@ -481,7 +481,14 @@ class ModManagerWindow(tk.Toplevel):
             modlist = export_modlist(self._game_dir, load_cfg(), pin_versions=pin)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(modlist, f, indent=2)
-            self._status.set(f"Exported {len(modlist['mods'])} mod(s) to {os.path.basename(path)}.")
+            # Untracked mods are counted separately, not folded into the total:
+            # importing this file won't install them, so a single number would
+            # promise more than the file can deliver.
+            note = (f" {len(modlist['untracked'])} untracked mod(s) are listed for "
+                    f"reference but won't be installed by an import."
+                    if modlist["untracked"] else "")
+            self._status.set(
+                f"Exported {len(modlist['mods'])} mod(s) to {os.path.basename(path)}.{note}")
         except Exception as e:
             messagebox.showerror("Export failed", str(e), parent=self)
 
@@ -526,11 +533,21 @@ class ModManagerWindow(tk.Toplevel):
             lines += [f"  • {mid}" + (f" {v}" if v else "") for mid, v in plan.unresolved]
             if plan.hinted_repos:
                 lines.append("This modlist expects sources: " + ", ".join(plan.hinted_repos))
+        # Listed last and phrased as a to-do, not a failure: nothing here blocks
+        # the import, and there's nothing the launcher could do about it anyway.
+        # Saying so beats an import that quietly reproduces less than the file
+        # describes.
+        if plan.untracked:
+            lines.append("Not included - the machine this came from also ran these, "
+                         "installed by hand. Copy them across yourself if you need them:")
+            lines += [f"  • {u['name']}" for u in plan.untracked]
         if plan.blocking:
             messagebox.showerror("Modlist has unresolved mods", "\n".join(lines), parent=self)
             return
         if not all_mods and not to_disable:
             messagebox.showinfo("Nothing to import",
+                "\n".join(lines + ["", "There's nothing new to install or disable."])
+                if plan.untracked else
                 "This modlist has nothing new to install or disable.", parent=self)
             return
         if not messagebox.askyesno("Import modlist",

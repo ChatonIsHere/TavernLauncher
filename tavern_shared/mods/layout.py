@@ -77,6 +77,15 @@ def _userlibs_dir(game_dir):
     return d
 
 
+def _displaced_base(game_dir):
+    # Where a Mods/<name>/ folder we didn't install goes when a mod of the same
+    # id needs that path (see install._clear_install_path). Dot-prefixed, so
+    # nothing that scans Mods/ - MelonLoader, list_installed_mods,
+    # list_untracked_mods - sees what's parked in here. TavernLib's
+    # ModPaths.DisplacedBase is the same location.
+    return os.path.join(_mods_base(game_dir), ".displaced")
+
+
 def _mod_dir_path(game_dir, mod_id):
     # A mod's own folder: Mods/<id>/. mod_id is guarded as a single path segment
     # (an id from an unreviewed repo can't be trusted to be path-safe).
