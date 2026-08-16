@@ -29,6 +29,7 @@ from tavern_shared.log_tailer import GameLogTailer
 from tavern_shared.mod_install import _melonloader_installed, _mods_need_attention
 from tavern_shared.patch import _patch_needs_attention
 from tavern_shared.mods_window import SetupWindow
+from tavern_shared import mods
 from tavern_shared.mods.ui.manager_window import ModManagerWindow
 
 from server.core.data_store import (
@@ -477,7 +478,7 @@ class ServerLauncher(tk.Tk):
             return
         if self._setup_win and self._setup_win.winfo_exists():
             self._setup_win.lift(); return
-        self._setup_win = SetupWindow(self, exe, on_status_change=self._refresh_setup_alert)
+        self._setup_win = SetupWindow(self, exe, on_status_change=self._on_mods_changed)
 
     def _open_mod_manager(self):
         exe = self.v_exe.get().strip()
@@ -489,7 +490,25 @@ class ServerLauncher(tk.Tk):
             self._mod_manager_win.lift(); return
         self._mod_manager_win = ModManagerWindow(
             self, os.path.dirname(exe), side="server",
-            on_change=self._refresh_setup_alert)
+            on_change=self._on_mods_changed)
+
+    def _on_mods_changed(self):
+        """Fires after any Setup or Mod Manager action changes what's on disk.
+        Beyond refreshing the alert, it closes a quiet trap: the handshake
+        (this launcher's auth service AND TavernLib's own join-time parity
+        check) reads Mods/ live, but the running game session loaded its mods
+        at startup. Change mods while the server is up and joining clients are
+        told about - and matched against - a set the live session isn't
+        actually running until it restarts. Nothing here can restart the game
+        safely on its own, so the honest move is to say so, every time it
+        happens while the server is running."""
+        self._refresh_setup_alert()
+        if self._proc and self._proc.poll() is None:
+            self._print("Mods changed while the server is running: the changes "
+                        "take effect after a server restart. Until then, joining "
+                        "players are matched against the NEW mod set while the "
+                        "running session still has the old one - restart soon.",
+                        "warn")
 
     def _open_addons(self):
         from server.core import addon_loader
@@ -535,6 +554,7 @@ class ServerLauncher(tk.Tk):
         exe = self.v_exe.get().strip()
         if not exe or not os.path.isfile(exe):
             self._setup_needs_attention = False
+            self._set_mod_manager_badge(0)
             return
         game_dir = os.path.dirname(exe)
         def worker():
@@ -547,8 +567,36 @@ class ServerLauncher(tk.Tk):
                 need = _mods_need_attention(game_dir) or _patch_needs_attention(exe)
             except Exception:
                 need = False
-            self.after(0, lambda: setattr(self, "_setup_needs_attention", need))
+            badge = self._count_mods_needing_attention(game_dir)
+            self.after(0, lambda: (setattr(self, "_setup_needs_attention", need),
+                                   self._set_mod_manager_badge(badge)))
         threading.Thread(target=worker, daemon=True).start()
+
+    def _count_mods_needing_attention(self, game_dir):
+        """How many installed community mods are outdated or damaged - a
+        quiet count on the Mod Manager button rather than a flash (an
+        available update is information, not an emergency; damage does also
+        count here since a reinstall from the manager is its fix). 0 on any
+        failure, so a network blip never decorates the button with a false
+        alarm. Runs off the UI thread only."""
+        try:
+            installed = [r for r in mods.list_installed_mods(game_dir)
+                         if r.get("server_side")]
+            if not installed:
+                return 0
+            index = mods.fetch_indexes(mods.list_repos(load_cfg()))
+            return sum(1 for r in installed
+                       if mods.mod_status(game_dir, r["id"], index)
+                       in ("outdated", "damaged"))
+        except Exception:
+            return 0
+
+    def _set_mod_manager_badge(self, count):
+        label = "📦 Mod Manager"
+        if count:
+            label += f"  ({count} need{'s' if count == 1 else ''} attention)"
+        try: self._mod_manager_btn.config(text=label)
+        except Exception: pass
 
     def _open_saves(self):
         try: os.makedirs(PLAYERS_SAVE, exist_ok=True); os.startfile(PLAYERS_SAVE)

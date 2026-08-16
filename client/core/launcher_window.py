@@ -454,6 +454,7 @@ class ClientLauncher(tk.Tk):
         exe = self.v_exe.get().strip()
         if not exe or not os.path.isfile(exe):
             self._setup_needs_attention = False
+            self._set_mod_manager_badge(0)
             return
         game_dir = os.path.dirname(exe)
         def worker():
@@ -466,8 +467,38 @@ class ClientLauncher(tk.Tk):
                 need = _mods_need_attention(game_dir) or _patch_needs_attention(exe)
             except Exception:
                 need = False
-            self.after(0, lambda: setattr(self, "_setup_needs_attention", need))
+            badge = self._count_mods_needing_attention(game_dir)
+            self.after(0, lambda: (setattr(self, "_setup_needs_attention", need),
+                                   self._set_mod_manager_badge(badge)))
         threading.Thread(target=worker, daemon=True).start()
+
+    def _count_mods_needing_attention(self, game_dir):
+        """How many installed community mods are outdated or damaged - the
+        quiet counterpart of the Setup alert, shown as a count on the Mod
+        Manager button rather than a flash. Quiet on purpose: joins
+        force-correct the mods that matter for a server anyway, so an
+        available update is information, not an emergency. 0 on any failure
+        (index unreachable, nothing installed), which just leaves the button
+        unadorned - same never-false-alarm rule the Setup alert follows.
+        Runs off the UI thread only (it hits the network and hashes files)."""
+        try:
+            installed = [r for r in mods.list_installed_mods(game_dir)
+                         if r.get("client_side")]
+            if not installed:
+                return 0
+            index = mods.fetch_indexes(mods.list_repos(load_cfg()))
+            return sum(1 for r in installed
+                       if mods.mod_status(game_dir, r["id"], index)
+                       in ("outdated", "damaged"))
+        except Exception:
+            return 0
+
+    def _set_mod_manager_badge(self, count):
+        label = "📦 Mod Manager"
+        if count:
+            label += f"  ({count} need{'s' if count == 1 else ''} attention)"
+        try: self._mod_manager_btn.config(text=label)
+        except Exception: pass
 
     # ── Persistence ────────────────────────────────────────────────────────────
 
@@ -985,6 +1016,18 @@ class ClientLauncher(tk.Tk):
                 mods.set_declined(load_cfg(), host, win.declined)
             except Exception as e:
                 self._print(f"Could not save your recommended-mod choices: {e}", "warn")
+        # Kept rows the user chose to make durable ("Pin" on a deactivation
+        # toggle): recorded as always-on pins, the same setting as Mod
+        # Manager's Keep Enabled, so future joins stop proposing the
+        # deactivation instead of asking again every time. Saved before the
+        # render for the same reason the declines are.
+        for mod_id in getattr(win, "pinned_keeps", []):
+            try:
+                mods.add_pin(load_cfg(), mod_id)
+                self._print(f"Pinned {mod_id} - it will stay enabled on every "
+                            f"server (undo in Mod Manager with Keep Enabled).", "dim")
+            except Exception as e:
+                self._print(f"Could not pin {mod_id}: {e}", "warn")
 
         def report(msg):
             self._print(msg, "dim")
@@ -1102,6 +1145,37 @@ class ClientLauncher(tk.Tk):
         return [(mid, ver, have.get(mid)) for mid, ver in required.items()
                 if have.get(mid) != ver]
 
+    def _report_build_divergence(self, game_dir, server_mods):
+        """Advisory only: same id and version on both sides can still be
+        different bytes - a release re-published without a version bump, or
+        the same version pulled from two different repos. Version parity (the
+        only thing the server enforces) passes, so the join goes ahead; this
+        just says so in the log, because an in-game misbehaviour from that
+        divergence is otherwise undiagnosable. Only possible when both sides
+        report a sha256 - older records and older servers simply don't, and
+        silence there is correct."""
+        try:
+            _, _, installed_mods, _ = mods.handshake_snapshot(game_dir)
+            have = {m["id"]: m for m in installed_mods}
+            for m in server_mods:
+                if not m.get("client_side"):
+                    continue
+                local = have.get(m["id"])
+                if not local or local.get("version") != m.get("version"):
+                    continue
+                server_sha = (m.get("sha256") or "").lower()
+                local_sha = (local.get("sha256") or "").lower()
+                if server_sha and local_sha and server_sha != local_sha:
+                    self._print(
+                        f"Heads up: {m['id']} {m.get('version')} is the same "
+                        f"version on both sides but a different build (the "
+                        f"published file changed without a version bump). The "
+                        f"server won't block your join over it, but if this mod "
+                        f"misbehaves in-game, that's why - worth telling the "
+                        f"server owner.", "warn")
+        except Exception:
+            pass
+
     def _reconcile_mods_async(self, host, exe, on_ready):
         """Brings Mods/ in line with this server and then calls on_ready() to
         continue the launch, or never calls it if the launch shouldn't proceed
@@ -1143,6 +1217,7 @@ class ClientLauncher(tk.Tk):
                         "Your mods still don't match this server: " + lines +
                         ". Joining would be rejected, so the game wasn't launched.")
                 return
+            self._report_build_divergence(game_dir, server_mods)
             if win is not None:
                 win.apply_finished(True)      # closes it, the launch follows
             self._set_sync_busy(False)
@@ -1167,14 +1242,22 @@ class ClientLauncher(tk.Tk):
                 # is unavailable, beside everything that is fine, is what tells
                 # the player whether to add a source or ask the server owner.
                 # No apply_action, so this is a read-only view and can't continue.
-                self._print("This server needs mods that aren't in any source "
-                            "you've added; not launching.", "err")
+                reasons = []
+                if plan.missing:
+                    reasons.append("aren't in any source you've added")
+                if plan.needs_repo:
+                    reasons.append("are only in a source you haven't added yet "
+                                   "(the comparison names it)")
+                self._print("This server needs mods that "
+                            + " or ".join(reasons) + "; not launching.", "err")
                 abort()
                 self._open_mod_diff(plan, server_mods, game_dir, host, joining=True)
                 return
 
+            # needs_repo doesn't appear here: a plan carrying one is blocking
+            # (a required mod that won't be installed), handled above.
             changed = [e for e in plan.entries if not e.active]
-            if not (changed or plan.to_deactivate or plan.needs_repo or plan.pin_conflicts):
+            if not (changed or plan.to_deactivate or plan.pin_conflicts):
                 verified(server_mods)         # already correct, nothing to apply
                 return
 

@@ -43,11 +43,12 @@ from tavern_shared.mods.install import (
     collect_library_dependencies, disable_mod, disable_untracked_dll, enable_mod,
     enable_untracked_dll, handshake_snapshot, install_library_dependency,
     install_mod, install_mod_closure, list_installed_mods, list_mods,
-    list_untracked_mods, mod_status, uninstall_mod,
+    list_untracked_mods, mod_status, uninstall_mod, verify_mod_files,
 )
 from tavern_shared.mods.cache import (
     adopt_installed_mods, cache_restore_library, cache_restore_mod,
     cache_store_library, cache_store_mod, clear_mod_cache,
+    ensure_mod_libraries,
 )
 from tavern_shared.mods.pins import (
     CFG_DECLINED_KEY, CFG_PINNED_KEY, add_pin, list_declined, list_pinned,
@@ -77,9 +78,10 @@ __all__ = [
     "enable_mod", "mod_status", "list_mods", "list_installed_mods",
     "list_untracked_mods", "disable_untracked_dll", "enable_untracked_dll",
     "handshake_snapshot", "collect_library_dependencies",
-    "install_library_dependency",
+    "install_library_dependency", "verify_mod_files",
     "cache_store_mod", "cache_store_library", "clear_mod_cache",
     "adopt_installed_mods", "cache_restore_mod", "cache_restore_library",
+    "ensure_mod_libraries",
     "CFG_PINNED_KEY", "CFG_DECLINED_KEY", "list_pinned", "list_declined",
     "set_declined", "add_pin", "remove_pin",
     "PlanEntry", "JoinPlan", "plan_join", "DiffRow", "build_mod_diff",

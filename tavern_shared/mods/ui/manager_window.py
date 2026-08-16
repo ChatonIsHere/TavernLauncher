@@ -10,17 +10,18 @@ from tavern_shared.mod_install import (
     _melonloader_installed, _tavernlib_installed,
 )
 from tavern_shared.theme import (
-    AMBER, AMBERDIM, BG, BORDER, CYAN, GREEN, MUTED, PARCH, SURF, _btn,
+    AMBER, AMBERDIM, BG, BORDER, CYAN, GREEN, MUTED, PARCH, RED, SURF, _btn,
     _mk_tree,
 )
 from tavern_shared.window_chrome import _enable_dark_titlebar
 
+from tavern_shared.mods.cache import ensure_mod_libraries
 from tavern_shared.mods.errors import ModManagerError
 from tavern_shared.mods.hostcfg import load_cfg
 from tavern_shared.mods.install import (
-    disable_mod, disable_untracked_dll, enable_mod, enable_untracked_dll,
-    install_mod_closure, list_installed_mods, list_untracked_mods, mod_status,
-    uninstall_mod,
+    _invalidate_verify_memo, disable_mod, disable_untracked_dll, enable_mod,
+    enable_untracked_dll, install_mod_closure, list_installed_mods,
+    list_untracked_mods, mod_status, uninstall_mod,
 )
 from tavern_shared.mods.modlist import (
     apply_import, export_modlist, import_modlist, modlist_import_disables,
@@ -52,6 +53,7 @@ class ModManagerWindow(tk.Toplevel):
     _WIDTHS = (90,       110,      160,   74,          70,       80,        120)
     _STATE_WORD = {
         "missing":  "Missing",
+        "damaged":  "Damaged",
         "current":  "Up to date",
         "outdated": "Update ready",
         "unknown":  "Installed",
@@ -111,6 +113,7 @@ class ModManagerWindow(tk.Toplevel):
         table_wrap.pack(fill="both", expand=True, padx=16)
         self._tree = _mk_tree(table_wrap, self._COLS, self._WIDTHS, height=10)
         self._tree.tag_configure("missing",   foreground=PARCH)
+        self._tree.tag_configure("damaged",   foreground=RED)
         self._tree.tag_configure("current",   foreground=GREEN)
         self._tree.tag_configure("outdated",  foreground=AMBER)
         self._tree.tag_configure("unknown",   foreground=MUTED)
@@ -141,6 +144,11 @@ class ModManagerWindow(tk.Toplevel):
 
     def _load(self, force=False):
         self._set_busy(True, "Loading installed mods...")
+        if force:
+            # Refresh means "look again, actually": damage checks are memoized
+            # per install (see verify_mod_files), and this is the explicit
+            # user gesture that says re-hash everything.
+            _invalidate_verify_memo()
         prev_index = self._index
         def worker():
             try:
@@ -417,6 +425,19 @@ class ModManagerWindow(tk.Toplevel):
             try:
                 if kind in ("managed", "untracked_folder"):
                     ok = disable_mod(game_dir, key) if disabling else enable_mod(game_dir, key)
+                    if ok and not disabling and kind == "managed":
+                        # A bare enable is just a record rename, but this mod's
+                        # pinned libraries may have been pruned from UserLibs/
+                        # while it was disabled (the join flow removes any
+                        # library no enabled mod pins). Put them back - cache
+                        # first, download if need be - or the mod loads without
+                        # them and fails in-game with nothing pointing here.
+                        restored = ensure_mod_libraries(
+                            game_dir, key,
+                            lambda m: self.after(0, lambda m=m: self._status.set(m)))
+                        if restored:
+                            self.after(0, lambda r=restored: self._status.set(
+                                f"Restored {', '.join(r)} for {name}."))
                 else:
                     ok = (disable_untracked_dll(game_dir, key) if disabling
                           else enable_untracked_dll(game_dir, key))
