@@ -96,12 +96,16 @@ def _get_redirect_location(url, timeout=10):
             conn.close()
 
 
-def _get_melonloader_latest_tag():
-    """Reads the current MelonLoader release tag (e.g. 'v0.7.3') from the
-    redirect target of its 'latest' download alias — no GitHub API call,
-    no rate limit, and no need to download the (large) release zip."""
-    loc = _get_redirect_location(
-        "https://github.com/LavaGang/MelonLoader/releases/latest/download/MelonLoader.x64.zip")
+def _get_latest_release_tag(url):
+    """Reads the release tag a GitHub 'latest' download alias currently
+    resolves to (e.g. 'v1.5.1') out of the first redirect hop — no GitHub
+    API call, no rate limit, and no need to download the asset itself.
+    Recorded at install time purely so the Setup window can SHOW which
+    release is installed; it is never the update check. The DLLs carry no
+    usable PE version resource (TavernLib is stamped 1.0.0.0 forever, the
+    patch inherits the game's own 0.0.0.1), so the release tag is the only
+    human-readable version these components have."""
+    loc = _get_redirect_location(url)
     if not loc:
         return None
     # .../releases/download/v0.7.3/MelonLoader.x64.zip -> "v0.7.3"
@@ -112,12 +116,21 @@ def _get_melonloader_latest_tag():
         return None
 
 
+def _get_melonloader_latest_tag():
+    """The current MelonLoader release tag (e.g. 'v0.7.3'). Unlike the other
+    two components this one IS the update check, compared against the
+    recorded melonloader_tag."""
+    return _get_latest_release_tag(MELONLOADER_ZIP_URLS["x64"])
+
+
 def _fetch_remote_fingerprint(url, timeout=10):
     """A lightweight 'has this file changed' check — HEAD for ETag (falls
     back to Last-Modified, then Content-Length), without downloading the
-    file. Needed for TavernLib specifically because its releases stay on a
-    single tag name that never changes, so tag comparison can't detect
-    updates the way it can for MelonLoader."""
+    file. This stays the update check for TavernLib and the patch even
+    though their repos tag releases these days (the tags are recorded for
+    display, see _get_latest_release_tag): the ETag tracks the asset's
+    BYTES, so it also catches a release re-uploaded under an unchanged
+    tag, which tag comparison reads as 'current' forever."""
     def _read(resp):
         h = resp.headers
         return h.get("ETag") or h.get("Last-Modified") or h.get("Content-Length") or ""
@@ -576,6 +589,15 @@ def _install_tavernlib(game_dir, on_progress):
     # which is what answers "is the file we installed still the file that's
     # there?" — a question the ETag cannot address at all.
     meta["tavernlib_sha256"] = expected_hash
+    # Display only (see _get_latest_release_tag) — dropped rather than left
+    # stale if the tag can't be read, same as the MelonLoader tag.
+    tag = None
+    try: tag = _get_latest_release_tag(TAVERNLIB_DOWNLOAD_URL)
+    except Exception: pass
+    if tag:
+        meta["tavernlib_tag"] = tag
+    else:
+        meta.pop("tavernlib_tag", None)
     _save_mod_meta(game_dir, meta)
 
 
