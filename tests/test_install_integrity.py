@@ -7,7 +7,7 @@ help. The dangerous shape is the one where nothing raises, nothing is logged,
 the status says "Up to date", and the file on disk is wrong -- reported as
 "the download seemed to complete, but the file didn't actually update".
 
-Three distinct mechanisms produce that shape, one per class below.
+Each class below covers one mechanism that produces that shape.
 """
 import io
 import os
@@ -104,6 +104,134 @@ class TruncatedDownloads(unittest.TestCase):
         mi._urlopen_hard_timeout = lambda *_a, **_k: resp
         mi._download_with_progress("https://example.test/f.dll", self.dest, lambda _m: None)
         self.assertEqual(os.path.getsize(self.dest), 50)
+
+
+class RefusedResponses(unittest.TestCase):
+    """The two download failures Content-Length alone can never catch, closed
+    for the setup components (patch, TavernLib, MelonLoader) that have no
+    independent hash to verify against.
+
+    First: the short-read check IS the truncation detection for a bare .dll,
+    and it silently stops existing the moment a proxy rewrites the response
+    to chunked encoding -- so for those downloads, no declared length is
+    itself a failure (require_length=True), not a shrug. Second: a proxy
+    serving a complete, correct-length block page defeats any length check;
+    only looking at the content catches that."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="tavern_refuse_")
+        self.dest = os.path.join(self.tmp, "payload.bin")
+        self._real_urlopen = mi._urlopen_hard_timeout
+
+    def tearDown(self):
+        mi._urlopen_hard_timeout = self._real_urlopen
+
+    def test_no_content_length_is_refused_when_required(self):
+        resp = FakeResponse(b"z" * 50)
+        del resp.headers["Content-Length"]
+        mi._urlopen_hard_timeout = lambda *_a, **_k: resp
+        with self.assertRaises(mi.DownloadError) as caught:
+            mi._download_with_progress("https://example.test/f.dll", self.dest,
+                                       lambda _m: None, require_length=True)
+        self.assertIn("Content-Length", str(caught.exception))
+        self.assertFalse(os.path.exists(self.dest),
+                         "refused before reading the body, so nothing lands on disk")
+
+    def test_a_block_page_is_not_a_dll(self):
+        """A school proxy's login page arrives complete, matches its own
+        Content-Length, and hashes consistently. Without a content check it
+        would be installed as Root.Township.dll and recorded as good."""
+        with open(self.dest, "wb") as f:
+            f.write(b"<!DOCTYPE html><html>Blocked by NetGuard</html>" * 200)
+        with self.assertRaises(mi.DownloadError) as caught:
+            mi._verify_payload_type(self.dest, "https://example.test/f.dll", "dll")
+        self.assertIn("isn't a Windows DLL", str(caught.exception))
+
+    def test_a_block_page_is_not_a_zip(self):
+        with open(self.dest, "wb") as f:
+            f.write(b"<html>Sign in to continue</html>" * 300)
+        with self.assertRaises(mi.DownloadError):
+            mi._verify_payload_type(self.dest, "https://example.test/ml.zip", "zip")
+
+    def test_a_real_dll_shaped_payload_passes(self):
+        with open(self.dest, "wb") as f:
+            f.write(b"MZ" + b"\0" * 8192)
+        mi._verify_payload_type(self.dest, "https://example.test/f.dll", "dll")
+
+    def test_a_tiny_mz_prefixed_file_is_still_refused(self):
+        """Magic alone isn't enough -- an error body could start with the
+        right two bytes. Every real payload here is orders of magnitude over
+        the floor."""
+        with open(self.dest, "wb") as f:
+            f.write(b"MZ error")
+        with self.assertRaises(mi.DownloadError):
+            mi._verify_payload_type(self.dest, "https://example.test/f.dll", "dll")
+
+
+class RetriedDownloads(unittest.TestCase):
+    """A dropped connection often succeeds on the next attempt -- the retry
+    exists so the user isn't handed a failure the launcher could have
+    absorbed. What escapes after the last attempt must say the retrying
+    already happened: the Setup window presents it as "we tried, here's the
+    manual route", which is only honest if it did."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="tavern_retry_")
+        self.dest = os.path.join(self.tmp, "payload.bin")
+
+    def test_a_transient_failure_is_absorbed(self):
+        calls = {"n": 0}
+        def flaky(url, dest, on_progress, **_kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise mi.DownloadError("connection reset")
+            with open(dest, "wb") as f:
+                f.write(b"ok")
+            return {}
+        real = mi._download_with_progress
+        mi._download_with_progress = flaky
+        try:
+            mi._download_with_retries("https://example.test/f.dll", self.dest,
+                                      lambda _m: None, retry_delay=0)
+        finally:
+            mi._download_with_progress = real
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(os.path.getsize(self.dest), 2)
+
+    def test_exhausted_retries_report_the_attempt_count(self):
+        real = mi._download_with_progress
+        def always_down(*_a, **_kw):
+            raise mi.DownloadError("connection reset")
+        mi._download_with_progress = always_down
+        try:
+            with self.assertRaises(mi.DownloadError) as caught:
+                mi._download_with_retries("https://example.test/f.dll", self.dest,
+                                          lambda _m: None, attempts=3, retry_delay=0)
+        finally:
+            mi._download_with_progress = real
+        self.assertIn("attempted 3 times", str(caught.exception))
+
+    def test_a_local_failure_is_not_retried(self):
+        """Retrying a permissions error or a full disk just triples the wait
+        before the same failure. Only DownloadError is the transient kind."""
+        calls = {"n": 0}
+        def broken_disk(*_a, **_kw):
+            calls["n"] += 1
+            raise PermissionError("disk says no")
+        real = mi._download_with_progress
+        mi._download_with_progress = broken_disk
+        try:
+            with self.assertRaises(PermissionError):
+                mi._download_with_retries("https://example.test/f.dll", self.dest,
+                                          lambda _m: None, retry_delay=0)
+        finally:
+            mi._download_with_progress = real
+        self.assertEqual(calls["n"], 1)
+
+    def test_download_error_is_still_a_runtime_error(self):
+        """Every existing caller catches RuntimeError; the subclass exists to
+        carry extra meaning, not to slip past those handlers."""
+        self.assertTrue(issubclass(mi.DownloadError, RuntimeError))
 
 
 class BlockedExtractions(unittest.TestCase):
