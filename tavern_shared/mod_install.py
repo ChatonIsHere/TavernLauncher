@@ -13,10 +13,8 @@ reviewed index, and the ability to be turned off per server -- none of which a
 hard-coded installer here could offer.
 """
 import os
-import sys
 import time
 import json
-import shutil
 import socket
 import threading
 import tempfile
@@ -29,7 +27,7 @@ import urllib.error
 import http.client
 from urllib.parse import urlparse
 
-from tavern_shared.paths import _app_dir, _sha256_file
+from tavern_shared.paths import _sha256_file
 
 MELONLOADER_ZIP_URLS = {
     "x64": "https://github.com/LavaGang/MelonLoader/releases/latest/download/MelonLoader.x64.zip",
@@ -44,6 +42,16 @@ TAVERNLIB_FILENAME = "TavernLib.dll"
 
 
 MODS_META_FILENAME = ".tavern_mods_meta.json"
+
+
+class DownloadError(RuntimeError):
+    """A download that failed for reasons on the network's side of the line:
+    couldn't connect, was cut short, stalled, or handed back something that
+    isn't the requested file. Distinct from RuntimeError so the Setup window
+    can tell "the download itself keeps failing" (offer the manual-install
+    route: the user's browser usually works where this process is blocked)
+    apart from a local failure like a blocked write, where re-downloading
+    would change nothing."""
 
 
 def _mods_meta_path(game_dir):
@@ -197,7 +205,7 @@ def _urlopen_hard_timeout(req, connect_timeout=20, socket_timeout=20):
     t.start()
     t.join(connect_timeout)
     if t.is_alive():
-        raise RuntimeError(
+        raise DownloadError(
             f"Connecting to {urlparse(req.full_url).netloc} took too long and was "
             "abandoned. This usually means DNS resolution or the connection itself "
             "is hanging on this machine — often a VPN, a misconfigured router, or "
@@ -231,14 +239,15 @@ def _short_read_message(url, downloaded, total):
 
 
 def _download_with_progress(url, dest_path, on_progress,
-                             connect_timeout=20, max_total_seconds=1800, chunk_size=1<<16):
+                             connect_timeout=20, max_total_seconds=1800, chunk_size=1<<16,
+                             require_length=False):
     """Downloads url to dest_path, reporting live progress and enforcing a
     real wall-clock cap on the whole operation — a plain urlopen timeout=
     only guards a single socket operation, so a connection that trickles
     data just fast enough to dodge that never trips it and looks like a
     permanent hang rather than a slow download. Returns the response
     headers on success (some callers use these, e.g. for an ETag). Raises
-    RuntimeError with a specific, actionable message on failure, and never
+    DownloadError with a specific, actionable message on failure, and never
     leaves a partially-downloaded file at dest_path.
 
     A short read is a failure, not a success. read() returning b"" means
@@ -247,14 +256,26 @@ def _download_with_progress(url, dest_path, on_progress,
     way a finished download does. Without the Content-Length check below,
     every caller then hashes the truncated file, gets a hash that of course
     matches itself, records it as verified, and installs a broken DLL while
-    reporting success."""
+    reporting success.
+
+    require_length=True refuses a response with no usable Content-Length at
+    all, BEFORE reading the body. The short-read check above is the only
+    truncation detection a bare-file download has (a .zip at least fails to
+    open; a .dll has no structure of its own to fail on), and it silently
+    stops existing the moment the header is missing -- which GitHub never
+    omits, but an intercepting proxy rewriting the response to chunked
+    encoding does. For a download whose caller can't verify the result
+    against an independent hash, no length means no truncation detection,
+    so it's treated as a failure rather than downloaded blind."""
     start = time.time()
     req = urllib.request.Request(url, headers={"User-Agent": "TavernLauncher/1.0"})
     with _force_ipv4():
         try:
             resp = _urlopen_hard_timeout(req, connect_timeout=connect_timeout)
+        except DownloadError:
+            raise
         except urllib.error.URLError as e:
-            raise RuntimeError(
+            raise DownloadError(
                 f"Couldn't connect to {urlparse(url).netloc} — {getattr(e,'reason',e)}\n\n"
                 "This is usually a network/firewall/antivirus issue on this machine, "
                 "not something wrong with the launcher itself. Worth trying:\n"
@@ -264,12 +285,21 @@ def _download_with_progress(url, dest_path, on_progress,
 
         total = resp.headers.get("Content-Length")
         total = int(total) if total and total.isdigit() else None
+        if require_length and total is None:
+            resp.close()
+            raise DownloadError(
+                f"{urlparse(url).netloc} answered without saying how large the file "
+                "is (no Content-Length). GitHub always sends one, so something "
+                "between this machine and GitHub — usually a proxy or security "
+                "software inspecting the connection — is rewriting the response. "
+                "Without the expected size, a cut-off download would be "
+                "undetectable, so nothing was downloaded.")
         downloaded = 0
         try:
             with resp, open(dest_path, "wb") as out:
                 while True:
                     if time.time() - start > max_total_seconds:
-                        raise RuntimeError(
+                        raise DownloadError(
                             f"Download stalled for over {max_total_seconds // 60} minutes — giving up. "
                             "The connection may be extremely slow, or something is "
                             "silently throttling it (security software, a captive "
@@ -285,12 +315,79 @@ def _download_with_progress(url, dest_path, on_progress,
                     else:
                         on_progress(f"Downloading… {downloaded//1024:,} KB")
                 if total is not None and downloaded != total:
-                    raise RuntimeError(_short_read_message(url, downloaded, total))
+                    raise DownloadError(_short_read_message(url, downloaded, total))
         except Exception:
             try: os.remove(dest_path)
             except Exception: pass
             raise
         return dict(resp.headers)
+
+
+DOWNLOAD_ATTEMPTS = 3
+
+
+def _download_with_retries(url, dest_path, on_progress, attempts=DOWNLOAD_ATTEMPTS,
+                           retry_delay=2.0, **kwargs):
+    """_download_with_progress, tried up to `attempts` times before giving up.
+    Only DownloadError is retried — that's the transient class (a dropped
+    connection often succeeds on the next try, which is also the first thing
+    _short_read_message tells the user to do manually). Anything else
+    (permissions, disk) fails immediately: it would fail identically again.
+    The exception that escapes after the last attempt says how many were made,
+    so the caller's failure UI can honestly present this as "we already
+    retried" rather than "try again"."""
+    last = None
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            on_progress(f"Download failed — retrying (attempt {attempt} of {attempts})…")
+            time.sleep(retry_delay)
+        try:
+            return _download_with_progress(url, dest_path, on_progress, **kwargs)
+        except DownloadError as e:
+            last = e
+    raise DownloadError(f"{last}\n\nThis download was attempted {attempts} times "
+                        "and failed every time.")
+
+
+_PAYLOAD_MAGIC = {
+    # (magic bytes, floor) — the floor only exists to reject something
+    # magic-prefixed but absurdly small, e.g. an error page that happens to
+    # start with the right two bytes; every real payload here is far larger.
+    "dll": (b"MZ", 4096, "a Windows DLL"),
+    "zip": (b"PK", 4096, "a .zip archive"),
+}
+
+
+def _verify_payload_type(path, url, kind):
+    """Rejects a download whose CONTENT isn't the kind of file asked for —
+    the check that catches an intercepting proxy serving a complete,
+    correct-length block/login page instead of the file. Content-Length
+    can't catch that (the substituted body matches its own length), and for
+    a bare .dll neither can anything downstream: it gets hashed, installed,
+    and recorded as good. Two bytes of magic kill the realistic version of
+    that scenario, since a block page is HTML, not a PE image or zip.
+    Deliberately NOT authentication — a deliberately substituted valid DLL
+    still passes; only a pinned hash could catch that, and these downloads
+    track a moving 'latest' with nothing published to pin against."""
+    magic, floor, described = _PAYLOAD_MAGIC[kind]
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            head = f.read(len(magic))
+    except OSError as e:
+        raise DownloadError(f"Couldn't read back the downloaded file — {e}")
+    if head != magic or size < floor:
+        preview = head + (b"" if size <= len(magic) else b"...")
+        raise DownloadError(
+            f"The download from {urlparse(url).netloc} completed, but the result "
+            f"isn't {described} (starts with {preview!r}, {size:,} bytes). "
+            "Something between this machine and GitHub answered with a different "
+            "file — usually a proxy, captive portal, or security software serving "
+            "an error/login page instead of the real download. Nothing was "
+            "installed.\n\nWorth trying:\n"
+            "  • A different network (a phone hotspot is a quick test)\n"
+            "  • Temporarily disable antivirus/VPN and retry\n"
+            "  • Use Manual Install to download it in your browser instead")
 
 
 def _open_zip_with_retry(path, retries=8, delay=1.0):
@@ -365,62 +462,44 @@ def _blocked_write_message(what, examples):
         "  • Use Manual Install to place the files yourself")
 
 
-def _melonloader_manual_zip_path(arch):
-    """Where a copy of MelonLoader shipped with this launcher release is
-    checked for, as an automatic fallback if the network download fails
-    or is taking too long. Some networks (school/corporate proxies that
-    need PAC/WPAD config Python doesn't evaluate, antivirus intercepting
-    the download for scanning, firewalls that only allowlist browser
-    traffic) block this app's own outbound request in ways no amount of
-    retry/timeout logic can fix from the inside — bundling a known-good
-    copy means the install still succeeds either way, with no user action
-    needed. The network attempt still goes first, since it's the only way
-    to get anything newer than whatever shipped with this build."""
-    return os.path.join(_app_dir(), "Patch", f"MelonLoader.{arch}.zip")
-
-
 def _install_melonloader(game_dir, arch, on_progress):
-    """Tries downloading the latest official MelonLoader release first;
-    if that fails, or a bundled copy exists and the download hasn't
-    finished quickly, falls back to whatever shipped in Patch/ — so this
-    succeeds either way without ever needing the user to do anything.
-    Raises only if neither a working download nor a bundled copy exists."""
-    manual_zip  = _melonloader_manual_zip_path(arch)
-    have_bundled = os.path.isfile(manual_zip)
+    """Downloads and installs the latest official MelonLoader release, with
+    retries. No bundled fallback: shipping a frozen copy inside the launcher
+    meant installing a stale (or worse, unreproducible) loader whenever GitHub
+    hiccuped, and silently — the user was told "installed" either way. A
+    download that still fails after the retries raises DownloadError, which
+    the Setup window turns into manual-install instructions: the user's own
+    browser is the trustworthy fallback, not a snapshot in Patch/.
+
+    The meta record (release tag + on-disk hash) is written only after the
+    extracted files have been read back and verified against the archive's
+    CRCs — a failed or blocked install must never update what we claim is
+    installed."""
     url = MELONLOADER_ZIP_URLS.get(arch)
-    if not url and not have_bundled:
+    if not url:
         raise RuntimeError(f"Unsupported or unrecognized game architecture ({arch}).")
 
     tag = None
-    downloaded_ok = False
+    try: tag = _get_melonloader_latest_tag()
+    except Exception: pass
+
     tmp_zip = os.path.join(tempfile.gettempdir(), "tavern_melonloader_dl.zip")
-
-    if url:
-        try: tag = _get_melonloader_latest_tag()
-        except Exception: pass
-        try:
-            if have_bundled:
-                # A good fallback is right there — don't make the user
-                # wait long before using it.
-                _download_with_progress(url, tmp_zip, on_progress,
-                                         connect_timeout=8, max_total_seconds=15)
-            else:
-                _download_with_progress(url, tmp_zip, on_progress)
-            downloaded_ok = True
-        except Exception:
-            if not have_bundled:
-                raise
-            on_progress("Couldn't reach GitHub — using the version bundled with this launcher…")
-
-    source_zip = tmp_zip if downloaded_ok else manual_zip
-    on_progress("Extracting MelonLoader…")
-    with _open_zip_with_retry(source_zip) as zf:
-        zf.extractall(game_dir)
-        # Verified against the archive itself, not just checked for presence
-        # -- see _verify_extracted for why presence is not enough here.
-        on_progress("Verifying extracted files…")
-        bad = _verify_extracted(zf, game_dir)
-    if downloaded_ok:
+    try:
+        _download_with_retries(url, tmp_zip, on_progress, require_length=True)
+        # A structurally-valid zip is a strong integrity check in itself (a
+        # truncated one loses its end-of-central-directory record and won't
+        # open) — but check the magic first anyway, so a substituted HTML page
+        # fails with "this isn't a zip, something intercepted the download"
+        # rather than eight seconds of open-retries and an antivirus hint.
+        _verify_payload_type(tmp_zip, url, "zip")
+        on_progress("Extracting MelonLoader…")
+        with _open_zip_with_retry(tmp_zip) as zf:
+            zf.extractall(game_dir)
+            # Verified against the archive itself, not just checked for presence
+            # -- see _verify_extracted for why presence is not enough here.
+            on_progress("Verifying extracted files…")
+            bad = _verify_extracted(zf, game_dir)
+    finally:
         try: os.remove(tmp_zip)
         except Exception: pass
 
@@ -433,13 +512,13 @@ def _install_melonloader(game_dir, arch, on_progress):
             "MelonLoader", "the expected files aren't in the game folder"))
 
     meta = _load_mod_meta(game_dir)
-    if downloaded_ok and tag:
+    if tag:
         meta["melonloader_tag"] = tag
-    elif not downloaded_ok:
-        # No real tag to record — a marker distinct enough that a later
-        # status check (once network access works again) can still tell
-        # this apart from "definitely current", prompting a real update.
-        meta["melonloader_tag"] = f"bundled:{_sha256_file(manual_zip)[:12]}"
+    else:
+        # The tag fetch failed, so which release this was is genuinely unknown
+        # — drop any old tag rather than leave it describing the previous
+        # install. Status then reports 'unknown' instead of a stale 'current'.
+        meta.pop("melonloader_tag", None)
     # The tag says which release we fetched; this says what is actually on
     # disk right now, which is a different question and the only one that can
     # answer "has something changed these files since we installed them?".
@@ -453,54 +532,42 @@ def _install_melonloader(game_dir, arch, on_progress):
     _save_mod_meta(game_dir, meta)
 
 
-def _tavernlib_manual_dll_path():
-    """Same idea as _melonloader_manual_zip_path — a copy of TavernLib.dll
-    shipped with this launcher release, used automatically as a fallback
-    if the network download fails or is taking too long."""
-    return os.path.join(_app_dir(), "Patch", "TavernLib.dll")
-
-
 def _install_tavernlib(game_dir, on_progress):
-    """Tries downloading the latest TavernLib.dll first; if that fails, or
-    a bundled copy exists and the download hasn't finished quickly, falls
-    back to whatever shipped in Patch/ — so this succeeds either way
-    without ever needing the user to do anything. Always swaps the result
-    in atomically, so a failed/interrupted attempt can never leave a
-    corrupt half-downloaded file in place."""
+    """Downloads and installs the latest TavernLib.dll, with retries. No
+    bundled fallback (see _install_melonloader for why it was removed).
+    Always swaps the result in atomically, so a failed/interrupted attempt
+    can never leave a corrupt half-downloaded file in place. The meta record
+    is written only after the installed file has been read back and matches
+    what was downloaded — a failed install never updates the recorded hash."""
     plugins_dir = os.path.join(game_dir, "Plugins")
     os.makedirs(plugins_dir, exist_ok=True)
     dest = os.path.join(plugins_dir, TAVERNLIB_FILENAME)
     tmp_dest = dest + ".download"
 
-    manual_dll   = _tavernlib_manual_dll_path()
-    have_bundled = os.path.isfile(manual_dll)
-    fingerprint  = ""
     try:
-        if have_bundled:
-            headers = _download_with_progress(TAVERNLIB_DOWNLOAD_URL, tmp_dest, on_progress,
-                                                connect_timeout=8, max_total_seconds=15)
-        else:
-            headers = _download_with_progress(TAVERNLIB_DOWNLOAD_URL, tmp_dest, on_progress)
+        headers = _download_with_retries(TAVERNLIB_DOWNLOAD_URL, tmp_dest, on_progress,
+                                         require_length=True)
+        _verify_payload_type(tmp_dest, TAVERNLIB_DOWNLOAD_URL, "dll")
         fingerprint = headers.get("ETag") or headers.get("Last-Modified") or ""
-    except Exception:
-        if not have_bundled:
-            raise
-        on_progress("Couldn't reach GitHub — using the version bundled with this launcher…")
-        shutil.copy2(manual_dll, tmp_dest)
-        fingerprint = f"bundled:{_sha256_file(manual_dll)[:12]}"
 
-    # Captured before the replace, since tmp_dest won't exist anymore
-    # afterward — os.replace renames it, it doesn't leave a copy behind.
-    expected_hash = _sha256_file(tmp_dest)
-    os.replace(tmp_dest, dest)  # atomic on Windows — always a full swap, never a partial one
-    if not os.path.isfile(dest) or _sha256_file(dest) != expected_hash:
-        # A silently-blocked write (Controlled Folder Access is a
-        # documented example) can leave os.replace appearing to succeed
-        # with the old file — or nothing at all — actually still there.
-        # Reading the result back and comparing is the only reliable way
-        # to tell a real success apart from that.
-        raise RuntimeError(_blocked_write_message(
-            "TavernLib.dll", "the installed file doesn't match what was downloaded"))
+        # Captured before the replace, since tmp_dest won't exist anymore
+        # afterward — os.replace renames it, it doesn't leave a copy behind.
+        expected_hash = _sha256_file(tmp_dest)
+        os.replace(tmp_dest, dest)  # atomic on Windows — always a full swap, never a partial one
+        if not os.path.isfile(dest) or _sha256_file(dest) != expected_hash:
+            # A silently-blocked write (Controlled Folder Access is a
+            # documented example) can leave os.replace appearing to succeed
+            # with the old file — or nothing at all — actually still there.
+            # Reading the result back and comparing is the only reliable way
+            # to tell a real success apart from that.
+            raise RuntimeError(_blocked_write_message(
+                "TavernLib.dll", "the installed file doesn't match what was downloaded"))
+    finally:
+        try:
+            if os.path.isfile(tmp_dest):
+                os.remove(tmp_dest)
+        except Exception:
+            pass
     meta = _load_mod_meta(game_dir)
     if fingerprint:
         meta["tavernlib_fingerprint"] = fingerprint

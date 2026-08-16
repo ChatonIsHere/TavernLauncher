@@ -24,8 +24,9 @@ from tavern_shared.window_chrome import _start_hidden, _finish_dark_window
 from tavern_shared.manual_install import ManualInstallWindow
 from tavern_shared.patch import _patch_is_applied, apply_patch
 from tavern_shared.mod_install import (
-    _detect_exe_arch, _install_melonloader, _install_tavernlib, _load_mod_meta,
-    _melonloader_installed, _melonloader_status, _tavernlib_status,
+    DownloadError, _detect_exe_arch, _install_melonloader, _install_tavernlib,
+    _load_mod_meta, _melonloader_installed, _melonloader_status,
+    _tavernlib_status,
 )
 
 class SetupWindow(tk.Toplevel):
@@ -69,9 +70,11 @@ class SetupWindow(tk.Toplevel):
 
         tk.Label(self,
             text="These set up modding for A Township Tale on this machine, in "
-                 "order: Patch, then MelonLoader, then TavernLib. If GitHub can't "
-                 "be reached (some networks/antivirus block it), the version "
-                 "bundled with this launcher is used automatically instead.",
+                 "order: Patch, then MelonLoader, then TavernLib. Each is "
+                 "downloaded fresh from its official GitHub release; if a "
+                 "download keeps failing (some networks/antivirus block it), "
+                 "you'll get step-by-step instructions to do it in your browser "
+                 "instead.",
             bg=BG, fg=MUTED, font=("Segoe UI",9), wraplength=470, justify="left"
         ).pack(anchor="w", padx=20, pady=(10,8))
 
@@ -178,9 +181,12 @@ class SetupWindow(tk.Toplevel):
         self._apply_row_state(self._patch_btn, patch_state)
         self._apply_row_state(self._ml_btn, ml_state)
         self._apply_row_state(self._tl_btn, tl_state)
-        # A real release tag (not the "bundled:<hash>" fallback marker) is
-        # worth showing so it's obvious exactly what got installed, not just
-        # that something did.
+        # A real release tag is worth showing so it's obvious exactly what got
+        # installed, not just that something did. "bundled:<hash>" markers are
+        # legacy: older launchers wrote them when they fell back to a copy
+        # shipped in Patch/ (a fallback that no longer exists) — still worth
+        # hiding rather than showing, and such installs read as 'outdated', so
+        # the next update replaces the marker with a real tag.
         if ml_tag and not ml_tag.startswith("bundled:"):
             note = self._ml_btn._notevar.get()
             self._ml_btn._notevar.set(f"{note}  ({ml_tag})" if note else f"({ml_tag})")
@@ -227,15 +233,14 @@ class SetupWindow(tk.Toplevel):
                 result = apply_patch(exe, lambda m: self.after(0, lambda: self._status.set(m)))
                 messages = {
                     "downloaded": "Downloaded the latest Tavern patch from GitHub and applied it.",
-                    "bundled": "Couldn't reach GitHub, so the version bundled with this "
-                               "launcher was applied instead.",
                     "current": "Already up to date — no changes were needed.",
                 }
                 msg = messages.get(result, "Root.Township.dll has been replaced with the Tavern patch.")
                 self.after(0, lambda: self._finish_install(True, msg))
             except RuntimeError as e:
-                self.after(0, lambda err=str(e): self._finish_install(
-                    False, f"Patch failed: {err}", "Patch"))
+                self.after(0, lambda e=e: self._finish_install(
+                    False, f"Patch failed: {e}", "Patch",
+                    auto_manual=isinstance(e, DownloadError)))
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_melonloader_click(self):
@@ -255,7 +260,8 @@ class SetupWindow(tk.Toplevel):
                 self.after(0, lambda: self._finish_install(True, "MelonLoader installed."))
             except Exception as e:
                 self.after(0, lambda e=e: self._finish_install(
-                    False, f"Install failed: {e}", "MelonLoader"))
+                    False, f"Install failed: {e}", "MelonLoader",
+                    auto_manual=isinstance(e, DownloadError)))
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_tavernlib_click(self):
@@ -273,7 +279,8 @@ class SetupWindow(tk.Toplevel):
                 self.after(0, lambda: self._finish_install(True, "TavernLib installed."))
             except Exception as e:
                 self.after(0, lambda e=e: self._finish_install(
-                    False, f"Install failed: {e}", "TavernLib"))
+                    False, f"Install failed: {e}", "TavernLib",
+                    auto_manual=isinstance(e, DownloadError)))
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_automatic_setup(self):
@@ -312,15 +319,26 @@ class SetupWindow(tk.Toplevel):
                 self.after(0, lambda: self._finish_install(True, "Automatic setup complete."))
             except Exception as e:
                 self.after(0, lambda e=e, s=stage[0]: self._finish_install(
-                    False, f"Automatic setup failed: {e}", s))
+                    False, f"Automatic setup failed: {e}", s,
+                    auto_manual=isinstance(e, DownloadError)))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_install(self, ok, msg, component=None):
+    def _finish_install(self, ok, msg, component=None, auto_manual=False):
+        """auto_manual opens the Manual Install window itself rather than
+        just revealing the button. Reserved for a download that failed every
+        one of its retries (DownloadError): at that point "try again" has
+        demonstrably been tried, the browser route is the useful next step,
+        and waiting for the user to discover the button just delays it. Local
+        failures (blocked writes, wrong paths) still only reveal the button —
+        those aren't fixed by downloading in a browser, so the window
+        shouldn't leap out for them."""
         self._set_busy(False, msg)
         if ok:
             self._hide_manual_offer()
         elif component:
             self._show_manual_offer(component, msg)
+            if auto_manual:
+                self._open_manual()
         # Held across the refresh rather than blanked by it. On failure this is
         # the only place the reason is ever shown -- there's no dialog and no
         # log in this window -- and the reasons are the actionable ones
