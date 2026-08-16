@@ -31,7 +31,7 @@ def _patch_target_path(game_exe):
 
 
 def _patch_status(game_exe):
-    """The same five states as _melonloader_status/_tavernlib_status, so the
+    """The same six states as _melonloader_status/_tavernlib_status, so the
     Setup window can say "Update available" about the patch instead of a
     binary applied/not — before this, a newly published patch release read
     as "Up to date" forever, because nothing ever compared against GitHub.
@@ -54,16 +54,19 @@ def _patch_status(game_exe):
     to stay apart: 'missing' flashes the Setup alert unconditionally,
     'unknown' never does.
 
-    - missing:  no Root.Township.dll at all, or nothing recorded as applied
-    - damaged:  the file no longer matches what apply_patch last confirmed
-                writing — a game update overwrote it, or antivirus ate it
-    - outdated: applied and intact, but GitHub's fingerprint for the
-                published file has moved (same ETag approach as TavernLib:
-                the patch release stays on one tag, so tags can't tell)
-    - unknown:  applied and intact, but nothing to compare against — the
-                fingerprint predates being recorded, or GitHub is
-                unreachable; deliberately not an alarm either way
-    - current:  applied, intact, and matches what GitHub is serving"""
+    - missing:    no Root.Township.dll at all, or nothing recorded as applied
+    - damaged:    the file no longer matches what apply_patch last confirmed
+                  writing — a game update overwrote it, or antivirus ate it
+    - outdated:   applied and intact, but GitHub's fingerprint for the
+                  published file has moved (the ETag tracks the asset's
+                  bytes, so it catches a re-upload a tag comparison misses)
+    - unrecorded: applied and intact, but the install record is incomplete —
+                  fingerprint or tag recorded by a launcher too old to write
+                  them; purely local, repaired by the reinstall Automatic
+                  Setup runs for this state
+    - unknown:    full record, but GitHub is unreachable to compare against;
+                  deliberately not an alarm and not auto-reinstalled
+    - current:    applied, intact, and matches what GitHub is serving"""
     game_dir = os.path.dirname(game_exe)
     dst = _patch_target_path(game_exe)
     meta = _load_mod_meta(game_dir)
@@ -72,8 +75,8 @@ def _patch_status(game_exe):
     if _file_matches_recorded(dst, meta.get("patch_sha256")) is False:
         return "damaged"
     installed_fp = meta.get("patch_fingerprint")
-    if not installed_fp:
-        return "unknown"
+    if not (installed_fp and meta.get("patch_tag")):
+        return "unrecorded"
     try:
         latest_fp = _fetch_remote_fingerprint(PATCH_DOWNLOAD_URL)
     except Exception:

@@ -298,6 +298,7 @@ class DriftAfterInstall(unittest.TestCase):
         mi._save_mod_meta(self.game, {
             "tavernlib_fingerprint": '"etag-v1"',
             "tavernlib_sha256": mi._sha256_file(self.tl),
+            "tavernlib_tag": "v1.5.1",
             "melonloader_tag": "v0.7.3",
             "melonloader_version_sha256": mi._sha256_file(self.ml),
         })
@@ -334,14 +335,39 @@ class DriftAfterInstall(unittest.TestCase):
             f.write(b"CORRUPTED")
         self.assertTrue(mi._mods_need_attention(self.game))
 
-    def test_no_recorded_hash_is_unknown_rather_than_damaged(self):
+    def test_no_recorded_hash_is_unrecorded_rather_than_damaged(self):
         """An install predating the hash being recorded has no baseline. That
         must not be reported as damage -- a false 'damaged' on every existing
-        install would train people to ignore the state entirely."""
+        install would train people to ignore the state entirely. It reads as
+        'unrecorded': locally repairable, so Automatic Setup reinstalls it,
+        unlike 'unknown' (complete record, check unavailable) which it must
+        leave alone."""
         meta = mi._load_mod_meta(self.game)
         del meta["tavernlib_sha256"]
         del meta["tavernlib_fingerprint"]
         mi._save_mod_meta(self.game, meta)
+        self.assertEqual(mi._tavernlib_status(self.game), "unrecorded")
+
+    def test_an_incomplete_record_is_auto_setup_work_but_never_an_alarm(self):
+        """The split in one test: 'unrecorded' is in AUTO_SETUP_STATES (a
+        reinstall repairs it) but not NEEDS_ATTENTION (a working install
+        shouldn't flash the launcher); 'unknown' is in neither (reinstalling
+        over an unreachable GitHub is guaranteed failure)."""
+        meta = mi._load_mod_meta(self.game)
+        del meta["melonloader_tag"]
+        mi._save_mod_meta(self.game, meta)
+        self.assertEqual(mi._melonloader_status(self.game), "unrecorded")
+        self.assertFalse(mi._mods_need_attention(self.game))
+        self.assertIn("unrecorded", mi.AUTO_SETUP_STATES)
+        self.assertNotIn("unknown", mi.AUTO_SETUP_STATES)
+        self.assertNotIn("unrecorded", mi.NEEDS_ATTENTION)
+
+    def test_a_failed_update_check_on_a_full_record_is_unknown(self):
+        """The other side of the split: everything recorded, GitHub
+        unreachable. Not 'unrecorded' -- a reinstall would fix nothing."""
+        def _down(*_a, **_k):
+            raise OSError("network unreachable")
+        mi._fetch_remote_fingerprint = _down
         self.assertEqual(mi._tavernlib_status(self.game), "unknown")
 
     def test_a_deleted_file_is_missing_not_damaged(self):
@@ -398,6 +424,7 @@ class PatchStatus(unittest.TestCase):
         mi._save_mod_meta(self.game, {
             "patch_sha256": mi._sha256_file(self.dll),
             "patch_fingerprint": '"etag-v1"',
+            "patch_tag": "v1.5.1",
         })
         self._real_fp = pt._fetch_remote_fingerprint
         pt._fetch_remote_fingerprint = lambda *_a, **_k: '"etag-v1"'
@@ -438,14 +465,16 @@ class PatchStatus(unittest.TestCase):
         self.assertEqual(pt._patch_status(self.exe), "unknown")
         self.assertFalse(pt._patch_needs_attention(self.exe))
 
-    def test_a_legacy_install_without_fingerprint_is_unknown(self):
+    def test_a_legacy_install_without_fingerprint_is_unrecorded(self):
         """Installs recorded before the fingerprint existed have no baseline
-        to compare against GitHub. That's 'unknown', not 'damaged' or a
-        false 'current' — and the next Install/Update records one."""
+        to compare against GitHub. That's 'unrecorded', not 'damaged' or a
+        false 'current' — Automatic Setup reinstalls it, which records one.
+        Not an alarm: the install itself works."""
         meta = mi._load_mod_meta(self.game)
         del meta["patch_fingerprint"]
         mi._save_mod_meta(self.game, meta)
-        self.assertEqual(pt._patch_status(self.exe), "unknown")
+        self.assertEqual(pt._patch_status(self.exe), "unrecorded")
+        self.assertFalse(pt._patch_needs_attention(self.exe))
 
     def test_a_deleted_dll_is_missing(self):
         os.remove(self.dll)

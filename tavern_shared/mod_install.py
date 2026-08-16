@@ -615,9 +615,17 @@ def _file_matches_recorded(path, recorded):
 
 
 def _melonloader_status(game_dir):
-    """Returns 'missing', 'damaged', 'outdated', 'unknown' (installed, but we
-    have no baseline to compare — e.g. it was installed by hand before this
-    feature existed, or the update check failed), or 'current'.
+    """Returns 'missing', 'damaged', 'outdated', 'unrecorded', 'unknown', or
+    'current'.
+
+    'unrecorded' and 'unknown' are deliberately separate answers to "can't
+    compare", because they're fixed from opposite directions. 'unrecorded'
+    means the install record itself is incomplete (installed by hand, or by
+    a launcher too old to write these fields) — purely local knowledge, and
+    a reinstall repairs it, so Automatic Setup treats it as work to do.
+    'unknown' means the record is complete but the remote check didn't
+    happen (GitHub unreachable) — reinstalling over that would just fail,
+    so nothing treats it as work and nothing alarms over it.
 
     'damaged' is checked before anything to do with versions, and is purely
     local: the version tag we recorded describes the release we fetched, so
@@ -632,8 +640,8 @@ def _melonloader_status(game_dir):
                               meta.get("melonloader_version_sha256")) is False:
         return "damaged"
     installed_tag = meta.get("melonloader_tag")
-    if not installed_tag:
-        return "unknown"
+    if not installed_tag or not meta.get("melonloader_version_sha256"):
+        return "unrecorded"
     try:
         latest = _get_melonloader_latest_tag()
     except Exception:
@@ -644,10 +652,13 @@ def _melonloader_status(game_dir):
 
 
 def _tavernlib_status(game_dir):
-    """Same five states as _melonloader_status, and 'damaged' matters here for
+    """Same six states as _melonloader_status, and 'damaged' matters here for
     the same reason: tavernlib_fingerprint is GitHub's ETag for the published
     file, so it answers "is a newer one out?" and is completely blind to the
-    installed copy being truncated, quarantined or replaced."""
+    installed copy being truncated, quarantined or replaced. A full record is
+    all three of hash (drift detection), fingerprint (update check) and tag
+    (version display) — any of them absent is 'unrecorded', one reinstall
+    away from all three working."""
     if not _tavernlib_installed(game_dir):
         return "missing"
     meta = _load_mod_meta(game_dir)
@@ -655,8 +666,9 @@ def _tavernlib_status(game_dir):
                               meta.get("tavernlib_sha256")) is False:
         return "damaged"
     installed_fp = meta.get("tavernlib_fingerprint")
-    if not installed_fp:
-        return "unknown"
+    if not (installed_fp and meta.get("tavernlib_sha256")
+            and meta.get("tavernlib_tag")):
+        return "unrecorded"
     try:
         latest_fp = _fetch_remote_fingerprint(TAVERNLIB_DOWNLOAD_URL)
     except Exception:
@@ -667,6 +679,15 @@ def _tavernlib_status(game_dir):
 
 
 NEEDS_ATTENTION = ("missing", "outdated", "damaged")
+
+
+# What Automatic Setup re-runs: everything alert-worthy, plus 'unrecorded' —
+# an incomplete install record is repaired by exactly the reinstall Automatic
+# Setup would do, and leaving it means no damage detection, no update checks
+# and no version display for that component. 'unknown' stays excluded from
+# both: it means the CHECK couldn't run, and reinstalling over an unreachable
+# GitHub turns "everything's installed" into guaranteed download failures.
+AUTO_SETUP_STATES = NEEDS_ATTENTION + ("unrecorded",)
 
 
 def _mods_need_attention(game_dir):
