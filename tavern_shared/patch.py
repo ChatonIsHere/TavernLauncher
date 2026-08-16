@@ -8,8 +8,8 @@ import os
 from tavern_shared.paths import _sha256_file
 from tavern_shared.mod_install import (
     NEEDS_ATTENTION, _download_with_retries, _fetch_remote_fingerprint,
-    _file_matches_recorded, _load_mod_meta, _save_mod_meta,
-    _verify_payload_type,
+    _file_matches_recorded, _get_latest_release_tag, _load_mod_meta,
+    _save_mod_meta, _verify_payload_type,
 )
 
 PATCH_DOWNLOAD_URL = "https://github.com/ModdingTavern/TavernDefaults/releases/latest/download/themoddingtavern.dll"
@@ -150,6 +150,15 @@ def apply_patch(game_exe, on_progress=None):
         meta["patch_sha256"] = new_hash
         if fingerprint:
             meta["patch_fingerprint"] = fingerprint
+        # Display only (see _get_latest_release_tag) — dropped rather than
+        # left stale if the tag can't be read.
+        tag = None
+        try: tag = _get_latest_release_tag(PATCH_DOWNLOAD_URL)
+        except Exception: pass
+        if tag:
+            meta["patch_tag"] = tag
+        else:
+            meta.pop("patch_tag", None)
         _save_mod_meta(game_dir, meta)
 
         return "current" if already_current else "downloaded"
