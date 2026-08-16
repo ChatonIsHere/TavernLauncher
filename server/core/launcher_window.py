@@ -27,7 +27,7 @@ except ImportError:
     pass
 from tavern_shared.log_tailer import GameLogTailer
 from tavern_shared.mod_install import _melonloader_installed, _mods_need_attention
-from tavern_shared.patch import _patch_is_applied
+from tavern_shared.patch import _patch_needs_attention
 from tavern_shared.mods_window import SetupWindow
 from tavern_shared.mods.ui.manager_window import ModManagerWindow
 
@@ -525,9 +525,9 @@ class ServerLauncher(tk.Tk):
 
     def _refresh_setup_alert(self):
         """One alert for the whole Setup sequence: a required mod missing or
-        outdated, or the patch not applied. These used to be two
-        separately flashing buttons for what is really one "this install
-        isn't ready yet" state.
+        outdated or damaged — the patch included, on the same rule. These
+        used to be two separately flashing buttons for what is really one
+        "this install isn't ready yet" state.
 
         The checks hit the network and the disk, so they run on a worker and
         only the resulting flag is written back on the main thread -- the
@@ -539,13 +539,12 @@ class ServerLauncher(tk.Tk):
         game_dir = os.path.dirname(exe)
         def worker():
             try:
-                # The unapplied-patch check used to be guarded on a bundled
-                # Patch/ copy existing (no point alerting about a patch there
-                # was no way to apply). The bundled copy is gone and the patch
-                # is always obtainable — by download, or the manual-install
-                # route when downloads are blocked — so unapplied alone is
-                # reason to alert now.
-                need = _mods_need_attention(game_dir) or not _patch_is_applied(exe)
+                # The patch is judged by the same missing/outdated/damaged
+                # rule as the other two components — so a newly published
+                # patch release flashes this alert instead of sitting
+                # invisible behind an applied-but-stale install, and a failed
+                # update check (network down) still never false-alarms.
+                need = _mods_need_attention(game_dir) or _patch_needs_attention(exe)
             except Exception:
                 need = False
             self.after(0, lambda: setattr(self, "_setup_needs_attention", need))
