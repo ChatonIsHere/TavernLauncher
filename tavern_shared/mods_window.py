@@ -24,7 +24,7 @@ from tavern_shared.window_chrome import _start_hidden, _finish_dark_window
 from tavern_shared.manual_install import ManualInstallWindow
 from tavern_shared.patch import _patch_status, apply_patch
 from tavern_shared.mod_install import (
-    NEEDS_ATTENTION, DownloadError, _detect_exe_arch, _install_melonloader,
+    AUTO_SETUP_STATES, DownloadError, _detect_exe_arch, _install_melonloader,
     _install_tavernlib, _load_mod_meta, _melonloader_installed,
     _melonloader_status, _tavernlib_status,
 )
@@ -138,27 +138,32 @@ class SetupWindow(tk.Toplevel):
     # ── Status ───────────────────────────────────────────────────────────────
 
     _STATE_STYLE = {
-        "missing":  ("○", MUTED, "⬇ Install"),
-        "outdated": ("⚠", AMBER, "⟳ Update"),
-        "damaged":  ("✕", RED,   "⟳ Repair"),
-        "unknown":  ("●", MUTED, "⟳ Reinstall"),
-        "current":  ("●", GREEN, "⟳ Reinstall"),
+        "missing":    ("○", MUTED, "⬇ Install"),
+        "outdated":   ("⚠", AMBER, "⟳ Update"),
+        "damaged":    ("✕", RED,   "⟳ Repair"),
+        "unrecorded": ("●", AMBER, "⟳ Reinstall"),
+        "unknown":    ("●", MUTED, "⟳ Reinstall"),
+        "current":    ("●", GREEN, "⟳ Reinstall"),
     }
     # Every state gets a note — a row that says nothing reads as "probably
     # fine", which is the one thing 'missing' and 'unknown' are not. The
-    # note is tinted to match the dot for the two states that ask for
-    # action, so "Update available" doesn't render in the same grey as
-    # "Up to date".
+    # note is tinted to match the dot for the states that ask for action,
+    # so "Update available" doesn't render in the same grey as "Up to date".
     _STATE_NOTE = {
-        "missing":  ("Not installed yet.", MUTED),
-        "outdated": ("Update available — a newer version is published.", AMBER),
+        "missing":    ("Not installed yet.", MUTED),
+        "outdated":   ("Update available — a newer version is published.", AMBER),
         # Deliberately says what was checked, not just that something is
         # wrong: this state exists to catch the case where the version looks
         # right and the file isn't, which is otherwise indistinguishable from
         # a healthy install.
-        "damaged":  ("Installed file doesn't match what was installed — repair it.", RED),
-        "unknown":  ("Installed — couldn't check for updates.", MUTED),
-        "current":  ("Up to date.", MUTED),
+        "damaged":    ("Installed file doesn't match what was installed — repair it.", RED),
+        # Installed and probably fine, but with no recorded baseline there's
+        # no damage detection, no update checks and no version display.
+        # Reinstalling records everything, and Automatic Setup does it.
+        "unrecorded": ("Installed, but its install record is incomplete — "
+                       "reinstall (or run Automatic Setup) to enable update checks.", AMBER),
+        "unknown":    ("Installed — couldn't check for updates.", MUTED),
+        "current":    ("Up to date.", MUTED),
     }
 
     def _refresh_states(self, keep_status=None):
@@ -307,19 +312,22 @@ class SetupWindow(tk.Toplevel):
         stage = ["Patch"]
 
         def worker():
-            # Each step runs on NEEDS_ATTENTION (missing/outdated/damaged) —
-            # the same rule that flashes the main window's Setup alert — and
-            # not on 'unknown', which means "installed, but the update CHECK
-            # didn't happen". Reinstalling over unknown would turn "GitHub
-            # unreachable but everything's already installed" into three
-            # guaranteed download failures instead of a completed no-op.
+            # Each step runs on AUTO_SETUP_STATES: everything that flashes
+            # the main window's Setup alert (missing/outdated/damaged), plus
+            # 'unrecorded' — an incomplete install record is repaired by
+            # exactly this reinstall, and until then that component has no
+            # damage detection, update checks or version display. 'unknown'
+            # stays skipped: it means the update CHECK didn't happen, and
+            # reinstalling over an unreachable GitHub would turn "everything's
+            # installed" into guaranteed download failures instead of a
+            # completed no-op.
             try:
-                if _patch_status(exe) in NEEDS_ATTENTION:
+                if _patch_status(exe) in AUTO_SETUP_STATES:
                     self.after(0, lambda: self._status.set("Applying patch…"))
                     apply_patch(exe, lambda m: self.after(0, lambda: self._status.set(m)))
 
                 stage[0] = "MelonLoader"
-                if _melonloader_status(game_dir) in NEEDS_ATTENTION:
+                if _melonloader_status(game_dir) in AUTO_SETUP_STATES:
                     arch = _detect_exe_arch(exe)
                     if not arch:
                         raise RuntimeError(
@@ -330,7 +338,7 @@ class SetupWindow(tk.Toplevel):
                         lambda m: self.after(0, lambda: self._status.set(m)))
 
                 stage[0] = "TavernLib"
-                if _tavernlib_status(game_dir) in NEEDS_ATTENTION:
+                if _tavernlib_status(game_dir) in AUTO_SETUP_STATES:
                     self.after(0, lambda: self._status.set("Installing TavernLib…"))
                     _install_tavernlib(game_dir,
                         lambda m: self.after(0, lambda: self._status.set(m)))
