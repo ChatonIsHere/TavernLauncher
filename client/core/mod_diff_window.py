@@ -84,8 +84,16 @@ class ModDiffWindow(tk.Toplevel):
         # Both directions a row can be overruled. _keep: deactivations the user
         # wants to hold on to. _skip: recommended mods the user doesn't want.
         # A row starts in _skip if it came in already declined for this server.
+        # _pin: kept rows the user wants kept EVERYWHERE - the durable version
+        # of _keep. A plain Keep only survives until the next join re-proposes
+        # the deactivation; a pin unions the mod into every future plan (Mod
+        # Manager's Keep Enabled), so it stops being offered for deactivation
+        # at all. The caller reads .pinned_keeps after an apply and writes the
+        # actual pins - this window never touches config itself.
         self._keep   = set()
+        self._pin    = set()
         self._skip   = {r.mod_id for r in rows if r.action == ACTION_SKIPPED}
+        self.pinned_keeps = []
         self.result  = False
 
         self._apply_action     = apply_action
@@ -204,6 +212,8 @@ class ModDiffWindow(tk.Toplevel):
             return "Done"
         if state == "start":
             return self._VERB_ING.get(r.action, "Working") + "…"
+        if mod_id in self._pin:
+            return "Keep active (pinned)"
         if mod_id in self._keep:
             return "Keep active"
         if r.recommended and mod_id in self._skip:
@@ -235,10 +245,14 @@ class ModDiffWindow(tk.Toplevel):
         return self._tag_colors.get(self._row_tag(mod_id), MUTED)
 
     def _choice_options(self, mod_id):
-        """(values, current) for an optional row's two-way toggle. 'included'
-        is whichever option the plan proposes by default - install for a
+        """(values, current) for an optional row's toggle. 'included' is
+        whichever option the plan proposes by default - install for a
         recommendation, deactivate for an extra the server doesn't use;
-        'current' is the separate, actual pending choice."""
+        'current' is the separate, actual pending choice. A deactivation row
+        gets a third choice, Pin: Keep for this apply AND remember it as an
+        always-on pin, so the next join stops proposing the deactivation
+        (the hover note explains it; same effect as Mod Manager's Keep
+        Enabled)."""
         r = self._rows[mod_id]
         if r.recommended:
             if r.action == ACTION_SKIPPED:
@@ -251,8 +265,13 @@ class ModDiffWindow(tk.Toplevel):
             values = (included, "Skip")
             current = "Skip" if mod_id in self._skip else included
         else:
-            values = ("Deactivate", "Keep")
-            current = "Keep" if mod_id in self._keep else "Deactivate"
+            values = ("Deactivate", "Keep", "Pin")
+            if mod_id in self._pin:
+                current = "Pin"
+            elif mod_id in self._keep:
+                current = "Keep"
+            else:
+                current = "Deactivate"
         return values, current
 
     def _populate(self):
@@ -349,15 +368,23 @@ class ModDiffWindow(tk.Toplevel):
 
     def _on_choice_changed(self, mod_id, choice):
         r = self._rows[mod_id]
-        # The override literal is always the second _choice_options value
-        # (Skip for a recommendation, Keep for an extra); picking it means
-        # "override the plan's default", picking the other means "don't".
-        target_set = self._skip if r.recommended else self._keep
-        override_literal = "Skip" if r.recommended else "Keep"
-        if choice == override_literal:
-            target_set.add(mod_id)
+        if r.recommended:
+            # "Skip" overrides the plan's default; the other option means don't.
+            if choice == "Skip":
+                self._skip.add(mod_id)
+            else:
+                self._skip.discard(mod_id)
         else:
-            target_set.discard(mod_id)
+            # Keep and Pin both hold the mod active; Pin additionally marks it
+            # to be remembered as an always-on pin when the plan is applied.
+            if choice in ("Keep", "Pin"):
+                self._keep.add(mod_id)
+            else:
+                self._keep.discard(mod_id)
+            if choice == "Pin":
+                self._pin.add(mod_id)
+            else:
+                self._pin.discard(mod_id)
         self._name_labels[mod_id].config(fg=self._row_color(mod_id))
         self._paint_toggle(mod_id, choice)
 
@@ -377,8 +404,11 @@ class ModDiffWindow(tk.Toplevel):
         self._plan.entries = [e for e in self._plan.entries
                               if e.mod_id not in self._skip]
         # What the caller should remember for this server, including choices
-        # taken back: a row toggled off _skip drops out of here too.
+        # taken back: a row toggled off _skip drops out of here too. And the
+        # kept rows the user asked to make durable - the caller turns each
+        # into an always-on pin alongside saving the declines.
         self.declined = sorted(self._skip)
+        self.pinned_keeps = sorted(self._pin)
         if self._apply_action is None:
             self.result = True
             self.destroy()
