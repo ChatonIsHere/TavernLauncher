@@ -177,36 +177,41 @@ class SetupWindow(tk.Toplevel):
             patch_state = _patch_status(exe)
             ml = _melonloader_status(game_dir)
             tl = _tavernlib_status(game_dir)
-            ml_tag = _load_mod_meta(game_dir).get("melonloader_tag")
-            self.after(0, lambda: self._apply_states(patch_state, ml, tl, ml_tag,
+            meta = _load_mod_meta(game_dir)
+            tags = {"patch": meta.get("patch_tag"),
+                    "ml":    meta.get("melonloader_tag"),
+                    "tl":    meta.get("tavernlib_tag")}
+            self.after(0, lambda: self._apply_states(patch_state, ml, tl, tags,
                                                      keep_status))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _apply_states(self, patch_state, ml_state, tl_state, ml_tag,
+    def _apply_states(self, patch_state, ml_state, tl_state, tags,
                       keep_status=None):
-        self._apply_row_state(self._patch_btn, patch_state)
-        self._apply_row_state(self._ml_btn, ml_state)
-        self._apply_row_state(self._tl_btn, tl_state)
-        # A real release tag is worth showing so it's obvious exactly what got
-        # installed, not just that something did. "bundled:<hash>" markers are
-        # legacy: older launchers wrote them when they fell back to a copy
-        # shipped in Patch/ (a fallback that no longer exists) — still worth
-        # hiding rather than showing, and such installs read as 'outdated', so
-        # the next update replaces the marker with a real tag.
-        if ml_tag and not ml_tag.startswith("bundled:"):
-            note = self._ml_btn._notevar.get()
-            self._ml_btn._notevar.set(f"{note}  ({ml_tag})" if note else f"({ml_tag})")
+        self._apply_row_state(self._patch_btn, patch_state, tags.get("patch"))
+        self._apply_row_state(self._ml_btn, ml_state, tags.get("ml"))
+        self._apply_row_state(self._tl_btn, tl_state, tags.get("tl"))
         self._lock_row(self._ml_btn, ml_state, patch_state, "Patch")
         self._lock_row(self._tl_btn, tl_state, ml_state, "MelonLoader")
         self._status.set("" if keep_status is None else keep_status)
         if self._on_status_change: self._on_status_change()
 
-    def _apply_row_state(self, btn, state):
+    def _apply_row_state(self, btn, state, tag=None):
         dot, color, text = self._STATE_STYLE[state]
         btn._dotvar.set(dot)
         btn._dotlabel.config(fg=color)
         btn.config(text=text)
         note, note_color = self._STATE_NOTE[state]
+        # The installed release tag (recorded at install time from the
+        # download's redirect target) is worth showing on every row so it's
+        # obvious exactly what's installed, not just that something is.
+        # "bundled:<hash>" markers are legacy: older launchers wrote them when
+        # they fell back to a copy shipped in Patch/ (a fallback that no
+        # longer exists) — still worth hiding rather than showing, and such
+        # installs read as 'outdated', so the next update replaces the marker
+        # with a real tag. Skipped for 'missing': whatever tag was once
+        # recorded, it doesn't describe an install that isn't there.
+        if tag and not tag.startswith("bundled:") and state != "missing":
+            note = f"{note}  ({tag})" if note else f"({tag})"
         btn._notevar.set(note)
         btn._notelabel.config(fg=note_color)
 

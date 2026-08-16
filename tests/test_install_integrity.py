@@ -349,6 +349,35 @@ class DriftAfterInstall(unittest.TestCase):
         self.assertEqual(mi._tavernlib_status(self.game), "missing")
 
 
+class ReleaseTags(unittest.TestCase):
+    """The release tag read from a 'latest' alias's redirect is the only
+    human-readable version the patch and TavernLib have — their PE version
+    resources are never bumped (TavernLib says 1.0.0.0 forever, the patch
+    inherits the game's own 0.0.0.1) — so it's recorded at install time and
+    shown on the Setup rows. Display only; the ETag fingerprint stays the
+    update check."""
+
+    def setUp(self):
+        self._real = mi._get_redirect_location
+
+    def tearDown(self):
+        mi._get_redirect_location = self._real
+
+    def test_the_tag_is_read_from_the_redirect_target(self):
+        mi._get_redirect_location = lambda *_a, **_k: (
+            "https://github.com/ModdingTavern/TavernLib/releases/download/v1.5.1/TavernLib.dll")
+        self.assertEqual(mi._get_latest_release_tag("https://x/latest/download/TavernLib.dll"),
+                         "v1.5.1")
+
+    def test_no_redirect_means_no_tag_not_a_crash(self):
+        mi._get_redirect_location = lambda *_a, **_k: None
+        self.assertIsNone(mi._get_latest_release_tag("https://x/latest/download/f.dll"))
+
+    def test_an_unexpected_location_shape_means_no_tag(self):
+        mi._get_redirect_location = lambda *_a, **_k: "https://cdn.example/somewhere/else"
+        self.assertIsNone(mi._get_latest_release_tag("https://x/latest/download/f.dll"))
+
+
 class PatchStatus(unittest.TestCase):
     """The patch used to be the one component with no update detection: a
     binary applied/not-applied, so a newly published patch release read as
