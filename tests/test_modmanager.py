@@ -1351,12 +1351,18 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
         self.assertEqual(plan.missing, [("ghost.m", "1.0.0")])
         self.assertEqual(plan.needs_repo, [])
 
-    def test_needs_repo_when_hint_names_unadded_repo_not_blocking(self):
+    def test_needs_repo_when_hint_names_unadded_repo_blocks_with_the_hint(self):
+        """A required mod resolvable only from an unadded repo blocks the same
+        as a missing one - an apply that skips it can only end in the parity
+        check failing after the render, so offering Apply was a button that
+        could never succeed. The distinction that matters survives in the
+        list itself: needs_repo names the exact source to add, missing has
+        nothing to suggest."""
         server_mods = [{"id": "elsewhere.m", "version": "1.0.0", "client_side": True,
                         "server_side": True, "parity_required": True,
                         "source_repo": self.OTHER}]
         plan = mm.plan_join(self.game, server_mods, [], [self.BASE])
-        self.assertFalse(plan.blocking)
+        self.assertTrue(plan.blocking)
         self.assertEqual(plan.missing, [])
         self.assertEqual(plan.needs_repo, [("elsewhere.m", "1.0.0", self.OTHER)])
 
@@ -1639,7 +1645,10 @@ class ModDiff(_FakeInstallFixture, unittest.TestCase):
         rows, plan = self._diff(server_mods, [])
         row = rows["d.other"]
         self.assertEqual(row.action, mm.ACTION_NEEDS_REPO)
-        self.assertFalse(row.blocking)      # informational, not a launch stopper
+        # Blocking, same as a missing required mod: an apply without it could
+        # only fail the parity check afterwards. What makes it the fixable
+        # variant is the note naming the exact source to add.
+        self.assertTrue(row.blocking)
         self.assertIn(mm._repo_shorthand(OTHER), row.note)
 
     def test_problems_sort_above_changes_and_matches(self):
@@ -2762,6 +2771,265 @@ class FacadeGuardsAgainstDeadStubs(unittest.TestCase):
     def test_unknown_name_raises(self):
         with self.assertRaises(AttributeError):
             mm.no_such_name_anywhere
+
+
+class DamageDetection(_FakeInstallFixture, unittest.TestCase):
+    """verify_mod_files + the 'damaged' status: installed community mods get
+    the same integrity story the core components (patch/ML/TavernLib) have -
+    the record carries per-file hashes written at install, and mod_status
+    checks them before it says anything about versions."""
+
+    def _install(self, mod_id, version, **over):
+        self._publish(mod_id, version, **over)
+        mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
+                               [self.BASE], self.progress.append, side="client")
+
+    def _dll(self, mod_id):
+        return os.path.join(self.game, "Mods", mod_id, f"{mod_id}.dll")
+
+    def test_install_records_per_file_hashes(self):
+        self._install("h.m", "1.0.0")
+        rec = read_json(os.path.join(self.game, "Mods", "h.m", "manifest.json"))
+        # Exactly the placed dll, hashed for real; the record itself is never
+        # in its own map (it didn't exist when the map was computed).
+        with open(self._dll("h.m"), "rb") as f:
+            expected = hashlib.sha256(f.read()).hexdigest()
+        self.assertEqual(rec["files"], {"h.m.dll": expected})
+
+    def test_intact_install_verifies_true(self):
+        self._install("ok.m", "1.0.0")
+        self.assertIs(mm.verify_mod_files(self.game, "ok.m"), True)
+        self.assertEqual(mm.mod_status(self.game, "ok.m",
+                                       [summary("ok.m", ["1.0.0"])]), "current")
+
+    def test_an_altered_file_reads_damaged(self):
+        self._install("av.m", "1.0.0")
+        with open(self._dll("av.m"), "wb") as f:
+            f.write(b"eaten by antivirus")
+        self.assertIs(mm.verify_mod_files(self.game, "av.m"), False)
+        self.assertEqual(mm.mod_status(self.game, "av.m",
+                                       [summary("av.m", ["1.0.0"])]), "damaged")
+
+    def test_a_deleted_file_reads_damaged(self):
+        self._install("gone.m", "1.0.0")
+        os.remove(self._dll("gone.m"))
+        self.assertIs(mm.verify_mod_files(self.game, "gone.m"), False)
+
+    def test_damage_outranks_outdated(self):
+        """A damaged install's version number is a claim about files that are
+        no longer there, so it must not soften to 'Update ready'."""
+        self._install("d.old", "1.0.0")
+        with open(self._dll("d.old"), "wb") as f:
+            f.write(b"junk")
+        self.assertEqual(mm.mod_status(self.game, "d.old",
+                                       [summary("d.old", ["1.0.0", "2.0.0"])]), "damaged")
+
+    def test_a_record_without_a_files_map_is_never_damaged(self):
+        """Pre-existing installs (and TavernLib's C# installer) have no map:
+        no evidence either way must read as None/current, or shipping this
+        would mark every existing install Damaged overnight."""
+        self._install("legacy.m", "1.0.0")
+        record_path = mm._mod_record_path(self.game, "legacy.m")
+        rec = read_json(record_path)
+        del rec["files"]
+        with io.open(record_path, "w", encoding="utf-8") as f:
+            json.dump(rec, f)
+        with open(self._dll("legacy.m"), "wb") as f:
+            f.write(b"altered, but unprovable")
+        self.assertIsNone(mm.verify_mod_files(self.game, "legacy.m"))
+        self.assertEqual(mm.mod_status(self.game, "legacy.m",
+                                       [summary("legacy.m", ["1.0.0"])]), "current")
+
+    def test_verification_is_memoized_until_invalidated(self):
+        """The memo is the price of hashing being affordable on every status
+        refresh: damage appearing after a clean check isn't seen until the
+        memo is invalidated (an install of that mod, or Refresh clearing it
+        whole - which is what this pins)."""
+        self._install("memo.m", "1.0.0")
+        self.assertIs(mm.verify_mod_files(self.game, "memo.m"), True)
+        with open(self._dll("memo.m"), "wb") as f:
+            f.write(b"corrupted after the check")
+        self.assertIs(mm.verify_mod_files(self.game, "memo.m"), True)   # stale, by design
+        mm._invalidate_verify_memo()
+        self.assertIs(mm.verify_mod_files(self.game, "memo.m"), False)
+
+    def test_reinstall_invalidates_the_memo_and_repairs(self):
+        self._install("fix.m", "1.0.0")
+        with open(self._dll("fix.m"), "wb") as f:
+            f.write(b"junk")
+        mm._invalidate_verify_memo()
+        self.assertIs(mm.verify_mod_files(self.game, "fix.m"), False)
+        self._install("fix.m", "1.0.0")    # reinstall over it
+        self.assertIs(mm.verify_mod_files(self.game, "fix.m"), True)
+
+    def test_handshake_entries_carry_the_artifact_sha(self):
+        """Additive advisory field; the fingerprint hash itself must not move
+        (it's byte-identical with TavernLib's C#)."""
+        self._install("s.m", "1.0.0")
+        mods_hash, _, entries, _ = mm.handshake_snapshot(self.game)
+        rec = read_json(os.path.join(self.game, "Mods", "s.m", "manifest.json"))
+        self.assertEqual(entries[0]["sha256"], rec["sha256"])
+        self.assertEqual(mods_hash,
+                         hashlib.sha256(b"s.m@1.0.0@req").hexdigest())
+
+
+class CacheIntegrityAndPruning(_FakeInstallFixture, unittest.TestCase):
+    """cache_restore_mod's restore-time verification and cache_store_mod's
+    version pruning. Same throwaway _tavern_data_dir patch as ClientModCache."""
+
+    def setUp(self):
+        super().setUp()
+        self.data_dir = tempfile.mkdtemp(prefix="tavern_appdata_")
+        self._saved_data_dir = layout._tavern_data_dir
+        layout._tavern_data_dir = lambda: self.data_dir
+        self.addCleanup(
+            lambda: setattr(layout, "_tavern_data_dir", self._saved_data_dir))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data_dir, ignore_errors=True))
+
+    def _install(self, mod_id, version, **over):
+        self._publish(mod_id, version, **over)
+        mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
+                               [self.BASE], self.progress.append, side="client")
+
+    def test_restore_verifies_and_discards_a_rotten_entry(self):
+        self._install("rot.m", "1.0.0")
+        mm.cache_store_mod(self.game, "rot.m")
+        entry = mm._cache_mod_dir("rot.m", "1.0.0")
+        with open(os.path.join(entry, "rot.m.dll"), "wb") as f:
+            f.write(b"bitrot")
+
+        with self.assertRaises(mm.ModManagerError) as ctx:
+            mm.cache_restore_mod(self.game, "rot.m", "1.0.0")
+        self.assertIn("rot.m", str(ctx.exception))
+        # The bad entry is gone (not poised to fail every future restore), and
+        # the installed copy was never touched.
+        self.assertFalse(os.path.isdir(entry))
+        self.assertIs(mm.verify_mod_files(self.game, "rot.m"), True)
+
+    def test_render_falls_back_to_download_when_the_cache_entry_is_bad(self):
+        self._install("fb.m", "1.0.0")
+        mm.cache_store_mod(self.game, "fb.m")
+        mm.uninstall_mod(self.game, "fb.m")
+        entry = mm._cache_mod_dir("fb.m", "1.0.0")
+        with open(os.path.join(entry, "fb.m.dll"), "wb") as f:
+            f.write(b"bitrot")
+
+        server_mods = [{"id": "fb.m", "version": "1.0.0", "client_side": True,
+                        "server_side": True, "parity_required": True}]
+        plan = mm.plan_join(self.game, server_mods, [summary("fb.m", ["1.0.0"])], [self.BASE])
+        entry_plan = next(e for e in plan.entries if e.mod_id == "fb.m")
+        self.assertTrue(entry_plan.cached)     # planned as a file move...
+        mm.render_active_set(self.game, plan, self.progress.append)
+        # ...but rendered as a verified download once the entry failed its
+        # restore-time check, leaving a correct install either way.
+        self.assertIs(mm.verify_mod_files(self.game, "fb.m"), True)
+        self.assertTrue(any("downloading instead" in m.lower() for m in self.progress))
+
+    def test_an_entry_without_a_files_map_still_restores(self):
+        """A cache entry stored from a pre-'files' install has nothing to
+        check against; restoring it unchecked mirrors verify_mod_files'
+        None."""
+        self._install("old.m", "1.0.0")
+        record_path = mm._mod_record_path(self.game, "old.m")
+        rec = read_json(record_path)
+        del rec["files"]
+        with io.open(record_path, "w", encoding="utf-8") as f:
+            json.dump(rec, f)
+        mm.cache_store_mod(self.game, "old.m")
+        mm.uninstall_mod(self.game, "old.m")
+        mm.cache_restore_mod(self.game, "old.m", "1.0.0")
+        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "old.m", "old.m.dll")))
+
+    def test_store_prunes_oldest_versions_past_the_cap(self):
+        base = os.path.join(mm._cache_base(), "pr.m")
+        for i, version in enumerate(["1.0.0", "1.1.0", "1.2.0", "1.3.0"]):
+            self._install("pr.m", version)
+            mm.cache_store_mod(self.game, "pr.m")
+            # Stamp distinct store times: pruning orders by directory mtime,
+            # and four stores can land within one clock tick.
+            os.utime(os.path.join(base, version), (1000 + i, 1000 + i))
+
+        kept = sorted(d for d in os.listdir(base) if not d.endswith(".caching"))
+        self.assertEqual(kept, ["1.1.0", "1.2.0", "1.3.0"])
+
+    def test_restoring_an_already_cached_version_does_not_prune(self):
+        """A re-store of a version already in the cache returns early - the
+        set must come through untouched, at or under the cap or not."""
+        base = os.path.join(mm._cache_base(), "pin.m")
+        for i, version in enumerate(["1.0.0", "1.1.0", "1.2.0"]):
+            self._install("pin.m", version)
+            mm.cache_store_mod(self.game, "pin.m")
+            os.utime(os.path.join(base, version), (1000 + i, 1000 + i))
+        self._install("pin.m", "1.0.0")
+        mm.cache_store_mod(self.game, "pin.m")    # early return: already cached
+        kept = sorted(d for d in os.listdir(base) if not d.endswith(".caching"))
+        self.assertEqual(kept, ["1.0.0", "1.1.0", "1.2.0"])
+
+
+class EnsureLibraries(_FakeInstallFixture, unittest.TestCase):
+    """ensure_mod_libraries: the bare-re-enable repair. A join that
+    deactivates a mod prunes its orphaned libraries; re-enabling from the
+    manager window is just a record rename, so this is what puts the
+    libraries back."""
+
+    def setUp(self):
+        super().setUp()
+        self.data_dir = tempfile.mkdtemp(prefix="tavern_appdata_")
+        self._saved_data_dir = layout._tavern_data_dir
+        layout._tavern_data_dir = lambda: self.data_dir
+        self.addCleanup(
+            lambda: setattr(layout, "_tavern_data_dir", self._saved_data_dir))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data_dir, ignore_errors=True))
+
+    LIB_URL = "https://x/NeededLib.dll"
+
+    def _install_with_lib(self, mod_id, version):
+        lib = {"name": "NeededLib", "download_url": self.LIB_URL,
+               "sha256": "", "filename": "NeededLib.dll"}
+        self._publish(mod_id, version, library_dependencies=[lib])
+        mm.install_mod_closure(self.game, summary(mod_id, [version]),
+                               [summary(mod_id, [version])],
+                               [self.BASE], self.progress.append, side="client")
+
+    def _lib_path(self):
+        return os.path.join(self.game, "UserLibs", "NeededLib.dll")
+
+    def test_restores_a_pruned_library_from_cache(self):
+        self._install_with_lib("lib.m", "1.0.0")
+        mm.cache_store_library(self.game, "NeededLib.dll")
+        os.remove(self._lib_path())
+        os.remove(self._lib_path() + ".meta.json")
+
+        restored = mm.ensure_mod_libraries(self.game, "lib.m", self.progress.append)
+        self.assertEqual(restored, ["NeededLib.dll"])
+        self.assertTrue(os.path.isfile(self._lib_path()))
+        self.assertTrue(any("cached" in m for m in self.progress))
+
+    def test_downloads_when_not_cached(self):
+        self._install_with_lib("lib.dl", "1.0.0")
+        os.remove(self._lib_path())
+        os.remove(self._lib_path() + ".meta.json")
+
+        restored = mm.ensure_mod_libraries(self.game, "lib.dl", self.progress.append)
+        self.assertEqual(restored, ["NeededLib.dll"])
+        self.assertTrue(os.path.isfile(self._lib_path()))
+        # And it lands in the cache, so the next prune/enable cycle is a move.
+        self.assertTrue(os.path.isdir(mm._cache_library_dir(
+            "NeededLib.dll", self._sha_for(self.LIB_URL))))
+
+    def test_noop_when_everything_is_in_place(self):
+        self._install_with_lib("lib.ok", "1.0.0")
+        self.assertEqual(mm.ensure_mod_libraries(self.game, "lib.ok"), [])
+
+    def test_noop_for_a_mod_with_no_libraries(self):
+        self._publish("nolib.m", "1.0.0")
+        mm.install_mod_closure(self.game, summary("nolib.m", ["1.0.0"]),
+                               [summary("nolib.m", ["1.0.0"])],
+                               [self.BASE], self.progress.append, side="client")
+        self.assertEqual(mm.ensure_mod_libraries(self.game, "nolib.m"), [])
+
+    def test_noop_for_a_mod_that_is_not_installed(self):
+        self.assertEqual(mm.ensure_mod_libraries(self.game, "ghost.m"), [])
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ from tavern_shared.mod_install import (
     _melonloader_installed, _tavernlib_installed,
 )
 from tavern_shared.theme import (
-    AMBER, BG, BORDER, CYAN, GREEN, MUTED, PARCH, SURF, _btn, _mk_scrollbar,
+    AMBER, BG, BORDER, CYAN, GREEN, MUTED, PARCH, RED, SURF, _btn, _mk_scrollbar,
 )
 from tavern_shared.window_chrome import _enable_dark_titlebar
 
@@ -38,12 +38,14 @@ class CommunityModsWindow(tk.Toplevel):
     _WIDTHS     = (90,       110,      160,   74,          64,       110)
     _STATE_WORD = {
         "missing":  "Available",
+        "damaged":  "Damaged",
         "current":  "Installed",
         "outdated": "Update ready",
         "unknown":  "Installed",
     }
     _PRIMARY_LABEL = {
         "missing":  "Install",
+        "damaged":  "Reinstall",
         "outdated": "Update",
         "current":  "Reinstall",
         "unknown":  "Reinstall",
@@ -87,7 +89,8 @@ class CommunityModsWindow(tk.Toplevel):
         # run by the time a window's _build() executes, but not yet at class
         # -definition time (module import).
         self._state_color = {
-            "missing": PARCH, "current": GREEN, "outdated": AMBER, "unknown": MUTED,
+            "missing": PARCH, "damaged": RED, "current": GREEN,
+            "outdated": AMBER, "unknown": MUTED,
         }
         h = tk.Frame(self, bg=SURF, height=44)
         h.pack(fill="x"); h.pack_propagate(False)

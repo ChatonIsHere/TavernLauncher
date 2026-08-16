@@ -44,8 +44,8 @@ class JoinPlan:
                              # any repo the client has configured - blocks launching
     needs_repo: list        # [(mod_id, version, source_repo)] required by the server and
                              # resolvable, but only from a repo the client hasn't added -
-                             # not blocking on its own; surfaced so the user can add the
-                             # repo and re-check
+                             # blocking (see `blocking` below), but with a row that names
+                             # the exact source to add, so the fix is in the user's hands
     pin_conflicts: list      # [(mod_id, pinned_version, server_version)] - a pinned mod's
                              # exact version disagrees with what the server runs; the
                              # user decides whether to unpin or accept the server's version
@@ -72,13 +72,21 @@ class JoinPlan:
 
     @property
     def blocking(self):
-        """True if this plan can't safely be applied at all - some mod the
-        server actually requires isn't resolvable from anywhere the client
-        knows of. needs_repo alone never blocks: it's
-        information for the user to act on, not a launch stopper by itself.
-        Neither does unresolved_pins: nothing the server asked for is missing,
-        so the join itself is fine."""
-        return bool(self.missing)
+        """True if applying this plan can't produce a joinable state - some
+        mod the server actually requires isn't going to be installed, either
+        because no configured repo has it (missing) or because the only repo
+        that does hasn't been added (needs_repo).
+
+        needs_repo used to be advisory-only, on the theory that it's
+        information for the user to act on rather than a hard stop. But a
+        required mod is required either way: an apply that skips it renders
+        everything else, then fails the post-render parity check with "mods
+        still don't match" - the user was invited to press a button that
+        could never succeed. Blocking up front, with the row still naming
+        exactly which source to add, is the honest version of the same
+        information. unresolved_pins still never blocks: nothing the server
+        asked for is missing, so the join itself is fine."""
+        return bool(self.missing or self.needs_repo)
 
 
 def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=None):
@@ -334,8 +342,11 @@ class DiffRow:
         """Only a mod the SERVER requires can stop a join. An unavailable mod
         the user pinned themselves gets the same ACTION_MISSING row - it is
         genuinely missing and worth seeing - but carries reason "pinned", and
-        nothing about it makes this server unjoinable."""
-        return self.action == ACTION_MISSING and self.reason == "required"
+        nothing about it makes this server unjoinable. A needs-repo row blocks
+        on the same terms as a missing one (JoinPlan.blocking explains why);
+        its note is what makes it the fixable variant."""
+        return ((self.action == ACTION_MISSING and self.reason == "required")
+                or self.action == ACTION_NEEDS_REPO)
 
 
 def build_mod_diff(game_dir, server_mods, plan):
@@ -395,7 +406,10 @@ def build_mod_diff(game_dir, server_mods, plan):
             mod_id=mod_id, server_version="", client_version=rec.get("version", ""),
             client_enabled=True, action=ACTION_DEACTIVATE, reason="", optional=True,
             source_repo=rec.get("source_repo", ""),
-            note="this server doesn't run it; keeping it on won't block your join",
+            note=("this server doesn't run it; keeping it on won't block your "
+                  "join. Pin keeps it enabled on every server, so it stops "
+                  "being offered for deactivation at all (same as Mod "
+                  "Manager's Keep Enabled)."),
             name=rec.get("name", mod_id)))
 
     seen = {r.mod_id for r in rows}
@@ -526,8 +540,9 @@ def render_active_set(game_dir, plan, on_progress=None, on_step=None):
     reports both, so the count a caller sized against is always reached."""
     if plan.blocking:
         raise ModManagerError(
-            "This plan has required mods that couldn't be resolved from any "
-            "configured repo; fix that before applying it.")
+            "This plan has required mods that can't be installed - not in any "
+            "repo you've added, or only in one you haven't added yet; fix that "
+            "before applying it.")
     progress = on_progress or (lambda *_a: None)
     step = on_step or (lambda *_a: None)
 
@@ -547,7 +562,17 @@ def render_active_set(game_dir, plan, on_progress=None, on_step=None):
             enable_mod(game_dir, entry.mod_id)
         elif entry.cached:
             progress(f"Installing {entry.mod_id} {entry.version} (cached)")
-            cache_restore_mod(game_dir, entry.mod_id, entry.version)
+            try:
+                cache_restore_mod(game_dir, entry.mod_id, entry.version)
+            except ModManagerError as e:
+                # The entry vanished or failed its restore-time verification
+                # (which also discarded it) between planning and now. The plan
+                # still carries the manifest, so the render degrades to what a
+                # non-cached entry does - a verified download - instead of
+                # dying over an optimization.
+                progress(f"Cache copy unusable ({e}) - downloading instead")
+                install_mod(game_dir, entry.manifest, progress)
+                cache_store_mod(game_dir, entry.mod_id)
         else:
             progress(f"Downloading {entry.mod_id} {entry.version}")
             install_mod(game_dir, entry.manifest, progress)
