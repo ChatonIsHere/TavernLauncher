@@ -7,7 +7,8 @@ import os
 
 from tavern_shared.paths import _sha256_file
 from tavern_shared.mod_install import (
-    _download_with_retries, _load_mod_meta, _save_mod_meta,
+    NEEDS_ATTENTION, _download_with_retries, _fetch_remote_fingerprint,
+    _file_matches_recorded, _load_mod_meta, _save_mod_meta,
     _verify_payload_type,
 )
 
@@ -29,31 +30,65 @@ def _patch_target_path(game_exe):
     return os.path.join(game_dir, PATCH_TARGET_SUBDIR, PATCH_TARGET_FILENAME)
 
 
-def _patch_is_applied(game_exe):
-    """True if the installed Root.Township.dll matches the hash apply_patch
-    most recently confirmed writing there, recorded in the per-game-dir meta
-    file (see _load_mod_meta).
+def _patch_status(game_exe):
+    """The same five states as _melonloader_status/_tavernlib_status, so the
+    Setup window can say "Update available" about the patch instead of a
+    binary applied/not — before this, a newly published patch release read
+    as "Up to date" forever, because nothing ever compared against GitHub.
 
-    Comparing against a local reference copy (the launcher used to bundle
-    one in Patch/) broke as soon as apply_patch used its GitHub download:
-    the installed file matched what had genuinely just been applied, but not
-    a bundled reference that was stale or missing, so this reported "not
-    applied" immediately after a successful patch. Hashing what we ourselves
-    last confirmed writing is correct regardless of what supplied it.
+    "Applied" means the installed Root.Township.dll matches the hash
+    apply_patch most recently confirmed writing there, recorded in the
+    per-game-dir meta file (see _load_mod_meta) — never a comparison
+    against some local reference copy (the launcher used to bundle one,
+    and comparing against it reported "not applied" immediately after a
+    successful GitHub download). The meta file lives in game_dir, not in
+    per-launcher state, so if the client launcher already patched a given
+    game install the server launcher (or vice versa) still sees it as
+    done, as long as both point at the same game folder.
 
-    The meta file lives in game_dir, not in per-launcher state, so if the
-    client launcher already patched a given game install the server launcher
-    (or vice versa) still sees it as done, as long as both point at the same
-    game folder. No re-patching, no re-flashing."""
+    One reading differs from the other two: Root.Township.dll always exists
+    in an unmodified game (it's the game's own file being replaced), so
+    presence proves nothing. With no recorded hash the file is just the
+    vanilla DLL and the answer is 'missing' (never patched), not 'unknown'
+    (patched, but by a launcher too old to record what it did). Those need
+    to stay apart: 'missing' flashes the Setup alert unconditionally,
+    'unknown' never does.
+
+    - missing:  no Root.Township.dll at all, or nothing recorded as applied
+    - damaged:  the file no longer matches what apply_patch last confirmed
+                writing — a game update overwrote it, or antivirus ate it
+    - outdated: applied and intact, but GitHub's fingerprint for the
+                published file has moved (same ETag approach as TavernLib:
+                the patch release stays on one tag, so tags can't tell)
+    - unknown:  applied and intact, but nothing to compare against — the
+                fingerprint predates being recorded, or GitHub is
+                unreachable; deliberately not an alarm either way
+    - current:  applied, intact, and matches what GitHub is serving"""
     game_dir = os.path.dirname(game_exe)
     dst = _patch_target_path(game_exe)
-    recorded = _load_mod_meta(game_dir).get("patch_sha256")
-    if not recorded or not os.path.isfile(dst):
-        return False
+    meta = _load_mod_meta(game_dir)
+    if not os.path.isfile(dst) or not meta.get("patch_sha256"):
+        return "missing"
+    if _file_matches_recorded(dst, meta.get("patch_sha256")) is False:
+        return "damaged"
+    installed_fp = meta.get("patch_fingerprint")
+    if not installed_fp:
+        return "unknown"
     try:
-        return _sha256_file(dst) == recorded
-    except OSError:
-        return False
+        latest_fp = _fetch_remote_fingerprint(PATCH_DOWNLOAD_URL)
+    except Exception:
+        return "unknown"
+    if not latest_fp:
+        return "unknown"
+    return "current" if latest_fp == installed_fp else "outdated"
+
+
+def _patch_needs_attention(game_exe):
+    """Whether the patch state should flash the main window's Setup alert,
+    by the same rule _mods_need_attention applies to MelonLoader/TavernLib:
+    missing/outdated/damaged do, and a failed update *check* (unknown) never
+    raises a false alarm on its own."""
+    return _patch_status(game_exe) in NEEDS_ATTENTION
 
 
 def apply_patch(game_exe, on_progress=None):
@@ -81,9 +116,10 @@ def apply_patch(game_exe, on_progress=None):
     tmp_dest = dst + ".download"
     try:
         on_progress("Checking for the latest patch…")
-        _download_with_retries(PATCH_DOWNLOAD_URL, tmp_dest, on_progress,
-                               require_length=True)
+        headers = _download_with_retries(PATCH_DOWNLOAD_URL, tmp_dest, on_progress,
+                                         require_length=True)
         _verify_payload_type(tmp_dest, PATCH_DOWNLOAD_URL, "dll")
+        fingerprint = headers.get("ETag") or headers.get("Last-Modified") or ""
 
         new_hash = _sha256_file(tmp_dest)
         already_current = os.path.isfile(dst) and _sha256_file(dst) == new_hash
@@ -104,11 +140,16 @@ def apply_patch(game_exe, on_progress=None):
                     "Folder Access, then try again.")
 
         # Record what is now confirmed to be sitting at dst, so
-        # _patch_is_applied (any launcher, any time) can recognise it. Only
+        # _patch_status (any launcher, any time) can recognise it. Only
         # reached once the swap has been read back and verified above — a
         # failed install never gets its hash recorded as the applied one.
+        # The fingerprint is GitHub's ETag for the published file — it
+        # answers _patch_status's "is a newer one out?" question, which the
+        # hash of what's on disk cannot (see _install_tavernlib).
         meta = _load_mod_meta(game_dir)
         meta["patch_sha256"] = new_hash
+        if fingerprint:
+            meta["patch_fingerprint"] = fingerprint
         _save_mod_meta(game_dir, meta)
 
         return "current" if already_current else "downloaded"

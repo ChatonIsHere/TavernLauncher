@@ -18,6 +18,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tavern_shared import mod_install as mi
+from tavern_shared import patch as pt
 
 
 class FakeResponse(io.BytesIO):
@@ -346,6 +347,80 @@ class DriftAfterInstall(unittest.TestCase):
     def test_a_deleted_file_is_missing_not_damaged(self):
         os.remove(self.tl)
         self.assertEqual(mi._tavernlib_status(self.game), "missing")
+
+
+class PatchStatus(unittest.TestCase):
+    """The patch used to be the one component with no update detection: a
+    binary applied/not-applied, so a newly published patch release read as
+    "Up to date" forever. It now answers the same five states as the other
+    two — with one reading of its own: Root.Township.dll always exists in an
+    unmodified game (it's the game's own file being replaced), so presence
+    proves nothing, and a vanilla DLL with nothing recorded is 'missing',
+    never 'unknown'."""
+
+    def setUp(self):
+        self.game = tempfile.mkdtemp(prefix="tavern_patch_")
+        self.exe = os.path.join(self.game, "A Township Tale.exe")
+        managed = os.path.join(self.game, pt.PATCH_TARGET_SUBDIR)
+        os.makedirs(managed)
+        self.dll = os.path.join(managed, pt.PATCH_TARGET_FILENAME)
+        with open(self.dll, "wb") as f:
+            f.write(b"PATCHED-BYTES")
+        mi._save_mod_meta(self.game, {
+            "patch_sha256": mi._sha256_file(self.dll),
+            "patch_fingerprint": '"etag-v1"',
+        })
+        self._real_fp = pt._fetch_remote_fingerprint
+        pt._fetch_remote_fingerprint = lambda *_a, **_k: '"etag-v1"'
+
+    def tearDown(self):
+        pt._fetch_remote_fingerprint = self._real_fp
+
+    def test_baseline_is_current(self):
+        self.assertEqual(pt._patch_status(self.exe), "current")
+        self.assertFalse(pt._patch_needs_attention(self.exe))
+
+    def test_a_new_release_is_outdated_not_current(self):
+        """The exact gap this status exists to close: applied, intact, and
+        stale. The old binary check called this applied and said nothing."""
+        pt._fetch_remote_fingerprint = lambda *_a, **_k: '"etag-v2"'
+        self.assertEqual(pt._patch_status(self.exe), "outdated")
+        self.assertTrue(pt._patch_needs_attention(self.exe))
+
+    def test_a_vanilla_dll_is_missing_not_unknown(self):
+        """The game's own Root.Township.dll sitting there, nothing recorded:
+        never patched. 'missing' alerts unconditionally; 'unknown' never
+        does — collapsing these would silence the first-run alert."""
+        mi._save_mod_meta(self.game, {})
+        self.assertEqual(pt._patch_status(self.exe), "missing")
+
+    def test_an_overwritten_patch_is_damaged(self):
+        """A game update replacing Root.Township.dll leaves a real DLL of a
+        plausible size in place — only the recorded hash can tell."""
+        with open(self.dll, "wb") as f:
+            f.write(b"VANILLA-AGAIN")
+        self.assertEqual(pt._patch_status(self.exe), "damaged")
+        self.assertTrue(pt._patch_needs_attention(self.exe))
+
+    def test_a_failed_update_check_is_unknown_and_never_alarms(self):
+        def _down(*_a, **_k):
+            raise OSError("network unreachable")
+        pt._fetch_remote_fingerprint = _down
+        self.assertEqual(pt._patch_status(self.exe), "unknown")
+        self.assertFalse(pt._patch_needs_attention(self.exe))
+
+    def test_a_legacy_install_without_fingerprint_is_unknown(self):
+        """Installs recorded before the fingerprint existed have no baseline
+        to compare against GitHub. That's 'unknown', not 'damaged' or a
+        false 'current' — and the next Install/Update records one."""
+        meta = mi._load_mod_meta(self.game)
+        del meta["patch_fingerprint"]
+        mi._save_mod_meta(self.game, meta)
+        self.assertEqual(pt._patch_status(self.exe), "unknown")
+
+    def test_a_deleted_dll_is_missing(self):
+        os.remove(self.dll)
+        self.assertEqual(pt._patch_status(self.exe), "missing")
 
 
 if __name__ == "__main__":

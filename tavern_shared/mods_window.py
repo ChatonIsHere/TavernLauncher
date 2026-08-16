@@ -22,11 +22,11 @@ from tavern_shared.theme import (
 )
 from tavern_shared.window_chrome import _start_hidden, _finish_dark_window
 from tavern_shared.manual_install import ManualInstallWindow
-from tavern_shared.patch import _patch_is_applied, apply_patch
+from tavern_shared.patch import _patch_status, apply_patch
 from tavern_shared.mod_install import (
-    DownloadError, _detect_exe_arch, _install_melonloader, _install_tavernlib,
-    _load_mod_meta, _melonloader_installed, _melonloader_status,
-    _tavernlib_status,
+    NEEDS_ATTENTION, DownloadError, _detect_exe_arch, _install_melonloader,
+    _install_tavernlib, _load_mod_meta, _melonloader_installed,
+    _melonloader_status, _tavernlib_status,
 )
 
 class SetupWindow(tk.Toplevel):
@@ -132,6 +132,7 @@ class SetupWindow(tk.Toplevel):
         btn._dotvar = dotvar
         btn._dotlabel = dot
         btn._notevar = notevar
+        btn._notelabel = note
         return btn
 
     # ── Status ───────────────────────────────────────────────────────────────
@@ -143,16 +144,21 @@ class SetupWindow(tk.Toplevel):
         "unknown":  ("●", MUTED, "⟳ Reinstall"),
         "current":  ("●", GREEN, "⟳ Reinstall"),
     }
+    # Every state gets a note — a row that says nothing reads as "probably
+    # fine", which is the one thing 'missing' and 'unknown' are not. The
+    # note is tinted to match the dot for the two states that ask for
+    # action, so "Update available" doesn't render in the same grey as
+    # "Up to date".
     _STATE_NOTE = {
-        "missing": "",
-        "outdated": "Update available.",
+        "missing":  ("Not installed yet.", MUTED),
+        "outdated": ("Update available — a newer version is published.", AMBER),
         # Deliberately says what was checked, not just that something is
         # wrong: this state exists to catch the case where the version looks
         # right and the file isn't, which is otherwise indistinguishable from
         # a healthy install.
-        "damaged": "Installed file doesn't match what was installed — repair it.",
-        "unknown": "",
-        "current": "Up to date.",
+        "damaged":  ("Installed file doesn't match what was installed — repair it.", RED),
+        "unknown":  ("Installed — couldn't check for updates.", MUTED),
+        "current":  ("Up to date.", MUTED),
     }
 
     def _refresh_states(self, keep_status=None):
@@ -168,7 +174,7 @@ class SetupWindow(tk.Toplevel):
         self._status.set("Checking status…" if keep_status is None else keep_status)
         exe, game_dir = self._exe, self._game_dir
         def worker():
-            patch_state = "current" if _patch_is_applied(exe) else "missing"
+            patch_state = _patch_status(exe)
             ml = _melonloader_status(game_dir)
             tl = _tavernlib_status(game_dir)
             ml_tag = _load_mod_meta(game_dir).get("melonloader_tag")
@@ -200,7 +206,9 @@ class SetupWindow(tk.Toplevel):
         btn._dotvar.set(dot)
         btn._dotlabel.config(fg=color)
         btn.config(text=text)
-        btn._notevar.set(self._STATE_NOTE[state])
+        note, note_color = self._STATE_NOTE[state]
+        btn._notevar.set(note)
+        btn._notelabel.config(fg=note_color)
 
     def _lock_row(self, btn, state, prior_state, prior_name):
         """Disables a step's button only when it's never been installed AND
@@ -294,13 +302,19 @@ class SetupWindow(tk.Toplevel):
         stage = ["Patch"]
 
         def worker():
+            # Each step runs on NEEDS_ATTENTION (missing/outdated/damaged) —
+            # the same rule that flashes the main window's Setup alert — and
+            # not on 'unknown', which means "installed, but the update CHECK
+            # didn't happen". Reinstalling over unknown would turn "GitHub
+            # unreachable but everything's already installed" into three
+            # guaranteed download failures instead of a completed no-op.
             try:
-                if not _patch_is_applied(exe):
+                if _patch_status(exe) in NEEDS_ATTENTION:
                     self.after(0, lambda: self._status.set("Applying patch…"))
                     apply_patch(exe, lambda m: self.after(0, lambda: self._status.set(m)))
 
                 stage[0] = "MelonLoader"
-                if _melonloader_status(game_dir) != "current":
+                if _melonloader_status(game_dir) in NEEDS_ATTENTION:
                     arch = _detect_exe_arch(exe)
                     if not arch:
                         raise RuntimeError(
@@ -311,7 +325,7 @@ class SetupWindow(tk.Toplevel):
                         lambda m: self.after(0, lambda: self._status.set(m)))
 
                 stage[0] = "TavernLib"
-                if _tavernlib_status(game_dir) != "current":
+                if _tavernlib_status(game_dir) in NEEDS_ATTENTION:
                     self.after(0, lambda: self._status.set("Installing TavernLib…"))
                     _install_tavernlib(game_dir,
                         lambda m: self.after(0, lambda: self._status.set(m)))
