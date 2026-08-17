@@ -39,10 +39,12 @@ Any other installer of these mods must match these byte-for-byte
   MelonLoader stops scanning. Uninstall = delete the folder.
 - The record carries `files`: `{relative path: sha256}` of everything the
   installer placed, hashed from staging before the record was written. This is
-  the damage-detection reference (see "Integrity layers"). Records written
-  before the field existed — or by TavernLib's C# installer, which doesn't
-  write it — simply have no damage detection: `verify_mod_files` returns
-  `None` there, never `False`.
+  the damage-detection reference (see "Integrity layers"). Keys are always
+  forward-slashed and hashes lowercase hex, on both sides: TavernLib's
+  `ModInstaller.HashTree` writes the same map and its `VerifyModFiles` reads
+  it, so either installer's record is checkable by the other. Records written
+  before the field existed simply have no damage detection:
+  `verify_mod_files` returns `None` there, never `False`.
 - Libraries (`library_dependencies`) install **flat** into `UserLibs/` with a
   `<filename>.meta.json` sidecar; the record's `libraries` list is how
   removal reference-counts them. Native DLLs must be libraries because
@@ -150,7 +152,11 @@ relaunch.
    `damaged` status in both windows (and the launcher buttons' attention
    count). Verification is memoized per install (zip bundles can be huge);
    an install/restore of that mod invalidates its entry, the manager's
-   Refresh clears the memo whole.
+   Refresh clears the memo whole. Headless servers run the same check from
+   `ModInstaller.VerifyModFiles`: reconcile re-checks a mod that's already at
+   its target version and reinstalls a damaged one, and `modmanager list`
+   marks it `[DAMAGED]`. No memo there — it's asked once per mod per boot,
+   not once per window open.
 3. Cache: `cache_restore_mod` re-verifies the staged copy against the
    record's `files` before swapping it in; a rotten entry is discarded and
    the render falls back to a fresh download.
@@ -193,8 +199,17 @@ install/update path for them would be guessing identities by filename.
   server is up advertises a set the live session isn't running. The server
   launcher warns and asks for a restart; it cannot restart the game safely
   itself.
+- The client's mirror of that problem is file locks, not staleness: Windows
+  keeps loaded assemblies open, so installs/removals/renders while the game
+  is up fail partway. Setup, the Mod Manager's write actions, and both sync
+  paths ask first (`tavern_shared/game_guard.py`), but the only signal is the
+  process the launcher itself started — a game launched some other way isn't
+  detected, and the prompt is overridable rather than a hard block.
 - The verify memo can report a stale "intact" for damage that arrives after
   a clean check (see Integrity layers) — bounded by Refresh and by every
   install/restore of the mod.
-- TavernLib's C# installer doesn't write the `files` map yet, so headless
-  installs have no damage detection until it does.
+- Mods installed before the `files` map shipped have no damage detection
+  until something rewrites their record — an update, a version change, or a
+  server join that reinstalls them. Deliberately not backfilled by hashing
+  what's on disk: that would record whatever is there now as canonical,
+  including the corruption this is meant to catch.

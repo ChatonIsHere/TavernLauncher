@@ -2825,9 +2825,9 @@ class DamageDetection(_FakeInstallFixture, unittest.TestCase):
                                        [summary("d.old", ["1.0.0", "2.0.0"])]), "damaged")
 
     def test_a_record_without_a_files_map_is_never_damaged(self):
-        """Pre-existing installs (and TavernLib's C# installer) have no map:
-        no evidence either way must read as None/current, or shipping this
-        would mark every existing install Damaged overnight."""
+        """Pre-existing installs, from before the field, have no map: no
+        evidence either way must read as None/current, or shipping this would
+        mark every existing install Damaged overnight."""
         self._install("legacy.m", "1.0.0")
         record_path = mm._mod_record_path(self.game, "legacy.m")
         rec = read_json(record_path)

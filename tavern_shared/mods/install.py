@@ -187,10 +187,14 @@ def verify_mod_files(game_dir, mod_id):
 
     Returns True (every recorded file present at its recorded hash), False
     (something is missing or altered - damaged), or None (nothing to check:
-    not installed, or the record predates the "files" map / was written by an
-    installer that doesn't record one, e.g. TavernLib's). None is deliberately
-    not False: claiming damage with no evidence would send every pre-existing
-    install to "Damaged" the moment this shipped."""
+    not installed, or the record predates the "files" map). None is
+    deliberately not False: claiming damage with no evidence would send every
+    pre-existing install to "Damaged" the moment this shipped.
+
+    TavernLib's C# installer writes the same map on the same terms
+    (ModInstaller.HashTree/VerifyModFiles), so a mod a headless server
+    installed is checkable here, and one installed here is checked by that
+    server's reconcile."""
     rec = _read_mod_record(game_dir, mod_id)
     if not rec:
         return None
@@ -223,10 +227,11 @@ def _mod_record(mod, files=None):
     It's what verify_mod_files checks, giving installed mods the same damaged
     detection the core components (patch/MelonLoader/TavernLib) have - without
     it a mod half-eaten by antivirus reads "Up to date" forever, because
-    mod_status only compares version numbers. Optional on read: a record
-    written before the field existed (or by TavernLib's C# installer, which
-    doesn't write it) simply has no damage detection, which verify_mod_files
-    reports as None, never as damaged.
+    mod_status only compares version numbers. TavernLib's C# installer writes
+    the same field, in the same shape, for the same reason, so the two
+    installers' records are interchangeable. Optional on read: a record
+    written before the field existed simply has no damage detection, which
+    verify_mod_files reports as None, never as damaged.
 
     Note there is NO placed-dll filename here: every operation works on the
     Mods/<id>/ folder (install swaps it, uninstall deletes it, update replaces it),
@@ -561,9 +566,9 @@ def mod_status(game_dir, mod_id, index):
     writing (verify_mod_files False) - antivirus ate a DLL, or a write was cut
     short. Checked before the version comparison because a damaged install's
     version number is a claim about files that are no longer there; a
-    reinstall fixes both at once. A record with no files map (pre-existing
-    install, or one written by TavernLib's C# installer) is never called
-    damaged - there's no evidence either way.
+    reinstall fixes both at once. A record with no files map (a pre-existing
+    install, from before the field) is never called damaged - there's no
+    evidence either way.
 
     "outdated" = the installed version is lower than the highest available across
     all repos (any major counts; a new major still shows as an available update,
