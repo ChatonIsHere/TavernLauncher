@@ -13,6 +13,7 @@ from tavern_shared.theme import (
     AMBER, AMBERDIM, BG, BORDER, CYAN, GREEN, MUTED, PARCH, RED, SURF, _btn,
     _mk_tree,
 )
+from tavern_shared.game_guard import confirm_while_game_running
 from tavern_shared.window_chrome import _enable_dark_titlebar
 
 from tavern_shared.mods.cache import ensure_mod_libraries
@@ -59,7 +60,8 @@ class ModManagerWindow(tk.Toplevel):
         "unknown":  "Installed",
     }
 
-    def __init__(self, parent, game_dir, side="client", on_change=None):
+    def __init__(self, parent, game_dir, side="client", on_change=None,
+                 is_game_running=None):
         super().__init__(parent)
         self.title("Mod Manager")
         self.configure(bg=BG)
@@ -68,6 +70,11 @@ class ModManagerWindow(tk.Toplevel):
         self._game_dir  = game_dir
         self._side      = side
         self._on_change = on_change
+        # Optional "is the game up?" check from the owning launcher (see
+        # tavern_shared.game_guard). The window itself opens either way -
+        # reading the table is harmless - and only the actions that write into
+        # Mods/ ask. A launcher that passes nothing behaves as before.
+        self._is_game_running = is_game_running
         self._index     = []      # list[ModSummary], the merged raw index
         self._rows      = {}      # row id -> row dict (see _rebuild_rows)
         self._busy      = False
@@ -298,6 +305,11 @@ class ModManagerWindow(tk.Toplevel):
 
     # -- actions --
 
+    def _allowed_now(self, action):
+        """Whether an action that writes into Mods/ should go ahead — see
+        tavern_shared.game_guard."""
+        return confirm_while_game_running(self, self._is_game_running, action)
+
     def _on_right_click(self, event):
         row = self._tree.identify_row(event.y)
         if not row:
@@ -363,6 +375,8 @@ class ModManagerWindow(tk.Toplevel):
     def _install_version(self, mod, version):
         if self._busy:
             return
+        if not self._allowed_now(f"Installing {mod.name}"):
+            return
         if not _melonloader_installed(self._game_dir):
             messagebox.showwarning("Install MelonLoader first",
                 f"{mod.name} is a MelonLoader mod. Install MelonLoader from the "
@@ -395,6 +409,11 @@ class ModManagerWindow(tk.Toplevel):
         r = self._rows.get(sel) if sel else None
         if not r or r["kind"] != "managed":
             return
+        # Asked before the confirm, not after: "the game has this open" changes
+        # whether the removal can work at all, so it isn't a footnote to a
+        # decision that's already been made.
+        if not self._allowed_now(f"Removing {r['name']}"):
+            return
         if not messagebox.askyesno("Remove mod",
                 f"Remove {r['name']} from your game?\n\nThis deletes its folder from "
                 "Mods/. Libraries shared with other installed mods are left in place.",
@@ -419,6 +438,12 @@ class ModManagerWindow(tk.Toplevel):
         if not r:
             return
         disabling = r["enabled"] is True
+        # A toggle is only a record rename, which usually survives a running
+        # game - but an ENABLE can also pull this mod's pinned libraries back
+        # into UserLibs/ (see below), and either way MelonLoader scanned Mods/
+        # at startup, so nothing here reaches the live session.
+        if not self._allowed_now(f"{'Disabling' if disabling else 'Enabling'} {r['name']}"):
+            return
         self._set_busy(True, f"{'Disabling' if disabling else 'Enabling'} {r['name']}...")
         game_dir, name, kind, key = self._game_dir, r["name"], r["kind"], r["key"]
         def worker():
@@ -483,7 +508,8 @@ class ModManagerWindow(tk.Toplevel):
             self._community_win.lift(); return
         self._community_win = CommunityModsWindow(
             self, self._game_dir, side=self._side,
-            on_change=lambda: self._load(force=True))
+            on_change=lambda: self._load(force=True),
+            is_game_running=self._is_game_running)
 
     def _on_export_modlist(self):
         if self._busy:
@@ -570,6 +596,8 @@ class ModManagerWindow(tk.Toplevel):
                 "\n".join(lines + ["", "There's nothing new to install or disable."])
                 if plan.untracked else
                 "This modlist has nothing new to install or disable.", parent=self)
+            return
+        if not self._allowed_now("Importing a modlist"):
             return
         if not messagebox.askyesno("Import modlist",
                 "\n".join(lines) + "\n\nInstall these now?", parent=self):

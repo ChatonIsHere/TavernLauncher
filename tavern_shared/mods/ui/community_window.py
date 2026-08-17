@@ -9,6 +9,7 @@ from tavern_shared.mod_install import (
 from tavern_shared.theme import (
     AMBER, BG, BORDER, CYAN, GREEN, MUTED, PARCH, RED, SURF, _btn, _mk_scrollbar,
 )
+from tavern_shared.game_guard import confirm_while_game_running
 from tavern_shared.window_chrome import _enable_dark_titlebar
 
 from tavern_shared.mods.cache import clear_mod_cache
@@ -57,7 +58,8 @@ class CommunityModsWindow(tk.Toplevel):
         (False, False): "-",
     }
 
-    def __init__(self, parent, game_dir, side="client", on_change=None):
+    def __init__(self, parent, game_dir, side="client", on_change=None,
+                 is_game_running=None):
         super().__init__(parent)
         self.title("Community Mods")
         self.configure(bg=BG)
@@ -66,6 +68,10 @@ class CommunityModsWindow(tk.Toplevel):
         self._game_dir  = game_dir
         self._side      = side
         self._on_change = on_change
+        # Handed down from the Mod Manager that opened this window, so an
+        # install started from the browse list asks the same question one
+        # started from the installed table does (see tavern_shared.game_guard).
+        self._is_game_running = is_game_running
         self._index     = []      # list[ModSummary], the merged raw index
         self._rows      = {}      # id -> row dict (see _rebuild_rows)
         self._visible_ids = []    # ids currently shown, filtered + sorted
@@ -412,6 +418,9 @@ class CommunityModsWindow(tk.Toplevel):
         """Installs `mod`'s closure, at `version` if given, else
         mod.highest() (the ordinary Install/Update/Reinstall path)."""
         if self._busy:
+            return
+        if not confirm_while_game_running(self, self._is_game_running,
+                                          f"Installing {mod.name}"):
             return
         if not _melonloader_installed(self._game_dir):
             messagebox.showwarning("Install MelonLoader first",
