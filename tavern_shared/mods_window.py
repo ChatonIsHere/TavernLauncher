@@ -20,6 +20,7 @@ from tavern_shared.theme import (
     BG, SURF, BORDER, AMBER, PARCH, MUTED, GREEN, RED,
     CYAN, _btn, _section_label,
 )
+from tavern_shared.game_guard import confirm_while_game_running
 from tavern_shared.window_chrome import _start_hidden, _finish_dark_window
 from tavern_shared.manual_install import ManualInstallWindow
 from tavern_shared.patch import _patch_status, apply_patch
@@ -37,7 +38,8 @@ class SetupWindow(tk.Toplevel):
     blocks re-running a step that's already installed (an update or a
     reinstall), even if an earlier step has since gone missing again."""
 
-    def __init__(self, parent, exe_path, on_status_change=None):
+    def __init__(self, parent, exe_path, on_status_change=None,
+                 is_game_running=None):
         super().__init__(parent)
         _start_hidden(self)
         self.title("Setup")
@@ -48,6 +50,13 @@ class SetupWindow(tk.Toplevel):
         self._game_dir = os.path.dirname(exe_path)
         self._busy = False
         self._on_status_change = on_status_change
+        # Optional: the client launcher passes its own "is the game up?" check
+        # (see tavern_shared.game_guard). Every step here replaces a file the
+        # running game has loaded — Root.Township.dll, MelonLoader's own
+        # assemblies, TavernLib.dll — so all three are worth asking about. A
+        # caller with no such check (the server launcher) gets today's
+        # behaviour unchanged.
+        self._is_game_running = is_game_running
         self._build()
         self.update_idletasks()
         self.geometry(f"520x{self.winfo_reqheight()}")
@@ -242,8 +251,14 @@ class SetupWindow(tk.Toplevel):
         self._tl_btn.config(state=state)
         self._status.set(msg)
 
+    def _allowed_now(self, action):
+        """Whether a step that rewrites the game folder should go ahead — see
+        tavern_shared.game_guard."""
+        return confirm_while_game_running(self, self._is_game_running, action)
+
     def _on_patch_click(self):
         if self._busy: return
+        if not self._allowed_now("Replacing the game's patched assembly"): return
         self._set_busy(True, "Checking for the latest patch…")
         exe = self._exe
         def worker():
@@ -263,6 +278,7 @@ class SetupWindow(tk.Toplevel):
 
     def _on_melonloader_click(self):
         if self._busy: return
+        if not self._allowed_now("Installing MelonLoader"): return
         arch = _detect_exe_arch(self._exe)
         if not arch:
             messagebox.showerror("Can't tell architecture",
@@ -284,6 +300,7 @@ class SetupWindow(tk.Toplevel):
 
     def _on_tavernlib_click(self):
         if self._busy: return
+        if not self._allowed_now("Installing TavernLib"): return
         if not _melonloader_installed(self._game_dir):
             messagebox.showwarning("Install MelonLoader first",
                 "TavernLib is a MelonLoader plugin — install MelonLoader above first.", parent=self)
@@ -303,6 +320,7 @@ class SetupWindow(tk.Toplevel):
 
     def _on_automatic_setup(self):
         if self._busy: return
+        if not self._allowed_now("Running setup"): return
         self._set_busy(True, "Running automatic setup…")
         exe, game_dir = self._exe, self._game_dir
 

@@ -34,6 +34,7 @@ from tavern_shared.mod_install import (
 )
 from tavern_shared.patch import _patch_needs_attention
 from tavern_shared.paths import _delete_last_rejection_file, _last_rejection_path
+from tavern_shared.game_guard import confirm_while_game_running, game_is_running
 from tavern_shared.mods_window import SetupWindow
 from tavern_shared import mods
 from tavern_shared.mods.ui.manager_window import ModManagerWindow
@@ -111,6 +112,11 @@ class ClientLauncher(tk.Tk):
         # couldn't identify. Advisory only; see _report_server_untracked.
         self._server_untracked = []
         self._mod_manager_win = None
+        # The game process this launcher last started, kept so every path that
+        # writes into the game folder can ask whether it's still holding those
+        # files open (see _game_is_running). Survives the process exiting -
+        # poll() answers correctly either way.
+        self._game_proc = None
         self._build_ui()
         self._load()
         # Start at exactly the size the fully-built layout needs, then set
@@ -688,13 +694,23 @@ class ClientLauncher(tk.Tk):
         if host:
             win.v_host.set(host)
 
+    def _game_is_running(self):
+        """Whether the game this launcher started is still up, and therefore
+        still holding the files in Mods/ (and MelonLoader's own) open. Every
+        window that writes into the game folder gets this as a callback rather
+        than a snapshot, so it asks at the moment of the action rather than at
+        the moment it opened — a player can easily open the Mod Manager,
+        launch, and come back."""
+        return game_is_running(self._game_proc)
+
     def _open_setup(self):
         exe = self.v_exe.get().strip()
         if not exe or not os.path.isfile(exe):
             messagebox.showerror("Game not found",
                 "Please set the path to 'A Township Tale.exe' above first.", parent=self)
             return
-        SetupWindow(self, exe, on_status_change=self._refresh_setup_alert)
+        SetupWindow(self, exe, on_status_change=self._refresh_setup_alert,
+                    is_game_running=self._game_is_running)
 
     def _open_mod_manager(self):
         exe = self.v_exe.get().strip()
@@ -704,9 +720,12 @@ class ClientLauncher(tk.Tk):
             return
         if self._mod_manager_win and self._mod_manager_win.winfo_exists():
             self._mod_manager_win.lift(); return
+        # Browsing is harmless while the game runs, so the window opens either
+        # way; the guard is on the actions that actually write.
         self._mod_manager_win = ModManagerWindow(
             self, os.path.dirname(exe), side="client",
-            on_change=self._refresh_setup_alert)
+            on_change=self._refresh_setup_alert,
+            is_game_running=self._game_is_running)
 
     def _open_addons(self):
         from client.core import addon_loader
@@ -922,6 +941,11 @@ class ClientLauncher(tk.Tk):
         if not exe or not os.path.isfile(exe):
             messagebox.showerror("Game not found",
                 "Please set the path to 'A Township Tale.exe' above first.", parent=self)
+            return
+
+        if not confirm_while_game_running(self, self._game_is_running,
+                                          "Syncing this server's mods"):
+            self._print("The game is running; close it first, then sync.", "warn")
             return
 
         game_dir = os.path.dirname(exe)
@@ -1194,6 +1218,17 @@ class ClientLauncher(tk.Tk):
         leave a mismatch that would otherwise only surface as an in-game
         rejection."""
         game_dir = os.path.dirname(exe)
+        # Asked before anything is fetched or resolved, not just before the
+        # render: a session already running has Mods/ open, so the render would
+        # fail partway AND the launch below it would be a second copy of the
+        # game. The player can override, because a wedged session they're about
+        # to kill shouldn't lock them out of their own launcher.
+        if not confirm_while_game_running(self, self._game_is_running,
+                                          "Syncing this server's mods"):
+            self._print("The game is already running; close it first, then "
+                        "join again.", "warn")
+            self._set_sync_busy(False)
+            return
         self._set_sync_busy(True)
 
         def abort(msg=None, tag="err"):
@@ -1513,6 +1548,10 @@ class ClientLauncher(tk.Tk):
             # skip AllocConsole); showing it means leaving them alone.
             proc = subprocess.Popen(args, cwd=os.path.dirname(exe),
                                     **self._popen_console_kwargs())
+            # Held on the launcher, not just handed to the watcher thread:
+            # everything that installs, removes, or renders mods asks this
+            # handle whether the game still has the folder open first.
+            self._game_proc = proc
             self._print(f"Game running (PID {proc.pid})", "ok")
             threading.Thread(target=self._watch_for_rejection,
                              args=(proc, host, relaunch), daemon=True).start()
