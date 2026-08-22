@@ -464,6 +464,18 @@ class ModDiffWindow(tk.Toplevel):
                 _, label, _ = self._action_widgets[item_id]
                 label.config(text=self._action_text(item_id), fg=self._row_color(item_id))
 
+    def retarget(self, plan):
+        """The plan being applied was replaced after Apply was pressed, because
+        a decline the user took back had to be re-resolved before it could be
+        rendered at all. The rows still describe the same choices, but the
+        progress bar was sized for the old plan, so re-measure it here rather
+        than let it fill and sit there while work carries on."""
+        if self._closed:
+            return
+        self._plan = plan
+        self._steps_total = render_plan_steps(plan)
+        self._draw_bar()
+
     def apply_finished(self, ok, message=""):
         """The render is over. On success with close_on_success the window gets
         out of the way so the caller can carry on; otherwise the outcome stays

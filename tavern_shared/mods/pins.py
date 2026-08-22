@@ -49,9 +49,11 @@ def list_declined(cfg, host):
 def set_declined(cfg, host, mod_ids):
     """Records this server's declined set, replacing whatever was there - the
     window hands back the whole set each time, including choices taken back, so
-    it's a write not a merge. Saves via the injected save_cfg, same convention
-    as add_repo/add_pin. A server with nothing declined drops out entirely
-    rather than leaving an empty list behind."""
+    it's a write not a merge. Saves via require_save_cfg, NOT the soft save_cfg
+    its siblings use: the window expects the whole set to stick, so an unwired
+    config is a hard error here rather than a silently lost write. A server
+    with nothing declined drops out entirely rather than leaving an empty list
+    behind."""
     save = require_save_cfg()
     table = dict(cfg.get(CFG_DECLINED_KEY) or {})
     ids = sorted(set(mod_ids or []))
