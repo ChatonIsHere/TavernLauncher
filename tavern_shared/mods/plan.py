@@ -4,17 +4,16 @@ import os
 from dataclasses import dataclass
 
 from tavern_shared.mods.cache import (
-    _cache_library_dir, _cache_mod_dir, cache_restore_library,
-    cache_restore_mod, cache_store_library, cache_store_mod,
+    _cache_mod_dir, _ensure_library, cache_restore_mod, cache_store_library,
+    cache_store_mod,
 )
 from tavern_shared.mods.errors import ModManagerError, _warn
 from tavern_shared.mods.install import (
-    _read_mod_record, _read_sidecar, collect_library_dependencies, disable_mod,
-    enable_mod, install_library_dependency, install_mod, list_installed_mods,
+    _read_mod_record, collect_library_dependencies, disable_mod, enable_mod,
+    install_mod, list_installed_mods,
 )
 from tavern_shared.mods.layout import (
-    _disabled_record_path, _library_sidecar_path, _safe_basename,
-    _userlibs_dir,
+    _disabled_record_path, _safe_basename, _userlibs_dir,
 )
 from tavern_shared.mods.manifest import parity_required
 from tavern_shared.mods.pins import _parse_pin_entry
@@ -582,18 +581,10 @@ def render_active_set(game_dir, plan, on_progress=None, on_step=None):
     for lib in plan.libraries:
         filename = _safe_basename(lib.filename)
         step(filename, "start")
-        dest = os.path.join(_userlibs_dir(game_dir), filename)
-        existing = _read_sidecar(_library_sidecar_path(game_dir, filename))
-        if os.path.isfile(dest) and existing and existing.get("sha256") == lib.sha256:
-            step(filename, "done")
-            continue     # already active with the exact pinned content
-        if os.path.isdir(_cache_library_dir(filename, lib.sha256)):
-            progress(f"Installing library {filename} (cached)")
-            cache_restore_library(game_dir, filename, lib.sha256)
-        else:
-            progress(f"Downloading library {filename}")
-            install_library_dependency(game_dir, lib, progress)
-            cache_store_library(game_dir, filename)
+        # One already active at the exact pinned content is a no-op inside
+        # _ensure_library, but both steps still report either way (see the
+        # docstring above).
+        _ensure_library(game_dir, lib, progress, verb="Installing")
         step(filename, "done")
 
     for mod_id in plan.to_deactivate:
