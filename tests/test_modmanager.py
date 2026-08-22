@@ -113,6 +113,20 @@ def slim_index(mods):
     return {"index_version": 1, "mods": mods}
 
 
+def _srv(mod_id, version, client=True, server=True, required=None,
+         source_repo=None):
+    """One entry of a server's handshake mods list, as plan_join receives
+    them. parity_required is always stated - True unless `required` says
+    otherwise - because the absent-field case is its own contract (a raise),
+    pinned by test_a_server_entry_without_the_field_fails_the_plan."""
+    entry = {"id": mod_id, "version": version,
+             "client_side": client, "server_side": server,
+             "parity_required": True if required is None else required}
+    if source_repo is not None:
+        entry["source_repo"] = source_repo
+    return entry
+
+
 def read_json(path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -644,6 +658,29 @@ class _FakeInstallFixture:
         self.manifests[url] = d
         return d
 
+    def _install(self, mod_id, version="1.0.0", **over):
+        """Publish + closure-install one mod: the installed state most cases
+        start from."""
+        self._publish(mod_id, version, **over)
+        mm.install_mod_closure(self.game, summary(mod_id, [version]),
+                               [summary(mod_id, [version])], [self.BASE],
+                               self.progress.append, side="client")
+
+
+class _TempDataDirFixture(_FakeInstallFixture):
+    """_FakeInstallFixture plus _tavern_data_dir pointed at a throwaway temp
+    dir, for anything that touches the client mod cache - tests must never
+    read or write the real %AppData%. Replaced on the layout module because
+    cache.py reads it through the module at call time (see the note there)."""
+
+    def setUp(self):
+        super().setUp()
+        self.data_dir = tempfile.mkdtemp(prefix="tavern_appdata_")
+        saved = layout._tavern_data_dir
+        layout._tavern_data_dir = lambda: self.data_dir
+        self.addCleanup(lambda: setattr(layout, "_tavern_data_dir", saved))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data_dir, ignore_errors=True))
+
 
 class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
     def test_full_closure_install_lands_files_and_sidecars(self):
@@ -708,6 +745,26 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
                                [self.BASE], self.progress.append, side="client")
         self.assertEqual(mm.mod_status(self.game, "s.s", [summary("s.s", ["1.0.0"])]), "current")
         self.assertEqual(mm.mod_status(self.game, "s.s", [summary("s.s", ["1.0.0", "1.1.0"])]), "outdated")
+
+    def test_status_agrees_with_the_listings_about_a_legacy_record(self):
+        """A record written before parity_required existed isn't ours by the
+        listings' test, so mod_status must not call it installed either - the
+        Community Mods window and the Mod Manager table would otherwise
+        describe the same folder two different ways."""
+        self._publish("legacy.m", "1.0.0")
+        index = [summary("legacy.m", ["1.0.0"])]
+        mm.install_mod_closure(self.game, summary("legacy.m", ["1.0.0"]), index,
+                               [self.BASE], self.progress.append, side="client")
+
+        record = os.path.join(self.game, "Mods", "legacy.m", "manifest.json")
+        rec = read_json(record)
+        del rec["parity_required"]
+        with open(record, "w", encoding="utf-8") as f:
+            json.dump(rec, f)
+
+        self.assertEqual(mm.mod_status(self.game, "legacy.m", index), "missing")
+        self.assertEqual([m["id"] for m in mm.list_installed_mods(self.game)], [])
+        self.assertEqual([u["name"] for u in mm.list_untracked_mods(self.game)], ["legacy.m"])
 
     def test_uninstall_removes_mod_and_its_orphaned_library(self):
         lib = {"name": "OrphanLib", "download_url": "https://x/OrphanLib.dll",
@@ -824,12 +881,6 @@ class UntrackedMods(_FakeInstallFixture, unittest.TestCase):
         with io.open(path, "w", encoding="utf-8") as f:
             f.write(content)
         return path
-
-    def _install(self, mod_id, version="1.0.0"):
-        self._publish(mod_id, version)
-        mm.install_mod_closure(self.game, summary(mod_id, [version]),
-                               [summary(mod_id, [version])], [self.BASE],
-                               self.progress.append, side="client")
 
     def _names(self):
         return {u["name"]: u for u in mm.list_untracked_mods(self.game)}
@@ -1093,25 +1144,10 @@ class HandshakeSnapshot(_FakeInstallFixture, unittest.TestCase):
         self.assertEqual(mods_hash, expected)
 
 
-class DisplacedFolders(_FakeInstallFixture, unittest.TestCase):
+class DisplacedFolders(_TempDataDirFixture, unittest.TestCase):
     """Installing over a Mods/<id>/ folder we didn't create moves it aside
     instead of deleting it. TavernLib's ClearInstallPath does the same thing for
     headless servers, where there's nobody to prompt."""
-
-    def setUp(self):
-        super().setUp()
-        self.data_dir = tempfile.mkdtemp(prefix="tavern_appdata_")
-        self._saved_data_dir = layout._tavern_data_dir
-        layout._tavern_data_dir = lambda: self.data_dir
-        self.addCleanup(
-            lambda: setattr(layout, "_tavern_data_dir", self._saved_data_dir))
-        self.addCleanup(lambda: __import__("shutil").rmtree(self.data_dir, ignore_errors=True))
-
-    def _install(self, mod_id, version="1.0.0"):
-        self._publish(mod_id, version)
-        mm.install_mod_closure(self.game, summary(mod_id, [version]),
-                               [summary(mod_id, [version])], [self.BASE],
-                               self.progress.append, side="client")
 
     def _foreign(self, name, marker="theirs"):
         """A folder at Mods/<name>/ that isn't ours: a manifest with no id, so it
@@ -1181,24 +1217,9 @@ class DisplacedFolders(_FakeInstallFixture, unittest.TestCase):
             self.assertEqual(f.read(), "theirs, mid-join")
 
 
-class ClientModCache(_FakeInstallFixture, unittest.TestCase):
+class ClientModCache(_TempDataDirFixture, unittest.TestCase):
     """The client mod cache: mod_cache/<id>/<version>/ and the library
-    equivalent, keyed by filename+sha256. Points _tavern_data_dir at a throwaway
-    temp dir so tests never touch the real %AppData%."""
-
-    def setUp(self):
-        super().setUp()
-        self.data_dir = tempfile.mkdtemp(prefix="tavern_appdata_")
-        self._saved_data_dir = layout._tavern_data_dir
-        layout._tavern_data_dir = lambda: self.data_dir
-        self.addCleanup(
-            lambda: setattr(layout, "_tavern_data_dir", self._saved_data_dir))
-        self.addCleanup(lambda: __import__("shutil").rmtree(self.data_dir, ignore_errors=True))
-
-    def _install(self, mod_id, version, **over):
-        self._publish(mod_id, version, **over)
-        mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
-                               [self.BASE], self.progress.append, side="client")
+    equivalent, keyed by filename+sha256."""
 
     def test_store_then_restore_round_trip(self):
         self._install("c.m", "1.0.0")
@@ -1283,39 +1304,18 @@ class ClientModCache(_FakeInstallFixture, unittest.TestCase):
         self.assertEqual(mm.adopt_installed_mods(self.game), [])
 
 
-class PlanJoin(_FakeInstallFixture, unittest.TestCase):
-    """plan_join: the pure resolution core. Points _tavern_data_dir at a
-    throwaway temp dir (needed for the cached/active-entry checks) the same
-    way ClientModCache does."""
+class PlanJoin(_TempDataDirFixture, unittest.TestCase):
+    """plan_join: the pure resolution core. The temp _tavern_data_dir is
+    needed for the cached/active-entry checks."""
 
     OTHER = OTHER
-
-    def setUp(self):
-        super().setUp()
-        self.data_dir = tempfile.mkdtemp(prefix="tavern_appdata_")
-        self._saved_data_dir = layout._tavern_data_dir
-        layout._tavern_data_dir = lambda: self.data_dir
-        self.addCleanup(
-            lambda: setattr(layout, "_tavern_data_dir", self._saved_data_dir))
-        self.addCleanup(lambda: __import__("shutil").rmtree(self.data_dir, ignore_errors=True))
-
-    def _install(self, mod_id, version, **over):
-        self._publish(mod_id, version, **over)
-        mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
-                               [self.BASE], self.progress.append, side="client")
 
     def _entry(self, plan, mod_id):
         return next(e for e in plan.entries if e.mod_id == mod_id)
 
-    @staticmethod
-    def _srv(mod_id, version, client=True, server=True, required=None):
-        return {"id": mod_id, "version": version,
-                "client_side": client, "server_side": server,
-                "parity_required": True if required is None else required}
-
     def test_required_mod_becomes_active_entry(self):
         self._publish("req.m", "1.0.0")
-        server_mods = [{"id": "req.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        server_mods = [_srv("req.m", "1.0.0")]
         index = [summary("req.m", ["1.0.0"])]
 
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
@@ -1329,7 +1329,7 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
         self.assertFalse(entry.active)
 
     def test_server_side_only_mod_not_required(self):
-        server_mods = [{"id": "srv.m", "version": "1.0.0", "client_side": False, "server_side": True, "parity_required": True}]
+        server_mods = [_srv("srv.m", "1.0.0", client=False)]
         plan = mm.plan_join(self.game, server_mods, [], [self.BASE])
         self.assertEqual(plan.entries, [])
         self.assertEqual(plan.missing, [])
@@ -1337,7 +1337,7 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
     def test_dependency_pulled_in_with_reason_dependency(self):
         self._publish("dep.k", "1.0.0")
         self._publish("root.m", "1.0.0", dependencies={"dep.k": "1.0.0"})
-        server_mods = [{"id": "root.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        server_mods = [_srv("root.m", "1.0.0")]
         index = [summary("dep.k", ["1.0.0"]), summary("root.m", ["1.0.0"])]
 
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
@@ -1345,7 +1345,7 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
                          {"root.m": "required", "dep.k": "dependency"})
 
     def test_missing_required_mod_blocks_with_no_hint(self):
-        server_mods = [{"id": "ghost.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        server_mods = [_srv("ghost.m", "1.0.0")]
         plan = mm.plan_join(self.game, server_mods, [], [self.BASE])
         self.assertTrue(plan.blocking)
         self.assertEqual(plan.missing, [("ghost.m", "1.0.0")])
@@ -1358,9 +1358,7 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
         could never succeed. The distinction that matters survives in the
         list itself: needs_repo names the exact source to add, missing has
         nothing to suggest."""
-        server_mods = [{"id": "elsewhere.m", "version": "1.0.0", "client_side": True,
-                        "server_side": True, "parity_required": True,
-                        "source_repo": self.OTHER}]
+        server_mods = [_srv("elsewhere.m", "1.0.0", source_repo=self.OTHER)]
         plan = mm.plan_join(self.game, server_mods, [], [self.BASE])
         self.assertTrue(plan.blocking)
         self.assertEqual(plan.missing, [])
@@ -1405,7 +1403,7 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
         """The whole point: the join goes ahead, carrying everything the server
         actually asked for."""
         self._publish("req.m", "1.0.0")
-        server_mods = [self._srv("req.m", "1.0.0")]
+        server_mods = [_srv("req.m", "1.0.0")]
         plan = mm.plan_join(self.game, server_mods, [summary("req.m", ["1.0.0"])],
                             [self.BASE], pinned=["ghost.pin"])
         self.assertFalse(plan.blocking)
@@ -1418,9 +1416,8 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
         so putting one there stated the opposite of the truth - and forced the
         comparison window open on every join over a mod the server would have
         let the player in without."""
-        server_mods = [{"id": "opt.elsewhere", "version": "1.0.0", "client_side": True,
-                        "server_side": True, "parity_required": False,
-                        "source_repo": self.OTHER}]
+        server_mods = [_srv("opt.elsewhere", "1.0.0", required=False,
+                            source_repo=self.OTHER)]
         plan = mm.plan_join(self.game, server_mods, [], [self.BASE])
         self.assertFalse(plan.blocking)
         self.assertEqual(plan.needs_repo, [])
@@ -1429,9 +1426,7 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
 
     def test_a_required_mod_from_an_unadded_repo_is_still_needs_repo(self):
         """The reordering above must not cost the required case its hint."""
-        server_mods = [{"id": "req.elsewhere", "version": "1.0.0", "client_side": True,
-                        "server_side": True, "parity_required": True,
-                        "source_repo": self.OTHER}]
+        server_mods = [_srv("req.elsewhere", "1.0.0", source_repo=self.OTHER)]
         plan = mm.plan_join(self.game, server_mods, [], [self.BASE])
         self.assertEqual(plan.needs_repo, [("req.elsewhere", "1.0.0", self.OTHER)])
 
@@ -1441,7 +1436,7 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
         with nothing on screen to say so."""
         self._publish("rec.conf", "1.0.0", parity_required=False)
         self._publish("rec.conf", "2.0.0", parity_required=False)
-        server_mods = [self._srv("rec.conf", "1.0.0", required=False)]
+        server_mods = [_srv("rec.conf", "1.0.0", required=False)]
         index = [summary("rec.conf", ["1.0.0"]), summary("rec.conf", ["2.0.0"])]
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE],
                             pinned=["rec.conf@2.0.0"])
@@ -1453,7 +1448,7 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
         over a change that isn't happening."""
         self._publish("rec.conf", "1.0.0", parity_required=False)
         self._publish("rec.conf", "2.0.0", parity_required=False)
-        server_mods = [self._srv("rec.conf", "1.0.0", required=False)]
+        server_mods = [_srv("rec.conf", "1.0.0", required=False)]
         index = [summary("rec.conf", ["1.0.0"]), summary("rec.conf", ["2.0.0"])]
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE],
                             pinned=["rec.conf@2.0.0"], declined=["rec.conf"])
@@ -1462,7 +1457,7 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
     def test_an_unresolvable_required_mod_is_not_also_a_pin_conflict(self):
         """It's already reported as blocking; a second complaint about the
         version it would have been is noise."""
-        server_mods = [self._srv("ghost.m", "1.0.0")]
+        server_mods = [_srv("ghost.m", "1.0.0")]
         plan = mm.plan_join(self.game, server_mods, [], [self.BASE],
                             pinned=["ghost.m@2.0.0"])
         self.assertTrue(plan.blocking)
@@ -1470,7 +1465,7 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
 
     def test_pin_conflict_when_server_requires_a_different_exact_version(self):
         self._publish("conf.m", "2.0.0")
-        server_mods = [{"id": "conf.m", "version": "2.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        server_mods = [_srv("conf.m", "2.0.0")]
         index = [summary("conf.m", ["1.0.0", "2.0.0"])]
 
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE], pinned=["conf.m@1.0.0"])
@@ -1482,7 +1477,7 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
 
     def test_active_true_when_already_installed_at_matching_version(self):
         self._install("act.m", "1.0.0")
-        server_mods = [{"id": "act.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        server_mods = [_srv("act.m", "1.0.0")]
         index = [summary("act.m", ["1.0.0"])]
 
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
@@ -1493,7 +1488,7 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
         self._install("cch.m", "1.0.0")
         mm.cache_store_mod(self.game, "cch.m")
         mm.uninstall_mod(self.game, "cch.m")
-        server_mods = [{"id": "cch.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        server_mods = [_srv("cch.m", "1.0.0")]
         index = [summary("cch.m", ["1.0.0"])]
 
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
@@ -1516,51 +1511,31 @@ class PlanJoin(_FakeInstallFixture, unittest.TestCase):
         lib_url = "https://x/PlanLib.dll"
         lib = {"name": "PlanLib", "download_url": lib_url, "sha256": "", "filename": "PlanLib.dll"}
         self._publish("root.m", "1.0.0", library_dependencies=[dict(lib)])
-        server_mods = [{"id": "root.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        server_mods = [_srv("root.m", "1.0.0")]
         index = [summary("root.m", ["1.0.0"])]
 
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
         self.assertEqual([l.filename for l in plan.libraries], ["PlanLib.dll"])
 
 
-class ModDiff(_FakeInstallFixture, unittest.TestCase):
+class ModDiff(_TempDataDirFixture, unittest.TestCase):
     """build_mod_diff: the client-vs-server comparison the diff window renders.
     Pure, so none of this needs a display."""
-
-    def setUp(self):
-        super().setUp()
-        self.data_dir = tempfile.mkdtemp(prefix="tavern_appdata_")
-        self._saved_data_dir = layout._tavern_data_dir
-        layout._tavern_data_dir = lambda: self.data_dir
-        self.addCleanup(
-            lambda: setattr(layout, "_tavern_data_dir", self._saved_data_dir))
-        self.addCleanup(lambda: __import__("shutil").rmtree(self.data_dir, ignore_errors=True))
-
-    def _install(self, mod_id, version, **over):
-        self._publish(mod_id, version, **over)
-        mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
-                               [self.BASE], self.progress.append, side="client")
 
     def _diff(self, server_mods, index):
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
         return {r.mod_id: r for r in mm.build_mod_diff(self.game, server_mods, plan)}, plan
 
-    @staticmethod
-    def _srv(mod_id, version, client=True, server=True, required=None):
-        return {"id": mod_id, "version": version,
-                "client_side": client, "server_side": server,
-                "parity_required": True if required is None else required}
-
     def test_not_installed_is_an_install(self):
         self._publish("d.new", "1.0.0")
-        rows, _ = self._diff([self._srv("d.new", "1.0.0")], [summary("d.new", ["1.0.0"])])
+        rows, _ = self._diff([_srv("d.new", "1.0.0")], [summary("d.new", ["1.0.0"])])
         self.assertEqual(rows["d.new"].action, mm.ACTION_INSTALL)
         self.assertEqual(rows["d.new"].server_version, "1.0.0")
         self.assertEqual(rows["d.new"].client_version, "")
 
     def test_matching_version_is_a_match(self):
         self._install("d.same", "1.0.0")
-        rows, _ = self._diff([self._srv("d.same", "1.0.0")], [summary("d.same", ["1.0.0"])])
+        rows, _ = self._diff([_srv("d.same", "1.0.0")], [summary("d.same", ["1.0.0"])])
         self.assertEqual(rows["d.same"].action, mm.ACTION_MATCH)
         self.assertEqual(rows["d.same"].client_version, "1.0.0")
 
@@ -1568,13 +1543,13 @@ class ModDiff(_FakeInstallFixture, unittest.TestCase):
         index = [summary("d.up", ["1.0.0"]), summary("d.up", ["2.0.0"])]
         self._install("d.up", "1.0.0")
         self._publish("d.up", "2.0.0")
-        rows, _ = self._diff([self._srv("d.up", "2.0.0")], index)
+        rows, _ = self._diff([_srv("d.up", "2.0.0")], index)
         self.assertEqual(rows["d.up"].action, mm.ACTION_UPDATE)
 
         # The same pair the other way round: the client is ahead and the server
         # pins the older build, which parity makes mandatory rather than optional.
         self._install("d.up", "2.0.0")
-        rows, _ = self._diff([self._srv("d.up", "1.0.0")], index)
+        rows, _ = self._diff([_srv("d.up", "1.0.0")], index)
         self.assertEqual(rows["d.up"].action, mm.ACTION_DOWNGRADE)
         self.assertEqual(rows["d.up"].client_version, "2.0.0")
         self.assertEqual(rows["d.up"].server_version, "1.0.0")
@@ -1583,7 +1558,7 @@ class ModDiff(_FakeInstallFixture, unittest.TestCase):
     def test_installed_but_disabled_is_an_enable(self):
         self._install("d.off", "1.0.0")
         mm.disable_mod(self.game, "d.off")
-        rows, _ = self._diff([self._srv("d.off", "1.0.0")], [summary("d.off", ["1.0.0"])])
+        rows, _ = self._diff([_srv("d.off", "1.0.0")], [summary("d.off", ["1.0.0"])])
         self.assertEqual(rows["d.off"].action, mm.ACTION_ENABLE)
         self.assertFalse(rows["d.off"].client_enabled)
 
@@ -1591,7 +1566,7 @@ class ModDiff(_FakeInstallFixture, unittest.TestCase):
         self._install("d.cch", "1.0.0")
         mm.cache_store_mod(self.game, "d.cch")
         mm.uninstall_mod(self.game, "d.cch")
-        rows, _ = self._diff([self._srv("d.cch", "1.0.0")], [summary("d.cch", ["1.0.0"])])
+        rows, _ = self._diff([_srv("d.cch", "1.0.0")], [summary("d.cch", ["1.0.0"])])
         row = rows["d.cch"]
         self.assertEqual(row.action, mm.ACTION_ACTIVATE)
         self.assertTrue(row.cached)
@@ -1599,24 +1574,24 @@ class ModDiff(_FakeInstallFixture, unittest.TestCase):
 
     def test_downloads_flag_marks_only_rows_that_fetch_bytes(self):
         self._publish("d.dl", "1.0.0")
-        rows, _ = self._diff([self._srv("d.dl", "1.0.0")], [summary("d.dl", ["1.0.0"])])
+        rows, _ = self._diff([_srv("d.dl", "1.0.0")], [summary("d.dl", ["1.0.0"])])
         self.assertTrue(rows["d.dl"].downloads)      # not here and not cached
 
         # An uncached update fetches; a match or a deactivate never does.
         self._install("d.upd", "1.0.0")
         self._publish("d.upd", "2.0.0")
-        rows, _ = self._diff([self._srv("d.upd", "2.0.0")],
+        rows, _ = self._diff([_srv("d.upd", "2.0.0")],
                              [summary("d.upd", ["1.0.0"]), summary("d.upd", ["2.0.0"])])
         self.assertTrue(rows["d.upd"].downloads)
 
         self._install("d.ok", "1.0.0")
-        rows, _ = self._diff([self._srv("d.ok", "1.0.0")], [summary("d.ok", ["1.0.0"])])
+        rows, _ = self._diff([_srv("d.ok", "1.0.0")], [summary("d.ok", ["1.0.0"])])
         self.assertFalse(rows["d.ok"].downloads)
 
     def test_extra_client_mod_is_an_optional_deactivate(self):
         self._install("d.mine", "1.0.0")
         self._publish("d.theirs", "1.0.0")
-        rows, _ = self._diff([self._srv("d.theirs", "1.0.0")],
+        rows, _ = self._diff([_srv("d.theirs", "1.0.0")],
                              [summary("d.theirs", ["1.0.0"])])
         mine = rows["d.mine"]
         self.assertEqual(mine.action, mm.ACTION_DEACTIVATE)
@@ -1627,21 +1602,19 @@ class ModDiff(_FakeInstallFixture, unittest.TestCase):
         self.assertFalse(rows["d.theirs"].optional)
 
     def test_server_only_mod_is_listed_but_not_required(self):
-        rows, _ = self._diff([self._srv("d.srv", "1.0.0", client=False, server=True)], [])
+        rows, _ = self._diff([_srv("d.srv", "1.0.0", client=False, server=True)], [])
         self.assertEqual(rows["d.srv"].action, mm.ACTION_SERVER_ONLY)
         self.assertEqual(rows["d.srv"].client_version, "")
         self.assertFalse(rows["d.srv"].blocking)
 
     def test_unresolvable_required_mod_blocks(self):
-        rows, plan = self._diff([self._srv("d.gone", "1.0.0")], [])
+        rows, plan = self._diff([_srv("d.gone", "1.0.0")], [])
         self.assertEqual(rows["d.gone"].action, mm.ACTION_MISSING)
         self.assertTrue(rows["d.gone"].blocking)
         self.assertTrue(plan.blocking)
 
     def test_needs_repo_row_names_the_source_to_add(self):
-        server_mods = [{"id": "d.other", "version": "1.0.0", "client_side": True,
-                        "server_side": True, "parity_required": True,
-                        "source_repo": OTHER}]
+        server_mods = [_srv("d.other", "1.0.0", source_repo=OTHER)]
         rows, plan = self._diff(server_mods, [])
         row = rows["d.other"]
         self.assertEqual(row.action, mm.ACTION_NEEDS_REPO)
@@ -1654,7 +1627,7 @@ class ModDiff(_FakeInstallFixture, unittest.TestCase):
     def test_problems_sort_above_changes_and_matches(self):
         self._install("d.keep", "1.0.0")     # becomes an optional deactivate
         self._publish("d.add", "1.0.0")
-        server_mods = [self._srv("d.add", "1.0.0"), self._srv("d.gone", "1.0.0")]
+        server_mods = [_srv("d.add", "1.0.0"), _srv("d.gone", "1.0.0")]
         plan = mm.plan_join(self.game, server_mods, [summary("d.add", ["1.0.0"])], [self.BASE])
         order = [r.action for r in mm.build_mod_diff(self.game, server_mods, plan)]
         self.assertEqual(order[0], mm.ACTION_MISSING)
@@ -1664,7 +1637,7 @@ class ModDiff(_FakeInstallFixture, unittest.TestCase):
         """Shown, because a pin that silently does nothing is worse than one
         that says why - but not blocking, since no server asked for it. The
         empty server column is what tells the two apart on screen."""
-        server_mods = [self._srv("d.fine", "1.0.0")]
+        server_mods = [_srv("d.fine", "1.0.0")]
         self._publish("d.fine", "1.0.0")
         plan = mm.plan_join(self.game, server_mods, [summary("d.fine", ["1.0.0"])],
                             [self.BASE], pinned=["ghost.pin"])
@@ -1682,7 +1655,7 @@ class ModDiff(_FakeInstallFixture, unittest.TestCase):
     def test_a_server_required_missing_mod_still_blocks(self):
         """The counterpart to the row above - same action, opposite verdict,
         told apart only by `reason`."""
-        server_mods = [self._srv("d.ghost", "1.0.0")]
+        server_mods = [_srv("d.ghost", "1.0.0")]
         plan = mm.plan_join(self.game, server_mods, [], [self.BASE])
         rows = {r.mod_id: r for r in mm.build_mod_diff(self.game, server_mods, plan)}
         self.assertEqual(rows["d.ghost"].action, mm.ACTION_MISSING)
@@ -1692,7 +1665,7 @@ class ModDiff(_FakeInstallFixture, unittest.TestCase):
         self._publish("d.pin", "1.0.0")
         self._publish("d.pin", "2.0.0")
         index = [summary("d.pin", ["1.0.0"]), summary("d.pin", ["2.0.0"])]
-        server_mods = [self._srv("d.pin", "1.0.0")]
+        server_mods = [_srv("d.pin", "1.0.0")]
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE], pinned=["d.pin@2.0.0"])
         rows = mm.build_mod_diff(self.game, server_mods, plan)
         self.assertEqual(len([r for r in rows if r.mod_id == "d.pin"]), 1)
@@ -1700,27 +1673,12 @@ class ModDiff(_FakeInstallFixture, unittest.TestCase):
         self.assertIn("1.0.0", rows[0].note)
 
 
-class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
-    """render_active_set: applying a JoinPlan to disk. Same throwaway
-    _tavern_data_dir patch as ClientModCache/PlanJoin."""
-
-    def setUp(self):
-        super().setUp()
-        self.data_dir = tempfile.mkdtemp(prefix="tavern_appdata_")
-        self._saved_data_dir = layout._tavern_data_dir
-        layout._tavern_data_dir = lambda: self.data_dir
-        self.addCleanup(
-            lambda: setattr(layout, "_tavern_data_dir", self._saved_data_dir))
-        self.addCleanup(lambda: __import__("shutil").rmtree(self.data_dir, ignore_errors=True))
-
-    def _install(self, mod_id, version, **over):
-        self._publish(mod_id, version, **over)
-        mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
-                               [self.BASE], self.progress.append, side="client")
+class RenderActiveSet(_TempDataDirFixture, unittest.TestCase):
+    """render_active_set: applying a JoinPlan to disk."""
 
     def test_downloads_missing_required_mod_and_caches_it(self):
         self._publish("dl.m", "1.0.0")
-        server_mods = [{"id": "dl.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        server_mods = [_srv("dl.m", "1.0.0")]
         index = [summary("dl.m", ["1.0.0"])]
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
 
@@ -1733,7 +1691,7 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
         mm.cache_store_mod(self.game, "cch.m")
         mm.uninstall_mod(self.game, "cch.m")
 
-        server_mods = [{"id": "cch.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        server_mods = [_srv("cch.m", "1.0.0")]
         index = [summary("cch.m", ["1.0.0"])]
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
         downloads_before = len(self.dl_dirs)
@@ -1758,7 +1716,7 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
         mm.adopt_installed_mods(self.game)
         self.assertTrue(os.path.isdir(mm._cache_mod_dir("adopt.m", "1.0.0")))
 
-        server_mods = [{"id": "adopt.m", "version": "2.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        server_mods = [_srv("adopt.m", "2.0.0")]
         index = [summary("adopt.m", ["1.0.0"]), summary("adopt.m", ["2.0.0"])]
         mm.render_active_set(self.game, mm.plan_join(self.game, server_mods, index, [self.BASE]))
 
@@ -1767,7 +1725,7 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
         self.assertTrue(os.path.isdir(mm._cache_mod_dir("adopt.m", "1.0.0")))
 
         # Dropping back to 1.0.0 is therefore a file move, not a download.
-        back = [{"id": "adopt.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        back = [_srv("adopt.m", "1.0.0")]
         plan_back = mm.plan_join(self.game, back, index, [self.BASE])
         self.assertTrue(plan_back.entries[0].cached)
         downloads_before = len(self.dl_dirs)
@@ -1777,7 +1735,7 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
 
     def test_already_active_entry_is_left_alone(self):
         self._install("act.m", "1.0.0")
-        server_mods = [{"id": "act.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        server_mods = [_srv("act.m", "1.0.0")]
         index = [summary("act.m", ["1.0.0"])]
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
         downloads_before = len(self.dl_dirs)
@@ -1821,7 +1779,7 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
         __import__("shutil").rmtree(mm._cache_mod_dir("back.m", "1.0.0"))
         downloads_before = len(self.dl_dirs)
 
-        server_mods = [{"id": "back.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        server_mods = [_srv("back.m", "1.0.0")]
         index = [summary("back.m", ["1.0.0"])]
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
         self.assertEqual([e.cached for e in plan.entries], [False])
@@ -1839,7 +1797,7 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
         self._publish("ver.m", "2.0.0")
         mm.render_active_set(self.game, mm.plan_join(self.game, [], [], [self.BASE]))
 
-        server_mods = [{"id": "ver.m", "version": "2.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        server_mods = [_srv("ver.m", "2.0.0")]
         index = [summary("ver.m", ["1.0.0"]), summary("ver.m", ["2.0.0"])]
         mm.render_active_set(self.game, mm.plan_join(self.game, server_mods, index, [self.BASE]))
 
@@ -1853,7 +1811,7 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
         lib_url = "https://x/Prune.dll"
         lib = {"name": "Prune", "download_url": lib_url, "sha256": "", "filename": "Prune.dll"}
         self._publish("lib.m", "1.0.0", library_dependencies=[dict(lib)])
-        server_mods = [{"id": "lib.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        server_mods = [_srv("lib.m", "1.0.0")]
         index = [summary("lib.m", ["1.0.0"])]
 
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
@@ -1873,7 +1831,7 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
         lib_url = "https://x/Reuse.dll"
         lib = {"name": "Reuse", "download_url": lib_url, "sha256": "", "filename": "Reuse.dll"}
         self._publish("lib2.m", "1.0.0", library_dependencies=[dict(lib)])
-        server_mods = [{"id": "lib2.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        server_mods = [_srv("lib2.m", "1.0.0")]
         index = [summary("lib2.m", ["1.0.0"])]
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
         mm.render_active_set(self.game, plan)
@@ -1890,7 +1848,7 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(self.game, "UserLibs", "Reuse.dll")))
 
     def test_blocking_plan_raises_and_changes_nothing(self):
-        server_mods = [{"id": "ghost.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        server_mods = [_srv("ghost.m", "1.0.0")]
         plan = mm.plan_join(self.game, server_mods, [], [self.BASE])
         self.assertTrue(plan.blocking)
         with self.assertRaises(mm.ModManagerError):
@@ -1909,7 +1867,7 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
     def test_every_item_reports_a_start_and_a_done(self):
         self._publish("step.a", "1.0.0")
         self._publish("step.b", "1.0.0")
-        server_mods = [{"id": i, "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}
+        server_mods = [_srv(i, "1.0.0")
                        for i in ("step.a", "step.b")]
         index = [summary("step.a", ["1.0.0"]), summary("step.b", ["1.0.0"])]
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
@@ -1921,7 +1879,7 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
     def test_deactivation_reports_a_step_too(self):
         self._install("keep.m", "1.0.0")
         self._install("drop.m", "1.0.0")
-        server_mods = [{"id": "keep.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        server_mods = [_srv("keep.m", "1.0.0")]
         index = [summary("keep.m", ["1.0.0"])]
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
 
@@ -1935,7 +1893,7 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
         lib = {"name": "Shared", "download_url": "https://x/Shared.dll",
                "sha256": "", "filename": "Shared.dll"}
         self._publish("libbed.m", "1.0.0", library_dependencies=[dict(lib)])
-        server_mods = [{"id": "libbed.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        server_mods = [_srv("libbed.m", "1.0.0")]
         index = [summary("libbed.m", ["1.0.0"])]
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
 
@@ -1950,7 +1908,7 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
         lib = {"name": "Shared", "download_url": "https://x/Shared.dll",
                "sha256": "", "filename": "Shared.dll"}
         self._install("libbed.m", "1.0.0", library_dependencies=[dict(lib)])
-        server_mods = [{"id": "libbed.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        server_mods = [_srv("libbed.m", "1.0.0")]
         index = [summary("libbed.m", ["1.0.0"])]
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
 
@@ -1962,39 +1920,21 @@ class RenderActiveSet(_FakeInstallFixture, unittest.TestCase):
 
     def test_rendering_without_a_step_hook_still_works(self):
         self._publish("nohook.m", "1.0.0")
-        server_mods = [{"id": "nohook.m", "version": "1.0.0", "client_side": True, "server_side": True, "parity_required": True}]
+        server_mods = [_srv("nohook.m", "1.0.0")]
         index = [summary("nohook.m", ["1.0.0"])]
         mm.render_active_set(self.game, mm.plan_join(self.game, server_mods, index, [self.BASE]))
         self.assertTrue(os.path.isdir(os.path.join(self.game, "Mods", "nohook.m")))
 
 
-class Parity(_FakeInstallFixture, unittest.TestCase):
+class Parity(_TempDataDirFixture, unittest.TestCase):
     """parity: whether a server running a mod obliges the client to match it.
 
-    "required" is the old behaviour and the default, so anything published
-    before the field existed keeps the guarantee it shipped with. "optional"
-    means the server won't refuse a join over it, so the client is offered it
-    and may decline."""
-
-    def setUp(self):
-        super().setUp()
-        self.data_dir = tempfile.mkdtemp(prefix="tavern_appdata_")
-        self._saved_data_dir = layout._tavern_data_dir
-        layout._tavern_data_dir = lambda: self.data_dir
-        self.addCleanup(
-            lambda: setattr(layout, "_tavern_data_dir", self._saved_data_dir))
-        self.addCleanup(lambda: __import__("shutil").rmtree(self.data_dir, ignore_errors=True))
-
-    def _install(self, mod_id, version, **over):
-        self._publish(mod_id, version, **over)
-        mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
-                               [self.BASE], self.progress.append, side="client")
-
-    @staticmethod
-    def _srv(mod_id, version, required=None, client=True, server=True):
-        return {"id": mod_id, "version": version,
-                "client_side": client, "server_side": server,
-                "parity_required": True if required is None else required}
+    There is no default in either direction: a manifest, record, index entry,
+    or server handshake entry that doesn't state parity_required outright is
+    rejected or ignored, never guessed at - the field decides whether a
+    joining client is obliged to match, and guessing is the one mistake that
+    matters here. "optional" means the server won't refuse a join over it, so
+    the client is offered the mod and may decline."""
 
     # -- reading the value ---------------------------------------------------
 
@@ -2105,7 +2045,7 @@ class Parity(_FakeInstallFixture, unittest.TestCase):
     def test_optional_mod_is_planned_in_by_default(self):
         """Recommended still means installed unless the user says otherwise."""
         self._publish("p.rec", "1.0.0", parity_required=False)
-        plan = mm.plan_join(self.game, [self._srv("p.rec", "1.0.0", required=False)],
+        plan = mm.plan_join(self.game, [_srv("p.rec", "1.0.0", required=False)],
                             [summary("p.rec", ["1.0.0"])], [self.BASE])
         self.assertEqual([(e.mod_id, e.reason) for e in plan.entries],
                          [("p.rec", "recommended")])
@@ -2113,7 +2053,7 @@ class Parity(_FakeInstallFixture, unittest.TestCase):
 
     def test_declining_leaves_an_optional_mod_out_of_the_plan(self):
         self._publish("p.rec", "1.0.0", parity_required=False)
-        plan = mm.plan_join(self.game, [self._srv("p.rec", "1.0.0", required=False)],
+        plan = mm.plan_join(self.game, [_srv("p.rec", "1.0.0", required=False)],
                             [summary("p.rec", ["1.0.0"])], [self.BASE],
                             declined=["p.rec"])
         self.assertEqual(plan.entries, [])
@@ -2123,7 +2063,7 @@ class Parity(_FakeInstallFixture, unittest.TestCase):
         """No client-side choice can make that join work, so pretending it can
         would just move the rejection to the server."""
         self._publish("p.req", "1.0.0")
-        plan = mm.plan_join(self.game, [self._srv("p.req", "1.0.0", required=True)],
+        plan = mm.plan_join(self.game, [_srv("p.req", "1.0.0", required=True)],
                             [summary("p.req", ["1.0.0"])], [self.BASE],
                             declined=["p.req"])
         self.assertEqual([e.mod_id for e in plan.entries], ["p.req"])
@@ -2132,7 +2072,7 @@ class Parity(_FakeInstallFixture, unittest.TestCase):
     def test_declining_never_deactivates_something_already_installed(self):
         """Declining is 'don't add it', not 'take it away'."""
         self._install("p.rec", "1.0.0", parity_required=False)
-        plan = mm.plan_join(self.game, [self._srv("p.rec", "1.0.0", required=False)],
+        plan = mm.plan_join(self.game, [_srv("p.rec", "1.0.0", required=False)],
                             [summary("p.rec", ["1.0.0"])], [self.BASE],
                             declined=["p.rec"])
         self.assertEqual(plan.to_deactivate, [])
@@ -2141,29 +2081,25 @@ class Parity(_FakeInstallFixture, unittest.TestCase):
     def test_an_unresolvable_optional_mod_does_not_block(self):
         """Required and unresolvable blocks the join; recommended just doesn't
         happen, since the server allows a client not to have it."""
-        plan = mm.plan_join(self.game, [self._srv("p.gone", "1.0.0", required=False)],
+        plan = mm.plan_join(self.game, [_srv("p.gone", "1.0.0", required=False)],
                             [], [self.BASE])
         self.assertFalse(plan.blocking)
         self.assertEqual(plan.missing, [])
         self.assertEqual(plan.entries, [])
 
     def test_an_unresolvable_required_mod_still_blocks(self):
-        plan = mm.plan_join(self.game, [self._srv("p.gone", "1.0.0", required=True)],
+        plan = mm.plan_join(self.game, [_srv("p.gone", "1.0.0", required=True)],
                             [], [self.BASE])
         self.assertTrue(plan.blocking)
         self.assertEqual(plan.missing, [("p.gone", "1.0.0")])
-
-    def test_a_server_mod_with_no_parity_field_is_still_required(self):
-        plan = mm.plan_join(self.game, [self._srv("p.old", "1.0.0")], [], [self.BASE])
-        self.assertTrue(plan.blocking)
 
     # -- the comparison ------------------------------------------------------
 
     def test_recommended_rows_are_the_users_call_required_ones_are_not(self):
         self._publish("p.rec", "1.0.0", parity_required=False)
         self._publish("p.req", "1.0.0")
-        server_mods = [self._srv("p.rec", "1.0.0", required=False),
-                       self._srv("p.req", "1.0.0", required=True)]
+        server_mods = [_srv("p.rec", "1.0.0", required=False),
+                       _srv("p.req", "1.0.0", required=True)]
         index = [summary("p.rec", ["1.0.0"]), summary("p.req", ["1.0.0"])]
         plan = mm.plan_join(self.game, server_mods, index, [self.BASE])
         rows = {r.mod_id: r for r in mm.build_mod_diff(self.game, server_mods, plan)}
@@ -2176,7 +2112,7 @@ class Parity(_FakeInstallFixture, unittest.TestCase):
 
     def test_a_declined_mod_gets_a_row_so_the_choice_can_be_taken_back(self):
         self._publish("p.rec", "1.0.0", parity_required=False)
-        server_mods = [self._srv("p.rec", "1.0.0", required=False)]
+        server_mods = [_srv("p.rec", "1.0.0", required=False)]
         plan = mm.plan_join(self.game, server_mods, [summary("p.rec", ["1.0.0"])],
                             [self.BASE], declined=["p.rec"])
         rows = {r.mod_id: r for r in mm.build_mod_diff(self.game, server_mods, plan)}
@@ -2189,7 +2125,7 @@ class Parity(_FakeInstallFixture, unittest.TestCase):
     def test_an_already_matching_recommended_mod_is_not_offered_as_a_choice(self):
         """Nothing to decide: it's installed, current, and the server is happy."""
         self._install("p.rec", "1.0.0", parity_required=False)
-        server_mods = [self._srv("p.rec", "1.0.0", required=False)]
+        server_mods = [_srv("p.rec", "1.0.0", required=False)]
         plan = mm.plan_join(self.game, server_mods, [summary("p.rec", ["1.0.0"])],
                             [self.BASE])
         rows = {r.mod_id: r for r in mm.build_mod_diff(self.game, server_mods, plan)}
@@ -2282,11 +2218,6 @@ class ResolveMissingMods(_FakeInstallFixture, unittest.TestCase):
 class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
     """export_modlist/import_modlist/apply_import: the shared
     {schema, repos, mods} shape, reused as-is by a headless server's modlist."""
-
-    def _install(self, mod_id, version, **over):
-        self._publish(mod_id, version, **over)
-        mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
-                               [self.BASE], self.progress.append, side="client")
 
     def _publish_latest(self, mod_id, version, **over):
         """Like _publish, but also serves it at latest.json, so bare-id
@@ -2558,36 +2489,22 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         self.assertEqual([m.id for m in plan.roots], ["rt.m"])
 
 
-class ZipBundleInstall(unittest.TestCase):
+class ZipBundleInstall(_FakeInstallFixture, unittest.TestCase):
     """package="zip" mods: archive is downloaded, verified, and extracted into
     Mods/<id>/. Zip-slip / symlink / absolute-path members are rejected."""
-    BASE = DEFAULT
 
     def setUp(self):
-        self.game = tempfile.mkdtemp(prefix="tavern_game_")
-        self.progress = []
-        self.manifests = {}
+        super().setUp()
         self.zip_bytes = {}          # download_url -> raw zip bytes
 
-        def fake_get_json(url, timeout=15):
-            if url in self.manifests:
-                return self.manifests[url]
-            raise mm.ModManagerError(f"404 {url}")
-        repos._get_json = fake_get_json
-
+        # The fixture's downloader derives bytes from the URL; a zip install
+        # needs the exact archive bytes _publish_zip registered for it.
         def fake_download(url, dest, on_progress=None):
             with open(dest, "wb") as f:
                 f.write(self.zip_bytes[url])
             if on_progress:
                 on_progress("downloaded")
-
-        def fake_hash(path):
-            with open(path, "rb") as f:
-                return hashlib.sha256(f.read()).hexdigest()
-
         install._download_with_progress = fake_download
-        install._sha256_file = fake_hash
-        self.addCleanup(lambda: __import__("shutil").rmtree(self.game, ignore_errors=True))
 
     def _make_zip(self, entries):
         """entries: (arcname, data) or (arcname, data, external_attr)."""
@@ -2631,6 +2548,24 @@ class ZipBundleInstall(unittest.TestCase):
         rec = read_json(os.path.join(modf, "manifest.json"))
         self.assertEqual(rec["package"], "zip")
         self.assertNotIn("filename", rec)
+
+    def test_zip_shipping_its_own_manifest_json_is_not_left_damaged(self):
+        """The archive's root manifest.json must not be extracted: the record
+        is written under that name after the tree is hashed, so extracting it
+        would record the archive's bytes, overwrite them, and leave the mod
+        permanently 'damaged' (and reinstalled on every headless boot)."""
+        self._publish_zip("ships.m", "1.0.0", [
+            ("Ships.dll", b"MZfake"),
+            ("manifest.json", b'{"not": "ours"}'),
+            ("Content/manifest.json", b'{"nested": "fine"}'),
+        ])
+        self._install("ships.m")
+        modf = os.path.join(self.game, "Mods", "ships.m")
+        rec = read_json(os.path.join(modf, "manifest.json"))
+        self.assertEqual(rec["id"], "ships.m")
+        self.assertNotIn("manifest.json", rec["files"])
+        self.assertIn("Content/manifest.json", rec["files"])
+        self.assertTrue(mm.verify_mod_files(self.game, "ships.m"))
 
     def test_zip_slip_traversal_rejected_nothing_installed(self):
         self._publish_zip("evil.m", "1.0.0", [
@@ -2779,11 +2714,6 @@ class DamageDetection(_FakeInstallFixture, unittest.TestCase):
     the record carries per-file hashes written at install, and mod_status
     checks them before it says anything about versions."""
 
-    def _install(self, mod_id, version, **over):
-        self._publish(mod_id, version, **over)
-        mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
-                               [self.BASE], self.progress.append, side="client")
-
     def _dll(self, mod_id):
         return os.path.join(self.game, "Mods", mod_id, f"{mod_id}.dll")
 
@@ -2873,23 +2803,9 @@ class DamageDetection(_FakeInstallFixture, unittest.TestCase):
                          hashlib.sha256(b"s.m@1.0.0@req").hexdigest())
 
 
-class CacheIntegrityAndPruning(_FakeInstallFixture, unittest.TestCase):
+class CacheIntegrityAndPruning(_TempDataDirFixture, unittest.TestCase):
     """cache_restore_mod's restore-time verification and cache_store_mod's
-    version pruning. Same throwaway _tavern_data_dir patch as ClientModCache."""
-
-    def setUp(self):
-        super().setUp()
-        self.data_dir = tempfile.mkdtemp(prefix="tavern_appdata_")
-        self._saved_data_dir = layout._tavern_data_dir
-        layout._tavern_data_dir = lambda: self.data_dir
-        self.addCleanup(
-            lambda: setattr(layout, "_tavern_data_dir", self._saved_data_dir))
-        self.addCleanup(lambda: __import__("shutil").rmtree(self.data_dir, ignore_errors=True))
-
-    def _install(self, mod_id, version, **over):
-        self._publish(mod_id, version, **over)
-        mm.install_mod_closure(self.game, summary(mod_id, [version]), [summary(mod_id, [version])],
-                               [self.BASE], self.progress.append, side="client")
+    version pruning."""
 
     def test_restore_verifies_and_discards_a_rotten_entry(self):
         self._install("rot.m", "1.0.0")
@@ -2914,8 +2830,7 @@ class CacheIntegrityAndPruning(_FakeInstallFixture, unittest.TestCase):
         with open(os.path.join(entry, "fb.m.dll"), "wb") as f:
             f.write(b"bitrot")
 
-        server_mods = [{"id": "fb.m", "version": "1.0.0", "client_side": True,
-                        "server_side": True, "parity_required": True}]
+        server_mods = [_srv("fb.m", "1.0.0")]
         plan = mm.plan_join(self.game, server_mods, [summary("fb.m", ["1.0.0"])], [self.BASE])
         entry_plan = next(e for e in plan.entries if e.mod_id == "fb.m")
         self.assertTrue(entry_plan.cached)     # planned as a file move...
@@ -2966,20 +2881,11 @@ class CacheIntegrityAndPruning(_FakeInstallFixture, unittest.TestCase):
         self.assertEqual(kept, ["1.0.0", "1.1.0", "1.2.0"])
 
 
-class EnsureLibraries(_FakeInstallFixture, unittest.TestCase):
+class EnsureLibraries(_TempDataDirFixture, unittest.TestCase):
     """ensure_mod_libraries: the bare-re-enable repair. A join that
     deactivates a mod prunes its orphaned libraries; re-enabling from the
     manager window is just a record rename, so this is what puts the
     libraries back."""
-
-    def setUp(self):
-        super().setUp()
-        self.data_dir = tempfile.mkdtemp(prefix="tavern_appdata_")
-        self._saved_data_dir = layout._tavern_data_dir
-        layout._tavern_data_dir = lambda: self.data_dir
-        self.addCleanup(
-            lambda: setattr(layout, "_tavern_data_dir", self._saved_data_dir))
-        self.addCleanup(lambda: __import__("shutil").rmtree(self.data_dir, ignore_errors=True))
 
     LIB_URL = "https://x/NeededLib.dll"
 
