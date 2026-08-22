@@ -15,6 +15,7 @@ import sys
 import zipfile
 import tempfile
 import unittest
+import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tavern_shared import mod_install as mi
@@ -105,6 +106,82 @@ class TruncatedDownloads(unittest.TestCase):
         mi._urlopen_hard_timeout = lambda *_a, **_k: resp
         mi._download_with_progress("https://example.test/f.dll", self.dest, lambda _m: None)
         self.assertEqual(os.path.getsize(self.dest), 50)
+
+
+class MidBodyFailures(unittest.TestCase):
+    """A connection cut DURING the body raises out of resp.read() rather than
+    ending the loop early — reset, TLS error, socket timeout, short chunked
+    read. Those are the same network-side failures as a refused connect, so
+    they must surface as DownloadError: the retry loop retries only that
+    class, and the Setup window's manual-install handoff classifies on it."""
+
+    class _DyingResponse(io.BytesIO):
+        def __init__(self, body_before_death, exc):
+            super().__init__(body_before_death)
+            self._exc = exc
+            self.headers = {"Content-Length": str(len(body_before_death) * 2)}
+
+        def read(self, *a, **kw):
+            data = super().read(*a, **kw)
+            if not data:
+                raise self._exc
+            return data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            self.close()
+            return False
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="tavern_midbody_")
+        self.dest = os.path.join(self.tmp, "payload.bin")
+        self._real_urlopen = mi._urlopen_hard_timeout
+
+    def tearDown(self):
+        mi._urlopen_hard_timeout = self._real_urlopen
+
+    def _serve_dying(self, exc):
+        resp = self._DyingResponse(b"x" * 200, exc)
+        mi._urlopen_hard_timeout = lambda *_a, **_k: resp
+
+    def test_a_mid_body_reset_is_a_download_error(self):
+        self._serve_dying(ConnectionResetError("peer reset"))
+        with self.assertRaises(mi.DownloadError):
+            mi._download_with_progress("https://example.test/f.dll", self.dest,
+                                       lambda _m: None)
+
+    def test_a_mid_body_incomplete_read_is_a_download_error(self):
+        import http.client
+        self._serve_dying(http.client.IncompleteRead(b"x" * 200))
+        with self.assertRaises(mi.DownloadError):
+            mi._download_with_progress("https://example.test/f.dll", self.dest,
+                                       lambda _m: None)
+
+    def test_the_partial_file_is_not_left_behind(self):
+        self._serve_dying(ConnectionResetError("peer reset"))
+        with self.assertRaises(mi.DownloadError):
+            mi._download_with_progress("https://example.test/f.dll", self.dest,
+                                       lambda _m: None)
+        self.assertFalse(os.path.exists(self.dest))
+
+    def test_a_mid_body_drop_is_retried(self):
+        """The point of the classification: the retry docstring promises a
+        dropped connection often succeeds on the next try, which is only true
+        if a drop mid-body actually reaches the retry loop."""
+        calls = {"n": 0}
+        good = b"y" * 400
+        def _urlopen(*_a, **_k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return self._DyingResponse(b"x" * 200, ConnectionResetError("peer reset"))
+            return FakeResponse(good)
+        mi._urlopen_hard_timeout = _urlopen
+        mi._download_with_retries("https://example.test/f.dll", self.dest,
+                                  lambda _m: None, retry_delay=0)
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(os.path.getsize(self.dest), len(good))
 
 
 class RefusedResponses(unittest.TestCase):
@@ -373,6 +450,65 @@ class DriftAfterInstall(unittest.TestCase):
     def test_a_deleted_file_is_missing_not_damaged(self):
         os.remove(self.tl)
         self.assertEqual(mi._tavernlib_status(self.game), "missing")
+
+
+class StrippedFingerprintHeaders(unittest.TestCase):
+    """A proxy stripping ETag/Last-Modified used to leave installs that could
+    never converge: install-time recorded no fingerprint (or kept a stale one)
+    while the remote check fell back to a size, so status read 'unrecorded' or
+    'outdated' forever and Automatic Setup reinstalled every single run. Both
+    sides now fall back to the same value — the file's full size."""
+
+    def setUp(self):
+        self.game = tempfile.mkdtemp(prefix="tavern_strip_")
+        self._real_dl = mi._download_with_retries
+        self._real_tag = mi._get_latest_release_tag
+        self._real_fp = mi._fetch_remote_fingerprint
+
+    def tearDown(self):
+        mi._download_with_retries = self._real_dl
+        mi._get_latest_release_tag = self._real_tag
+        mi._fetch_remote_fingerprint = self._real_fp
+
+    def test_install_records_the_size_fallback_and_converges(self):
+        """One clean install on a header-stripping network must end at
+        'current', not loop forever."""
+        body = b"MZ" + b"\0" * 8192
+        def fake_download(url, dest, on_progress, **_kw):
+            with open(dest, "wb") as f:
+                f.write(body)
+            return {"Content-Length": str(len(body))}  # no ETag/Last-Modified
+        mi._download_with_retries = fake_download
+        mi._get_latest_release_tag = lambda *_a, **_k: "v1.5.1"
+        mi._install_tavernlib(self.game, lambda _m: None)
+        meta = mi._load_mod_meta(self.game)
+        self.assertEqual(meta["tavernlib_fingerprint"], str(len(body)))
+        # The remote check's fallback computes the same size, so they agree.
+        mi._fetch_remote_fingerprint = lambda *_a, **_k: str(len(body))
+        self.assertEqual(mi._tavernlib_status(self.game), "current")
+
+    def test_remote_fallback_reads_the_full_size_out_of_content_range(self):
+        """The ranged-GET fallback's Content-Length describes the 1-byte
+        slice — a constant "1" that could never match anything install-time
+        records. The full size lives in Content-Range."""
+        class _Resp:
+            headers = {"Content-Length": "1",
+                       "Content-Range": "bytes 0-0/8194"}
+            def __enter__(self):
+                return self
+            def __exit__(self, *_exc):
+                return False
+        def fake_urlopen(req, timeout=None):
+            if req.get_method() == "HEAD":
+                raise OSError("host rejects HEAD")
+            return _Resp()
+        real = urllib.request.urlopen
+        urllib.request.urlopen = fake_urlopen
+        try:
+            fp = mi._fetch_remote_fingerprint("https://example.test/f.dll")
+        finally:
+            urllib.request.urlopen = real
+        self.assertEqual(fp, "8194")
 
 
 class ReleaseTags(unittest.TestCase):
