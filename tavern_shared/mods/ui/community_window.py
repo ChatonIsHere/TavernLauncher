@@ -3,25 +3,22 @@ import threading
 import tkinter as tk
 from tkinter import messagebox
 
-from tavern_shared.mod_install import (
-    _melonloader_installed, _tavernlib_installed,
-)
 from tavern_shared.theme import (
     AMBER, BG, BORDER, CYAN, GREEN, MUTED, PARCH, RED, SURF, _btn, _mk_scrollbar,
 )
-from tavern_shared.game_guard import confirm_while_game_running
 from tavern_shared.window_chrome import _enable_dark_titlebar
 
 from tavern_shared.mods.cache import clear_mod_cache
 from tavern_shared.mods.errors import ModManagerError
 from tavern_shared.mods.hostcfg import load_cfg
 from tavern_shared.mods.install import (
-    install_mod_closure, list_installed_mods, list_mods, mod_status,
+    list_installed_mods, list_mods, mod_status,
 )
-from tavern_shared.mods.repos import (
-    _is_default, _source_display, fetch_indexes, list_repos,
-)
+from tavern_shared.mods.repos import fetch_indexes, list_repos
 from tavern_shared.mods.resolve import resolve_mod_by_id
+from tavern_shared.mods.ui.shared import (
+    install_mod_flow, meta_matches_side, source_label,
+)
 from tavern_shared.mods.ui.sources_window import ModSourcesWindow
 
 
@@ -43,6 +40,10 @@ class CommunityModsWindow(tk.Toplevel):
         "current":  "Installed",
         "outdated": "Update ready",
         "unknown":  "Installed",
+    }
+    _STATE_COLOR = {
+        "missing": PARCH, "damaged": RED, "current": GREEN,
+        "outdated": AMBER, "unknown": MUTED,
     }
     _PRIMARY_LABEL = {
         "missing":  "Install",
@@ -90,14 +91,6 @@ class CommunityModsWindow(tk.Toplevel):
         self._load(force=False)
 
     def _build(self):
-        # Resolved here rather than as a class attribute: PARCH/GREEN/AMBER/
-        # MUTED are host colours wired in by set_helpers, which has always
-        # run by the time a window's _build() executes, but not yet at class
-        # -definition time (module import).
-        self._state_color = {
-            "missing": PARCH, "damaged": RED, "current": GREEN,
-            "outdated": AMBER, "unknown": MUTED,
-        }
         h = tk.Frame(self, bg=SURF, height=44)
         h.pack(fill="x"); h.pack_propagate(False)
         tk.Label(h, text="Community Mods", bg=SURF, fg=AMBER,
@@ -203,7 +196,7 @@ class CommunityModsWindow(tk.Toplevel):
         # window's, so a mod that's dropped out of every index no longer
         # gets a row here at all (it still has one there).
         installed_by_id = {m["id"]: m for m in installed
-                           if m.get("id") and self._meta_matches_side(m)}
+                           if m.get("id") and meta_matches_side(m, self._side)}
         rows = {}
         for s in available:
             meta = installed_by_id.get(s.id)
@@ -212,20 +205,11 @@ class CommunityModsWindow(tk.Toplevel):
                 "description": s.description or "",
                 "client_side": s.client_side, "server_side": s.server_side,
                 "parity_required": s.parity_required,
-                "latest": s.highest(), "source": self._source_label(s.source_repo),
+                "latest": s.highest(), "source": source_label(s.source_repo),
                 "summary": s, "installed": meta.get("version", "?") if meta else None,
                 "state": "missing",
             }
         self._rows = rows
-
-    def _meta_matches_side(self, meta):
-        key = "client_side" if self._side == "client" else "server_side"
-        return meta.get(key, True)
-
-    def _source_label(self, source_repo):
-        if _is_default(source_repo):
-            return "Modding Tavern"
-        return _source_display(source_repo)
 
     # -- card rendering --
 
@@ -339,7 +323,7 @@ class CommunityModsWindow(tk.Toplevel):
             return
         state = r["state"]
         w["status_var"].set(self._STATE_WORD.get(state, ""))
-        w["status_lbl"].config(fg=self._state_color.get(state, MUTED))
+        w["status_lbl"].config(fg=self._STATE_COLOR.get(state, MUTED))
         w["btn"].config(text=self._PRIMARY_LABEL.get(state, "Install"),
                         state="disabled" if (self._busy or r["summary"] is None) else "normal")
 
@@ -412,40 +396,7 @@ class CommunityModsWindow(tk.Toplevel):
         r = self._rows.get(mod_id)
         if not r or r["summary"] is None:
             return
-        self._install(r["summary"])
-
-    def _install(self, mod, version=None):
-        """Installs `mod`'s closure, at `version` if given, else
-        mod.highest() (the ordinary Install/Update/Reinstall path)."""
-        if self._busy:
-            return
-        if not confirm_while_game_running(self, self._is_game_running,
-                                          f"Installing {mod.name}"):
-            return
-        if not _melonloader_installed(self._game_dir):
-            messagebox.showwarning("Install MelonLoader first",
-                f"{mod.name} is a MelonLoader mod. Install MelonLoader from the "
-                "Setup window first.", parent=self)
-            return
-        if not _tavernlib_installed(self._game_dir):
-            messagebox.showwarning("Install TavernLib first",
-                f"{mod.name} needs TavernLib. Install it from the Setup window "
-                "first.", parent=self)
-            return
-        label = f"{mod.name} {version}" if version else mod.name
-        self._set_busy(True, f"Installing {label}...")
-        index = self._index
-        def worker():
-            try:
-                repos = list_repos(load_cfg())
-                install_mod_closure(
-                    self._game_dir, mod, index, repos,
-                    lambda m: self.after(0, lambda: self._status.set(m)),
-                    self._side, version=version)
-                self.after(0, lambda: self._finish(f"{label} installed."))
-            except Exception as e:
-                self.after(0, lambda e=e: self._finish(f"Install failed: {e}"))
-        threading.Thread(target=worker, daemon=True).start()
+        install_mod_flow(self, r["summary"])
 
     def _on_clear_cache(self):
         if self._busy:
