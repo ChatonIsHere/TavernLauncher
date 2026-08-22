@@ -50,6 +50,16 @@ if errorlevel 1 (
 )
 echo %VERSION%>dependencies\version
 
+:: Re-cut Patch/ from the current releases. These are the offline copies the
+:: Setup window falls back to when a download won't complete, and they are
+:: only worth shipping while they are current -- committing them by hand is
+:: how the previous set silently drifted behind the published files.
+:: Deliberately not fatal: a build machine that can't reach GitHub should
+:: still produce working executables, shipping whatever Patch/ already holds.
+echo.
+echo  Refreshing bundled Setup payloads in Patch\...
+python dependencies\refresh_bundled_payloads.py
+
 echo.
 echo  Installing PyInstaller and Pillow...
 pip install pyinstaller pillow -q
