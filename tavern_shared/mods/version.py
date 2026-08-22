@@ -1,6 +1,16 @@
 """Semver-ish comparison. Major-lock resolution leans on this constantly and
 the stdlib has no semver, so it is the one place versions become comparable."""
+import re
+
 from tavern_shared.mods.errors import ModManagerError
+
+# int() is looser than C#'s int.TryParse, which is what TavernLib parses the
+# same version strings with: int("0_5") is 5 and int("١٢") is 12, both of which
+# TryParse refuses. Neither side throws on an unparseable version - they skip it
+# with a warning - so accepting more here doesn't error, it silently gives the
+# launcher a different version set (and a different highest()/major) than the
+# host resolving the same index. ASCII digits only is the intersection.
+_SEGMENT = re.compile(r"[0-9]+")
 
 
 def _parse_version(v):
@@ -20,11 +30,10 @@ def _parse_version(v):
         raise ModManagerError(
             f"Version {v!r} isn't MAJOR.MINOR.PATCH: exactly three numeric "
             f"segments are required (no pre-release/build metadata).")
-    try:
-        return tuple(int(p) for p in parts)
-    except ValueError:
+    if not all(_SEGMENT.fullmatch(p) for p in parts):
         raise ModManagerError(
             f"Version {v!r} has a non-numeric segment; only digits are allowed.")
+    return tuple(int(p) for p in parts)
 
 
 def _major(v):
