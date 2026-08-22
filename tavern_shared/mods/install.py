@@ -49,15 +49,12 @@ def _verified_download(url, sha256, work_dir, on_progress):
     routing through %TEMP% (usually C:) would make that a cross-volume move,
     which fails with WinError 17 when the game is on another drive. The temp is
     always cleaned up, so a failed verify/move leaves nothing behind."""
-    download = _download_with_progress
-    hashfn = _sha256_file
-
     os.makedirs(work_dir, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".tavern_dl_", suffix=".part", dir=work_dir)
     os.close(fd)
     try:
-        download(url, tmp, on_progress)
-        actual = hashfn(tmp)
+        _download_with_progress(url, tmp, on_progress)
+        actual = _sha256_file(tmp)
         if actual.lower() != (sha256 or "").lower():
             raise ModManagerError(
                 f"Downloaded file failed its checksum: expected {sha256}, got "
@@ -102,6 +99,15 @@ def _safe_extract_zip(zip_path, dest_dir):
         written = 0
         for info in infos:
             name = info.filename
+            # A root-level manifest.json is a natural thing for a mod to ship
+            # (it's MelonLoader's folder marker too), but the install record is
+            # written under exactly that name AFTER the extracted tree is
+            # hashed - so extracting it would record the archive's bytes and
+            # then overwrite them, a permanent "damaged" verdict that reinstalls
+            # the mod on every headless boot. TavernLib's SafeExtractZip skips
+            # the same names.
+            if name in (RECORD_NAME, DISABLED_RECORD_NAME):
+                continue
             # Absolute paths never belong in a mod archive, and a colon
             # anywhere is refused rather than just a drive letter in position
             # 1: on NTFS "mod.dll:payload" writes an alternate data stream
@@ -517,10 +523,12 @@ def _owned_mod_record(game_dir, mod_id):
     "is this folder OURS?" test. It has to be the same predicate
     list_installed_mods applies (id present, parity readable), so that a folder
     can never read as installed to one caller and as foreign to another:
-    list_untracked_mods uses this to decide what's already claimed, and
-    _clear_install_path uses it to decide delete-vs-displace. TavernLib's
-    ModRecord.Read is the same test (its parity field is Required.Always, so an
-    unusable record reads as no record there too). Returns None for a folder
+    list_untracked_mods uses this to decide what's already claimed,
+    _clear_install_path uses it to decide delete-vs-displace, and mod_status
+    uses it so "installed" means the same thing in every window. TavernLib's
+    ModRecord.Read is the same test (its parity field is Required.Always AND
+    read through a strict boolean converter, so a record with a missing or
+    non-boolean parity reads as no record there too). Returns None for a folder
     that isn't ours by that test."""
     rec = _read_mod_record(game_dir, mod_id)
     if rec is None:
@@ -579,7 +587,11 @@ def mod_status(game_dir, mod_id, index):
     calling it anything scarier would flag a working install over an index
     bookkeeping state). "unknown" = installed but no longer present in any
     configured index (e.g. its repo was removed), nothing to compare against."""
-    meta = _read_mod_record(game_dir, mod_id)
+    # _owned_mod_record, not the lenient reader: "installed" has to mean the
+    # same thing here as it does in the Mod Manager's table, or a folder whose
+    # record predates parity_required reads as Installed in one window and
+    # Untracked in the other, and the join planner sides with the second.
+    meta = _owned_mod_record(game_dir, mod_id)
     if not meta or "version" not in meta:
         return "missing"
     if verify_mod_files(game_dir, mod_id) is False:
