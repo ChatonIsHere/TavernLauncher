@@ -15,6 +15,7 @@ hard-coded installer here could offer.
 import os
 import time
 import json
+import shutil
 import socket
 import threading
 import tempfile
@@ -28,6 +29,7 @@ import http.client
 from urllib.parse import urlparse
 
 from tavern_shared.paths import _sha256_file
+from tavern_shared.bundled import bundled_tag, usable_payload
 
 MELONLOADER_ZIP_URLS = {
     "x64": "https://github.com/LavaGang/MelonLoader/releases/latest/download/MelonLoader.x64.zip",
@@ -67,11 +69,57 @@ def _load_mod_meta(game_dir):
 
 
 def _save_mod_meta(game_dir, meta):
+    """Replaces the whole record, atomically.
+
+    Written to a temp file in the same folder and swapped in with os.replace
+    rather than truncating the real one, because this file is deliberately
+    shared: it lives in game_dir so the client launcher and the server
+    launcher can see each other's installs (see _patch_status). A plain
+    open(w) leaves it empty for as long as the write takes, and anything that
+    reads it in that window gets a JSON error -- which _load_mod_meta turns
+    into {}, which reads as "nothing is installed", which makes Automatic
+    Setup reinstall all three components. The swap has no such window: a
+    reader sees either the old file or the new one."""
+    path = _mods_meta_path(game_dir)
+    tmp = f"{path}.{os.getpid()}.tmp"
     try:
-        with open(_mods_meta_path(game_dir), "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(meta, f)
+        os.replace(tmp, path)
     except Exception:
-        pass
+        try: os.remove(tmp)
+        except OSError: pass
+
+
+def _update_mod_meta(game_dir, changes, drop=()):
+    """Applies field changes to the record, re-reading it immediately before
+    the write.
+
+    The read-modify-write the installers do spans a download and a file swap
+    -- seconds at least, minutes for MelonLoader. Two launchers pointed at one
+    game folder (installing TavernLib in one while applying the patch in the
+    other is the obvious way in) would each write back a copy of the record
+    they read at the start, and whoever finished last would erase the other's
+    fields entirely. Re-reading here narrows that to the width of one
+    os.replace, and the fields the two write never overlap."""
+    meta = _load_mod_meta(game_dir)
+    meta.update(changes)
+    for key in drop:
+        meta.pop(key, None)
+    _save_mod_meta(game_dir, meta)
+    return meta
+
+
+def _record_source(changes, drop, component, from_bundle):
+    """Notes whether this install came from GitHub or from the copy shipped in
+    Patch/, so the Setup row can say so. Removed rather than set to "github"
+    on the normal path: absent already means "downloaded", and a launcher that
+    predates this field would otherwise be indistinguishable from an offline
+    install."""
+    if from_bundle:
+        changes[f"{component}_source"] = "bundled"
+    else:
+        drop.append(f"{component}_source")
 
 
 def _get_redirect_location(url, timeout=10):
@@ -133,7 +181,23 @@ def _fetch_remote_fingerprint(url, timeout=10):
     tag, which tag comparison reads as 'current' forever."""
     def _read(resp):
         h = resp.headers
-        return h.get("ETag") or h.get("Last-Modified") or h.get("Content-Length") or ""
+        fp = h.get("ETag") or h.get("Last-Modified")
+        if fp:
+            return fp
+        # Size fallback for a proxy that strips ETag/Last-Modified. On the
+        # ranged-GET path below, Content-Length describes the 1-byte slice
+        # (a constant "1" — useless as a fingerprint), so the full size has
+        # to come out of Content-Range ("bytes 0-0/12345" -> "12345"). That
+        # keeps every path here returning the same value the install-time
+        # GET records as its own fallback (its Content-Length IS the full
+        # size), so a fresh install on such a network converges to
+        # 'current' instead of mismatching forever.
+        content_range = h.get("Content-Range") or ""
+        if "/" in content_range:
+            total = content_range.rsplit("/", 1)[1].strip()
+            if total.isdigit():
+                return total
+        return h.get("Content-Length") or ""
     with _force_ipv4():
         req = urllib.request.Request(url, method="HEAD",
             headers={"User-Agent": "TavernLauncher/1.0"})
@@ -317,7 +381,30 @@ def _download_with_progress(url, dest_path, on_progress,
                             "The connection may be extremely slow, or something is "
                             "silently throttling it (security software, a captive "
                             "portal, etc.) rather than blocking it outright.")
-                    chunk = resp.read(chunk_size)
+                    try:
+                        chunk = resp.read(chunk_size)
+                    except (OSError, http.client.HTTPException) as e:
+                        # A connection dropped mid-body surfaces here — reset,
+                        # TLS error, socket timeout, a short chunked read — and
+                        # every one of those is the network's side of the line,
+                        # exactly like a refused connect. It has to be
+                        # DownloadError: _download_with_retries retries only
+                        # that class, and the Setup window classifies on it for
+                        # the manual-install handoff. Only the read is wrapped —
+                        # out.write() failing is local (disk, permissions) and
+                        # must keep failing immediately.
+                        raise DownloadError(
+                            f"The connection to {urlparse(url).netloc} was cut "
+                            f"part-way through the download after {downloaded:,} "
+                            f"bytes ({type(e).__name__}: {e}).\n\n"
+                            "This is usually antivirus, a VPN, or a proxy "
+                            "interrupting the transfer rather than refusing it. "
+                            "Nothing was installed and nothing was changed.\n\n"
+                            "Worth trying:\n"
+                            "  • Try again — this often succeeds on a second attempt\n"
+                            "  • Try a different network (a phone hotspot is a quick test)\n"
+                            "  • Temporarily disable antivirus/VPN and retry\n"
+                            "  • Use Manual Install to download it in your browser instead")
                     if not chunk:
                         break
                     out.write(chunk)
@@ -475,14 +562,28 @@ def _blocked_write_message(what, examples):
         "  • Use Manual Install to place the files yourself")
 
 
+def _melonloader_install_broken(game_dir):
+    """Whether there is no MelonLoader install here worth protecting —
+    missing, failing its recorded hash, or recorded incompletely. The same
+    three readings _melonloader_status calls 'missing'/'damaged'/'unrecorded',
+    but computed without touching the network, because the one caller
+    (the bundled fallback) is by definition already offline."""
+    if not _melonloader_installed(game_dir):
+        return True
+    meta = _load_mod_meta(game_dir)
+    recorded = meta.get("melonloader_version_sha256")
+    if _file_matches_recorded(os.path.join(game_dir, "version.dll"), recorded) is False:
+        return True
+    return not (meta.get("melonloader_tag") and recorded)
+
+
 def _install_melonloader(game_dir, arch, on_progress):
     """Downloads and installs the latest official MelonLoader release, with
-    retries. No bundled fallback: shipping a frozen copy inside the launcher
-    meant installing a stale (or worse, unreproducible) loader whenever GitHub
-    hiccuped, and silently — the user was told "installed" either way. A
-    download that still fails after the retries raises DownloadError, which
-    the Setup window turns into manual-install instructions: the user's own
-    browser is the trustworthy fallback, not a snapshot in Patch/.
+    retries, falling back to the copy shipped in Patch/ only when that copy
+    is verified and would actually help (see tavern_shared.bundled). A
+    download that fails with nothing usable to fall back to raises
+    DownloadError, which the Setup window turns into manual-install
+    instructions — the user's own browser is the fallback of last resort.
 
     The meta record (release tag + on-disk hash) is written only after the
     extracted files have been read back and verified against the archive's
@@ -498,21 +599,36 @@ def _install_melonloader(game_dir, arch, on_progress):
 
     tmp_zip = os.path.join(tempfile.gettempdir(), "tavern_melonloader_dl.zip")
     try:
-        _download_with_retries(url, tmp_zip, on_progress, require_length=True)
-        # A structurally-valid zip is a strong integrity check in itself (a
-        # truncated one loses its end-of-central-directory record and won't
-        # open) — but check the magic first anyway, so a substituted HTML page
-        # fails with "this isn't a zip, something intercepted the download"
-        # rather than eight seconds of open-retries and an antivirus hint.
-        _verify_payload_type(tmp_zip, url, "zip")
+        try:
+            _download_with_retries(url, tmp_zip, on_progress, require_length=True)
+            # A structurally-valid zip is a strong integrity check in itself (a
+            # truncated one loses its end-of-central-directory record and won't
+            # open) — but check the magic first anyway, so a substituted HTML page
+            # fails with "this isn't a zip, something intercepted the download"
+            # rather than eight seconds of open-retries and an antivirus hint.
+            _verify_payload_type(tmp_zip, url, "zip")
+            source_zip, from_bundle = tmp_zip, False
+        except DownloadError:
+            # Only the x64 archive is shipped, and usable_payload's hash check
+            # means an x86 request can't be served the wrong one by accident.
+            source_zip = usable_payload(
+                "melonloader", _melonloader_install_broken(game_dir),
+                _load_mod_meta(game_dir).get("melonloader_tag")) if arch == "x64" else None
+            if not source_zip:
+                raise
+            from_bundle = True
+            tag = bundled_tag("melonloader")
+            on_progress(f"Couldn't reach GitHub — installing the {tag} copy shipped with this launcher…")
         on_progress("Extracting MelonLoader…")
-        with _open_zip_with_retry(tmp_zip) as zf:
+        with _open_zip_with_retry(source_zip) as zf:
             zf.extractall(game_dir)
             # Verified against the archive itself, not just checked for presence
             # -- see _verify_extracted for why presence is not enough here.
             on_progress("Verifying extracted files…")
             bad = _verify_extracted(zf, game_dir)
     finally:
+        # tmp_zip only — never source_zip, which on the fallback path is the
+        # shipped copy itself and has to survive for the next attempt.
         try: os.remove(tmp_zip)
         except Exception: pass
 
@@ -524,44 +640,95 @@ def _install_melonloader(game_dir, arch, on_progress):
         raise RuntimeError(_blocked_write_message(
             "MelonLoader", "the expected files aren't in the game folder"))
 
-    meta = _load_mod_meta(game_dir)
+    changes, drop = {}, []
     if tag:
-        meta["melonloader_tag"] = tag
+        changes["melonloader_tag"] = tag
     else:
         # The tag fetch failed, so which release this was is genuinely unknown
         # — drop any old tag rather than leave it describing the previous
         # install. Status then reports 'unknown' instead of a stale 'current'.
-        meta.pop("melonloader_tag", None)
+        drop.append("melonloader_tag")
+    # Which release this is stays the honest answer either way, so unlike
+    # TavernLib and the patch this needs no fingerprint sentinel: MelonLoader's
+    # update check IS the tag comparison, and a shipped copy that happens to be
+    # the current release genuinely is current. The source is recorded only so
+    # the Setup row can say where the files came from.
+    _record_source(changes, drop, "melonloader", from_bundle)
     # The tag says which release we fetched; this says what is actually on
     # disk right now, which is a different question and the only one that can
     # answer "has something changed these files since we installed them?".
     # version.dll is the shim the game itself loads, so if anything is going
     # to get quarantined, rolled back or overwritten, it's this.
     try:
-        meta["melonloader_version_sha256"] = _sha256_file(
+        changes["melonloader_version_sha256"] = _sha256_file(
             os.path.join(game_dir, "version.dll"))
     except OSError:
-        meta.pop("melonloader_version_sha256", None)
-    _save_mod_meta(game_dir, meta)
+        drop.append("melonloader_version_sha256")
+    _update_mod_meta(game_dir, changes, drop)
+
+
+def _tavernlib_install_broken(game_dir):
+    """Whether there is no TavernLib install here worth protecting. The
+    network-free half of _tavernlib_status, for the same reason as
+    _melonloader_install_broken."""
+    if not _tavernlib_installed(game_dir):
+        return True
+    meta = _load_mod_meta(game_dir)
+    recorded = meta.get("tavernlib_sha256")
+    if _file_matches_recorded(os.path.join(game_dir, "Plugins", TAVERNLIB_FILENAME),
+                              recorded) is False:
+        return True
+    return not (recorded and meta.get("tavernlib_fingerprint")
+                and meta.get("tavernlib_tag"))
 
 
 def _install_tavernlib(game_dir, on_progress):
-    """Downloads and installs the latest TavernLib.dll, with retries. No
-    bundled fallback (see _install_melonloader for why it was removed).
-    Always swaps the result in atomically, so a failed/interrupted attempt
-    can never leave a corrupt half-downloaded file in place. The meta record
-    is written only after the installed file has been read back and matches
-    what was downloaded — a failed install never updates the recorded hash."""
+    """Downloads and installs the latest TavernLib.dll, with retries, falling
+    back to the verified copy shipped in Patch/ when the download fails and
+    that copy would help (see tavern_shared.bundled). Always swaps the result
+    in atomically, so a failed/interrupted attempt can never leave a corrupt
+    half-downloaded file in place. The meta record is written only after the
+    installed file has been read back and matches what was staged — a failed
+    install never updates the recorded hash."""
     plugins_dir = os.path.join(game_dir, "Plugins")
     os.makedirs(plugins_dir, exist_ok=True)
     dest = os.path.join(plugins_dir, TAVERNLIB_FILENAME)
     tmp_dest = dest + ".download"
 
     try:
-        headers = _download_with_retries(TAVERNLIB_DOWNLOAD_URL, tmp_dest, on_progress,
-                                         require_length=True)
-        _verify_payload_type(tmp_dest, TAVERNLIB_DOWNLOAD_URL, "dll")
-        fingerprint = headers.get("ETag") or headers.get("Last-Modified") or ""
+        try:
+            headers = _download_with_retries(TAVERNLIB_DOWNLOAD_URL, tmp_dest, on_progress,
+                                             require_length=True)
+            _verify_payload_type(tmp_dest, TAVERNLIB_DOWNLOAD_URL, "dll")
+            from_bundle = False
+            # Content-Length as the last resort mirrors _fetch_remote_fingerprint
+            # exactly: on a network whose proxy strips ETag/Last-Modified, the
+            # remote check falls back to the file's size, so the install has to
+            # record that same size or the two can never agree — a fresh install
+            # would sit at 'unrecorded' (Automatic Setup reinstalling every run),
+            # an existing one at a stale fingerprint reading 'outdated' forever.
+            # require_length=True above guarantees a Content-Length exists, so
+            # something is always recorded and one install always converges.
+            fingerprint = (headers.get("ETag") or headers.get("Last-Modified")
+                           or headers.get("Content-Length") or "")
+        except DownloadError:
+            source = usable_payload("tavernlib", _tavernlib_install_broken(game_dir),
+                                    _load_mod_meta(game_dir).get("tavernlib_tag"))
+            if not source:
+                raise
+            from_bundle = True
+            tag = bundled_tag("tavernlib")
+            on_progress(f"Couldn't reach GitHub — installing the {tag} copy shipped with this launcher…")
+            # Staged through tmp_dest like a download so the atomic swap and
+            # read-back verification below cover both paths identically.
+            shutil.copyfile(source, tmp_dest)
+            # Deliberately NOT a real fingerprint. GitHub's ETag is what the
+            # update check compares against, and we never spoke to GitHub — so
+            # this records a value that cannot match one, which means the first
+            # check that does reach GitHub reads 'outdated' and pulls the real
+            # release. Recording the shipped copy's own size here instead would
+            # read 'current' forever against a proxy that strips ETags.
+            fingerprint = f"bundled:{tag}"
 
         # Captured before the replace, since tmp_dest won't exist anymore
         # afterward — os.replace renames it, it doesn't leave a copy behind.
@@ -581,24 +748,35 @@ def _install_tavernlib(game_dir, on_progress):
                 os.remove(tmp_dest)
         except Exception:
             pass
-    meta = _load_mod_meta(game_dir)
+    changes, drop = {}, []
     if fingerprint:
-        meta["tavernlib_fingerprint"] = fingerprint
+        changes["tavernlib_fingerprint"] = fingerprint
+    else:
+        # No usable header at all (can't happen while require_length holds,
+        # but a stale fingerprint would read 'outdated' forever) — drop it,
+        # same reasoning as the tag below.
+        drop.append("tavernlib_fingerprint")
     # The fingerprint is GitHub's ETag — it answers "is a newer one published?"
     # and nothing else. This is the hash of the file we actually put on disk,
     # which is what answers "is the file we installed still the file that's
     # there?" — a question the ETag cannot address at all.
-    meta["tavernlib_sha256"] = expected_hash
+    changes["tavernlib_sha256"] = expected_hash
     # Display only (see _get_latest_release_tag) — dropped rather than left
-    # stale if the tag can't be read, same as the MelonLoader tag.
-    tag = None
-    try: tag = _get_latest_release_tag(TAVERNLIB_DOWNLOAD_URL)
-    except Exception: pass
-    if tag:
-        meta["tavernlib_tag"] = tag
+    # stale if the tag can't be read, same as the MelonLoader tag. On the
+    # fallback path the manifest already knows the tag, and asking GitHub for
+    # it would just fail again on the network that sent us here.
+    if from_bundle:
+        tag = bundled_tag("tavernlib")
     else:
-        meta.pop("tavernlib_tag", None)
-    _save_mod_meta(game_dir, meta)
+        tag = None
+        try: tag = _get_latest_release_tag(TAVERNLIB_DOWNLOAD_URL)
+        except Exception: pass
+    if tag:
+        changes["tavernlib_tag"] = tag
+    else:
+        drop.append("tavernlib_tag")
+    _record_source(changes, drop, "tavernlib", from_bundle)
+    _update_mod_meta(game_dir, changes, drop)
 
 
 def _file_matches_recorded(path, recorded):
