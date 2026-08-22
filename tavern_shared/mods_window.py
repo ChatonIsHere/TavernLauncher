@@ -195,37 +195,49 @@ class SetupWindow(tk.Toplevel):
             tags = {"patch": meta.get("patch_tag"),
                     "ml":    meta.get("melonloader_tag"),
                     "tl":    meta.get("tavernlib_tag")}
+            # Whether each component was installed from the copy shipped in
+            # Patch/ rather than fetched — worth saying on the row, since an
+            # offline install is a real install of a real release but not
+            # necessarily the newest one.
+            offline = {"patch": meta.get("patch_source") == "bundled",
+                       "ml":    meta.get("melonloader_source") == "bundled",
+                       "tl":    meta.get("tavernlib_source") == "bundled"}
             self.after(0, lambda: self._apply_states(patch_state, ml, tl, tags,
-                                                     keep_status))
+                                                     offline, keep_status))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _apply_states(self, patch_state, ml_state, tl_state, tags,
+    def _apply_states(self, patch_state, ml_state, tl_state, tags, offline,
                       keep_status=None):
-        self._apply_row_state(self._patch_btn, patch_state, tags.get("patch"))
-        self._apply_row_state(self._ml_btn, ml_state, tags.get("ml"))
-        self._apply_row_state(self._tl_btn, tl_state, tags.get("tl"))
+        self._apply_row_state(self._patch_btn, patch_state, tags.get("patch"),
+                              offline.get("patch"))
+        self._apply_row_state(self._ml_btn, ml_state, tags.get("ml"),
+                              offline.get("ml"))
+        self._apply_row_state(self._tl_btn, tl_state, tags.get("tl"),
+                              offline.get("tl"))
         self._lock_row(self._ml_btn, ml_state, patch_state, "Patch")
         self._lock_row(self._tl_btn, tl_state, ml_state, "MelonLoader")
         self._status.set("" if keep_status is None else keep_status)
         if self._on_status_change: self._on_status_change()
 
-    def _apply_row_state(self, btn, state, tag=None):
+    def _apply_row_state(self, btn, state, tag=None, offline=False):
         dot, color, text = self._STATE_STYLE[state]
         btn._dotvar.set(dot)
         btn._dotlabel.config(fg=color)
         btn.config(text=text)
         note, note_color = self._STATE_NOTE[state]
         # The installed release tag (recorded at install time from the
-        # download's redirect target) is worth showing on every row so it's
-        # obvious exactly what's installed, not just that something is.
-        # "bundled:<hash>" markers are legacy: older launchers wrote them when
-        # they fell back to a copy shipped in Patch/ (a fallback that no
-        # longer exists) — still worth hiding rather than showing, and such
-        # installs read as 'outdated', so the next update replaces the marker
-        # with a real tag. Skipped for 'missing': whatever tag was once
-        # recorded, it doesn't describe an install that isn't there.
+        # download's redirect target, or from Patch/bundled.json when the
+        # shipped copy was used) is worth showing on every row so it's obvious
+        # exactly what's installed, not just that something is.
+        # "bundled:<hash>" markers are legacy: older launchers wrote one in
+        # place of the tag when falling back, so they name no release at all
+        # and are hidden rather than shown. Today's fallback records the real
+        # tag and says where it came from via `offline` instead. Skipped for
+        # 'missing': whatever tag was once recorded, it doesn't describe an
+        # install that isn't there.
         if tag and not tag.startswith("bundled:") and state != "missing":
-            note = f"{note}  ({tag})" if note else f"({tag})"
+            shown = f"{tag} · offline copy" if offline else tag
+            note = f"{note}  ({shown})" if note else f"({shown})"
         btn._notevar.set(note)
         btn._notelabel.config(fg=note_color)
 
@@ -251,14 +263,11 @@ class SetupWindow(tk.Toplevel):
         self._tl_btn.config(state=state)
         self._status.set(msg)
 
-    def _allowed_now(self, action):
-        """Whether a step that rewrites the game folder should go ahead — see
-        tavern_shared.game_guard."""
-        return confirm_while_game_running(self, self._is_game_running, action)
-
     def _on_patch_click(self):
         if self._busy: return
-        if not self._allowed_now("Replacing the game's patched assembly"): return
+        if not confirm_while_game_running(self, self._is_game_running,
+                                          "Replacing the game's patched assembly"):
+            return
         self._set_busy(True, "Checking for the latest patch…")
         exe = self._exe
         def worker():
@@ -270,7 +279,10 @@ class SetupWindow(tk.Toplevel):
                 }
                 msg = messages.get(result, "Root.Township.dll has been replaced with the Tavern patch.")
                 self.after(0, lambda: self._finish_install(True, msg))
-            except RuntimeError as e:
+            # Exception, not RuntimeError: an OSError from a locked
+            # Root.Township.dll must still reach _finish_install, or the
+            # window stays busy forever. Same rule as the other workers here.
+            except Exception as e:
                 self.after(0, lambda e=e: self._finish_install(
                     False, f"Patch failed: {e}", "Patch",
                     auto_manual=isinstance(e, DownloadError)))
@@ -278,7 +290,9 @@ class SetupWindow(tk.Toplevel):
 
     def _on_melonloader_click(self):
         if self._busy: return
-        if not self._allowed_now("Installing MelonLoader"): return
+        if not confirm_while_game_running(self, self._is_game_running,
+                                          "Installing MelonLoader"):
+            return
         arch = _detect_exe_arch(self._exe)
         if not arch:
             messagebox.showerror("Can't tell architecture",
@@ -300,7 +314,9 @@ class SetupWindow(tk.Toplevel):
 
     def _on_tavernlib_click(self):
         if self._busy: return
-        if not self._allowed_now("Installing TavernLib"): return
+        if not confirm_while_game_running(self, self._is_game_running,
+                                          "Installing TavernLib"):
+            return
         if not _melonloader_installed(self._game_dir):
             messagebox.showwarning("Install MelonLoader first",
                 "TavernLib is a MelonLoader plugin — install MelonLoader above first.", parent=self)
@@ -320,7 +336,9 @@ class SetupWindow(tk.Toplevel):
 
     def _on_automatic_setup(self):
         if self._busy: return
-        if not self._allowed_now("Running setup"): return
+        if not confirm_while_game_running(self, self._is_game_running,
+                                          "Running setup"):
+            return
         self._set_busy(True, "Running automatic setup…")
         exe, game_dir = self._exe, self._game_dir
 

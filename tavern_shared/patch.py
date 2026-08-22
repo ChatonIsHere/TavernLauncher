@@ -4,12 +4,14 @@ Applying the community Tavern patch (themoddingtavern.dll -> Root.Township.dll)
 game install, and the other should correctly see it as already done.
 """
 import os
+import shutil
 
 from tavern_shared.paths import _sha256_file
+from tavern_shared.bundled import bundled_tag, usable_payload
 from tavern_shared.mod_install import (
-    NEEDS_ATTENTION, _download_with_retries, _fetch_remote_fingerprint,
-    _file_matches_recorded, _get_latest_release_tag, _load_mod_meta,
-    _save_mod_meta, _verify_payload_type,
+    NEEDS_ATTENTION, DownloadError, _download_with_retries,
+    _fetch_remote_fingerprint, _file_matches_recorded, _get_latest_release_tag,
+    _load_mod_meta, _record_source, _update_mod_meta, _verify_payload_type,
 )
 
 PATCH_DOWNLOAD_URL = "https://github.com/ModdingTavern/TavernDefaults/releases/latest/download/themoddingtavern.dll"
@@ -94,17 +96,38 @@ def _patch_needs_attention(game_exe):
     return _patch_status(game_exe) in NEEDS_ATTENTION
 
 
+def _patch_install_broken(game_exe):
+    """Whether there is no applied patch here worth protecting. The
+    network-free half of _patch_status (see _melonloader_install_broken).
+
+    'missing' reads differently here than for the other two components and
+    that difference carries through: Root.Township.dll always exists, so an
+    absent record means the file is the game's own vanilla assembly, which
+    is exactly a state any verified patch improves on."""
+    game_dir = os.path.dirname(game_exe)
+    dst = _patch_target_path(game_exe)
+    meta = _load_mod_meta(game_dir)
+    recorded = meta.get("patch_sha256")
+    if not os.path.isfile(dst) or not recorded:
+        return True
+    if _file_matches_recorded(dst, recorded) is False:
+        return True
+    return not (meta.get("patch_fingerprint") and meta.get("patch_tag"))
+
+
 def apply_patch(game_exe, on_progress=None):
-    """Downloads themoddingtavern.dll from GitHub (with retries — no bundled
-    fallback; see _install_melonloader for why it was removed) and installs
-    it as Root.Township.dll. Skips the write if already up to date.
+    """Downloads themoddingtavern.dll from GitHub (with retries, falling back
+    to the verified copy shipped in Patch/ when the download fails and that
+    copy would help — see tavern_shared.bundled) and installs it as
+    Root.Township.dll. Skips the write if already up to date.
 
     Returns "downloaded" or "current".
-    Raises DownloadError when the download itself keeps failing (the Setup
-    window turns that into manual-install instructions), or RuntimeError on
-    a local failure — including a silent Controlled Folder Access block,
-    caught by reading the file back and comparing. The recorded hash is only
-    ever updated after that read-back confirms the install landed."""
+    Raises DownloadError when the download keeps failing and nothing usable
+    is shipped (the Setup window turns that into manual-install
+    instructions), or RuntimeError on a local failure — including a silent
+    Controlled Folder Access block, caught by reading the file back and
+    comparing. The recorded hash is only ever updated after that read-back
+    confirms the install landed."""
     if on_progress is None:
         on_progress = lambda msg: None
 
@@ -119,10 +142,34 @@ def apply_patch(game_exe, on_progress=None):
     tmp_dest = dst + ".download"
     try:
         on_progress("Checking for the latest patch…")
-        headers = _download_with_retries(PATCH_DOWNLOAD_URL, tmp_dest, on_progress,
-                                         require_length=True)
-        _verify_payload_type(tmp_dest, PATCH_DOWNLOAD_URL, "dll")
-        fingerprint = headers.get("ETag") or headers.get("Last-Modified") or ""
+        try:
+            headers = _download_with_retries(PATCH_DOWNLOAD_URL, tmp_dest, on_progress,
+                                             require_length=True)
+            _verify_payload_type(tmp_dest, PATCH_DOWNLOAD_URL, "dll")
+            from_bundle = False
+            # Content-Length as the last resort mirrors _fetch_remote_fingerprint
+            # (see _install_tavernlib): on a network whose proxy strips
+            # ETag/Last-Modified, the remote check falls back to the file's size,
+            # so recording anything else here means the two never agree and
+            # Automatic Setup re-applies the patch every run without converging.
+            # require_length=True guarantees a Content-Length exists.
+            fingerprint = (headers.get("ETag") or headers.get("Last-Modified")
+                           or headers.get("Content-Length") or "")
+        except DownloadError:
+            source = usable_payload("patch", _patch_install_broken(game_exe),
+                                    _load_mod_meta(game_dir).get("patch_tag"))
+            if not source:
+                raise
+            from_bundle = True
+            tag = bundled_tag("patch")
+            on_progress(f"Couldn't reach GitHub — applying the {tag} patch shipped with this launcher…")
+            # Staged through tmp_dest so the atomic swap and read-back check
+            # below cover the fallback exactly as they cover a download.
+            shutil.copyfile(source, tmp_dest)
+            # A value no real ETag can equal, so the first check that does
+            # reach GitHub reads 'outdated' and pulls the published file —
+            # see _install_tavernlib for the full reasoning.
+            fingerprint = f"bundled:{tag}"
 
         new_hash = _sha256_file(tmp_dest)
         already_current = os.path.isfile(dst) and _sha256_file(dst) == new_hash
@@ -149,20 +196,29 @@ def apply_patch(game_exe, on_progress=None):
         # The fingerprint is GitHub's ETag for the published file — it
         # answers _patch_status's "is a newer one out?" question, which the
         # hash of what's on disk cannot (see _install_tavernlib).
-        meta = _load_mod_meta(game_dir)
-        meta["patch_sha256"] = new_hash
+        changes, drop = {"patch_sha256": new_hash}, []
         if fingerprint:
-            meta["patch_fingerprint"] = fingerprint
-        # Display only (see _get_latest_release_tag) — dropped rather than
-        # left stale if the tag can't be read.
-        tag = None
-        try: tag = _get_latest_release_tag(PATCH_DOWNLOAD_URL)
-        except Exception: pass
-        if tag:
-            meta["patch_tag"] = tag
+            changes["patch_fingerprint"] = fingerprint
         else:
-            meta.pop("patch_tag", None)
-        _save_mod_meta(game_dir, meta)
+            # No usable header at all (can't happen while require_length
+            # holds) — drop rather than leave a stale fingerprint reading
+            # 'outdated' forever.
+            drop.append("patch_fingerprint")
+        # Display only (see _get_latest_release_tag) — dropped rather than
+        # left stale if the tag can't be read. The fallback path already has
+        # the tag from the manifest and no working route to GitHub to check.
+        if from_bundle:
+            tag = bundled_tag("patch")
+        else:
+            tag = None
+            try: tag = _get_latest_release_tag(PATCH_DOWNLOAD_URL)
+            except Exception: pass
+        if tag:
+            changes["patch_tag"] = tag
+        else:
+            drop.append("patch_tag")
+        _record_source(changes, drop, "patch", from_bundle)
+        _update_mod_meta(game_dir, changes, drop)
 
         return "current" if already_current else "downloaded"
     finally:
