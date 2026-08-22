@@ -296,11 +296,10 @@ def _open_zip_with_retry(path, retries=8, delay=1.0):
 PARTIAL_UPDATE_MARKER = "partial_update.json"
 
 
-def _marker_path(_install_dir=None):
+def _marker_path():
     """Deliberately in AppData, not next to the exe. The marker exists to
     report that writing next to the exe was blocked, so writing the report
     itself into that same folder is the one place it is most likely to fail.
-    Takes (and ignores) install_dir so the call sites read symmetrically.
 
     Duplicates tavern_shared.paths._tavern_data_dir rather than importing it:
     this module is stdlib-only on purpose, because finish_update_if_requested
@@ -309,9 +308,23 @@ def _marker_path(_install_dir=None):
     return os.path.join(base, "TheModdingTavern", PARTIAL_UPDATE_MARKER)
 
 
+def _same_install(a, b):
+    """Whether two install-dir paths name the same folder. One marker path
+    serves both launchers (see _marker_path), so the install_dir recorded
+    inside it is the only thing keeping the client from consuming a report
+    that belongs to the server install, or vice versa. realpath+normcase so
+    a case-only or 8.3-short-name difference in how the two processes
+    spelled the same folder doesn't read as foreign."""
+    try:
+        return (os.path.normcase(os.path.realpath(a)) ==
+                os.path.normcase(os.path.realpath(b)))
+    except (TypeError, ValueError, OSError):
+        return False
+
+
 def _write_partial_update_marker(install_dir, failed):
     try:
-        path = _marker_path(install_dir)
+        path = _marker_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"when": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -321,27 +334,48 @@ def _write_partial_update_marker(install_dir, failed):
         pass
 
 
-def _clear_partial_update_marker(install_dir):
-    try:
-        os.remove(_marker_path(install_dir))
-    except OSError:
-        pass
-
-
 def read_partial_update_marker():
     """What the app calls on startup to find out whether the update it just
     applied actually replaced everything. Returns the marker dict, or None if
     the last update was clean. Clearing it is the caller's job (see
-    clear_partial_update_marker) so it survives until it has been shown."""
+    clear_partial_update_marker) so it survives until it has been shown.
+
+    The marker file is shared by both launchers, so one recorded for a
+    different install dir is the OTHER launcher's still-unshown report:
+    answered with None, and deliberately not cleared, so the launcher it
+    belongs to still finds it on its own next start."""
     try:
         with open(_marker_path(), "r", encoding="utf-8") as f:
-            return json.load(f)
+            marker = json.load(f)
     except Exception:
         return None
+    if not _same_install(marker.get("install_dir"),
+                         os.path.dirname(sys.executable)):
+        return None
+    return marker
 
 
-def clear_partial_update_marker():
-    _clear_partial_update_marker(None)
+def clear_partial_update_marker(install_dir=None):
+    """Removes the marker — but only if it belongs to install_dir (default:
+    this process's own install). The path is shared by both launchers, so an
+    unconditional remove would eat the other launcher's still-unshown report;
+    an unreadable marker is removed regardless, since it can't be shown to
+    anyone. finish_update_if_requested passes install_dir explicitly because
+    its own sys.executable still points into the staging folder."""
+    if install_dir is None:
+        install_dir = os.path.dirname(sys.executable)
+    try:
+        with open(_marker_path(), "r", encoding="utf-8") as f:
+            if not _same_install(json.load(f).get("install_dir"), install_dir):
+                return
+    except OSError:
+        return  # nothing there to clear
+    except Exception:
+        pass
+    try:
+        os.remove(_marker_path())
+    except OSError:
+        pass
 
 
 def _log_update_event(msg):
@@ -630,7 +664,7 @@ def finish_update_if_requested():
                           + ", ".join(failed))
         _write_partial_update_marker(install_dir, failed)
     else:
-        _clear_partial_update_marker(install_dir)
+        clear_partial_update_marker(install_dir)
         _log_update_event("Update applied successfully, relaunching.")
     try:
         subprocess.Popen([old_exe])
