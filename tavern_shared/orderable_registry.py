@@ -26,8 +26,30 @@ class OrderableRegistry:
         remaining = [item for item in self._items if item["key"] not in saved]
         # Default fallback for anything with no saved position: built-in
         # items first, addon items after -- stable within each group.
-        remaining.sort(key=lambda item: 0 if item.get("built_in") else 1)
-        return ordered + remaining
+        # Items with 'after' parameter are positioned after their target.
+        built_ins = [item for item in remaining if item.get("built_in")]
+        addons = [item for item in remaining if not item.get("built_in")]
+        
+        # Sort addons respecting 'after' constraints
+        result = built_ins.copy()
+        positioned = set()
+        for item in addons:
+            after_key = item.get("after")
+            if after_key and after_key in by_key:
+                # Find where to insert this item
+                try:
+                    idx = result.index(by_key[after_key])
+                    result.insert(idx + 1, item)
+                    positioned.add(item["key"])
+                except ValueError:
+                    pass
+        
+        # Add remaining addons that didn't have a valid 'after' target
+        for item in addons:
+            if item["key"] not in positioned:
+                result.append(item)
+        
+        return ordered + result
 
     def save_order(self, keys):
         try:
