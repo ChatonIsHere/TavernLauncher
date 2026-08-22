@@ -28,6 +28,7 @@ except ImportError:
 from tavern_shared.log_tailer import GameLogTailer
 from tavern_shared.mod_install import _melonloader_installed, _mods_need_attention
 from tavern_shared.patch import _patch_needs_attention
+from tavern_shared.game_guard import game_is_running
 from tavern_shared.mods_window import SetupWindow
 from tavern_shared import mods
 from tavern_shared.mods.ui.manager_window import ModManagerWindow
@@ -503,7 +504,7 @@ class ServerLauncher(tk.Tk):
         safely on its own, so the honest move is to say so, every time it
         happens while the server is running."""
         self._refresh_setup_alert()
-        if self._proc and self._proc.poll() is None:
+        if game_is_running(self._proc):
             self._print("Mods changed while the server is running: the changes "
                         "take effect after a server restart. Until then, joining "
                         "players are matched against the NEW mod set while the "
@@ -674,7 +675,7 @@ class ServerLauncher(tk.Tk):
 
     def _watch(self):
         time.sleep(8)
-        if self._proc and self._proc.poll() is None:
+        if game_is_running(self._proc):
             self._print("Server ready. Players may connect.", "ok")
         else:
             self._print("Server exited unexpectedly.", "err")
@@ -718,7 +719,7 @@ class ServerLauncher(tk.Tk):
 
     def _do_auto_reboot(self):
         self._reboot_after_id = None
-        if self._proc and self._proc.poll() is None:
+        if game_is_running(self._proc):
             self._print("Auto-reboot triggered.", "warn")
             self._stop(reboot=True)
         else:
@@ -735,7 +736,7 @@ class ServerLauncher(tk.Tk):
         self.after(0, _do)
 
     def _on_close(self):
-        if self._proc and self._proc.poll() is None:
+        if game_is_running(self._proc):
             if messagebox.askyesno("Server running",
                                    "Stop the server before closing?", parent=self):
                 self._stop()
