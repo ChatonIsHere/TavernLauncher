@@ -24,6 +24,15 @@ def game_is_running(proc):
     return bool(proc and proc.poll() is None)
 
 
+def any_game_running(procs):
+    """True while any of `procs` is still alive, pruning the exited ones from
+    the list in place. A list, not one handle: the prompt below can be
+    overridden and a second copy launched, and the guard has to keep watching
+    the first for as long as it lives, not just the newest."""
+    procs[:] = [p for p in procs if game_is_running(p)]
+    return bool(procs)
+
+
 def confirm_while_game_running(parent, is_game_running, action):
     """Whether `action` should go ahead. True immediately when nothing says the
     game is running (including when the caller passes no check at all - the
