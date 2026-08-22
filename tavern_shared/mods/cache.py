@@ -202,20 +202,50 @@ def cache_restore_mod(game_dir, mod_id, version):
     _invalidate_verify_memo(game_dir, mod_id)
 
 
+def _library_present(game_dir, filename, sha256):
+    """UserLibs/<filename> is on disk with a sidecar recording exactly this
+    sha256 - the "already active" test every restore path runs before touching
+    anything. The sidecar is the authority, matching how libraries have no
+    version: a file at the right name with no (or a different) recorded hash
+    needs reinstalling."""
+    existing = _read_sidecar(_library_sidecar_path(game_dir, filename))
+    return (os.path.isfile(os.path.join(_userlibs_dir(game_dir), filename))
+            and bool(existing) and existing.get("sha256") == sha256)
+
+
 def cache_restore_library(game_dir, filename, sha256):
     """Copies a cached library (and its sidecar) into UserLibs/, unless it's
     already there with a matching hash. Raises if that exact
     filename+sha256 isn't cached."""
-    dest = os.path.join(_userlibs_dir(game_dir), filename)
-    existing = _read_sidecar(_library_sidecar_path(game_dir, filename))
-    if os.path.isfile(dest) and existing and existing.get("sha256") == sha256:
+    if _library_present(game_dir, filename, sha256):
         return
 
     src = _cache_library_dir(filename, sha256)
     if not os.path.isdir(src):
         raise ModManagerError(f"Library '{filename}' ({sha256[:12]}...) isn't in the local cache.")
-    shutil.copy2(os.path.join(src, filename), dest)
+    shutil.copy2(os.path.join(src, filename), os.path.join(_userlibs_dir(game_dir), filename))
     shutil.copy2(os.path.join(src, f"{filename}.meta.json"), _library_sidecar_path(game_dir, filename))
+
+
+def _ensure_library(game_dir, lib, progress, verb="Restoring"):
+    """Puts one pinned library into UserLibs/ at its exact hash, unless it's
+    already there: from the cache when that content is cached (a file move),
+    downloaded and then cached otherwise. Returns True when anything was
+    written, False when the library was already in place - callers decide
+    whether that counts as work done. `verb` only labels the cached-path
+    progress line: the enable repair says "Restoring" where a join render
+    says "Installing", and those strings are what the user sees."""
+    filename = _safe_basename(lib.filename)
+    if _library_present(game_dir, filename, lib.sha256):
+        return False
+    if os.path.isdir(_cache_library_dir(filename, lib.sha256)):
+        progress(f"{verb} library {filename} (cached)")
+        cache_restore_library(game_dir, filename, lib.sha256)
+    else:
+        progress(f"Downloading library {filename}")
+        install_library_dependency(game_dir, lib, progress)
+        cache_store_library(game_dir, filename)
+    return True
 
 
 def ensure_mod_libraries(game_dir, mod_id, on_progress=None):
@@ -247,16 +277,6 @@ def ensure_mod_libraries(game_dir, mod_id, on_progress=None):
             _warn(f"'{mod_id}' pins a library its record doesn't describe "
                   f"usably ({entry!r}); skipped.")
             continue
-        dest = os.path.join(_userlibs_dir(game_dir), filename)
-        meta = _read_sidecar(_library_sidecar_path(game_dir, filename))
-        if os.path.isfile(dest) and meta and meta.get("sha256") == lib.sha256:
-            continue
-        if os.path.isdir(_cache_library_dir(filename, lib.sha256)):
-            progress(f"Restoring library {filename} (cached)")
-            cache_restore_library(game_dir, filename, lib.sha256)
-        else:
-            progress(f"Downloading library {filename}")
-            install_library_dependency(game_dir, lib, progress)
-            cache_store_library(game_dir, filename)
-        restored.append(filename)
+        if _ensure_library(game_dir, lib, progress):
+            restored.append(filename)
     return restored
