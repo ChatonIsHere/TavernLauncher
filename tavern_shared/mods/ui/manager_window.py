@@ -6,9 +6,6 @@ import tkinter as tk
 from tkinter import filedialog
 from tkinter import messagebox
 
-from tavern_shared.mod_install import (
-    _melonloader_installed, _tavernlib_installed,
-)
 from tavern_shared.theme import (
     AMBER, AMBERDIM, BG, BORDER, CYAN, GREEN, MUTED, PARCH, RED, SURF, _btn,
     _mk_tree,
@@ -21,8 +18,8 @@ from tavern_shared.mods.errors import ModManagerError
 from tavern_shared.mods.hostcfg import load_cfg
 from tavern_shared.mods.install import (
     _invalidate_verify_memo, disable_mod, disable_untracked_dll, enable_mod,
-    enable_untracked_dll, install_mod_closure, list_installed_mods,
-    list_untracked_mods, mod_status, uninstall_mod,
+    enable_untracked_dll, list_installed_mods, list_untracked_mods,
+    mod_status, uninstall_mod,
 )
 from tavern_shared.mods.modlist import (
     apply_import, export_modlist, import_modlist, modlist_import_disables,
@@ -30,10 +27,11 @@ from tavern_shared.mods.modlist import (
 from tavern_shared.mods.pins import (
     _parse_pin_entry, add_pin, list_pinned, remove_pin,
 )
-from tavern_shared.mods.repos import (
-    _is_default, _source_display, fetch_indexes, list_repos,
-)
+from tavern_shared.mods.repos import fetch_indexes, list_repos
 from tavern_shared.mods.ui.community_window import CommunityModsWindow
+from tavern_shared.mods.ui.shared import (
+    install_mod_flow, meta_matches_side, source_label,
+)
 from tavern_shared.mods.ui.version_window import ModVersionWindow
 from tavern_shared.mods.version import _parse_version
 
@@ -199,7 +197,7 @@ class ModManagerWindow(tk.Toplevel):
         rows = {}
         for meta in installed:
             mod_id = meta.get("id")
-            if not mod_id or not self._meta_matches_side(meta):
+            if not mod_id or not meta_matches_side(meta, self._side):
                 continue
             s = summaries.get(mod_id)
             rows[f"m:{mod_id}"] = {
@@ -209,7 +207,7 @@ class ModManagerWindow(tk.Toplevel):
                 "installed": meta.get("version", "?"),
                 "latest": s.highest() if s else "-",
                 "managed": "Managed",
-                "source": self._source_label(s.source_repo) if s else "-",
+                "source": source_label(s.source_repo) if s else "-",
                 "summary": s, "state": "unknown",
                 "enabled": meta.get("enabled", True),
             }
@@ -221,15 +219,6 @@ class ModManagerWindow(tk.Toplevel):
                 "summary": None, "state": None, "enabled": u["enabled"],
             }
         self._rows = rows
-
-    def _meta_matches_side(self, meta):
-        key = "client_side" if self._side == "client" else "server_side"
-        return meta.get(key, True)
-
-    def _source_label(self, source_repo):
-        if _is_default(source_repo):
-            return "Modding Tavern"
-        return _source_display(source_repo)
 
     # -- table rendering --
 
@@ -305,11 +294,6 @@ class ModManagerWindow(tk.Toplevel):
 
     # -- actions --
 
-    def _allowed_now(self, action):
-        """Whether an action that writes into Mods/ should go ahead — see
-        tavern_shared.game_guard."""
-        return confirm_while_game_running(self, self._is_game_running, action)
-
     def _on_right_click(self, event):
         row = self._tree.identify_row(event.y)
         if not row:
@@ -370,37 +354,7 @@ class ModManagerWindow(tk.Toplevel):
     def _open_version_window(self, mod, versions, installed_version):
         repos = list_repos(load_cfg())
         ModVersionWindow(self, mod, versions, installed_version, repos,
-                         on_install=lambda v: self._install_version(mod, v))
-
-    def _install_version(self, mod, version):
-        if self._busy:
-            return
-        if not self._allowed_now(f"Installing {mod.name}"):
-            return
-        if not _melonloader_installed(self._game_dir):
-            messagebox.showwarning("Install MelonLoader first",
-                f"{mod.name} is a MelonLoader mod. Install MelonLoader from the "
-                "Setup window first.", parent=self)
-            return
-        if not _tavernlib_installed(self._game_dir):
-            messagebox.showwarning("Install TavernLib first",
-                f"{mod.name} needs TavernLib. Install it from the Setup window "
-                "first.", parent=self)
-            return
-        label = f"{mod.name} {version}"
-        self._set_busy(True, f"Installing {label}...")
-        index = self._index
-        def worker():
-            try:
-                repos = list_repos(load_cfg())
-                install_mod_closure(
-                    self._game_dir, mod, index, repos,
-                    lambda m: self.after(0, lambda: self._status.set(m)),
-                    self._side, version=version)
-                self.after(0, lambda: self._finish(f"{label} installed."))
-            except Exception as e:
-                self.after(0, lambda e=e: self._finish(f"Install failed: {e}"))
-        threading.Thread(target=worker, daemon=True).start()
+                         on_install=lambda v: install_mod_flow(self, mod, v))
 
     def _on_uninstall(self):
         if self._busy:
@@ -409,15 +363,16 @@ class ModManagerWindow(tk.Toplevel):
         r = self._rows.get(sel) if sel else None
         if not r or r["kind"] != "managed":
             return
-        # Asked before the confirm, not after: "the game has this open" changes
-        # whether the removal can work at all, so it isn't a footnote to a
-        # decision that's already been made.
-        if not self._allowed_now(f"Removing {r['name']}"):
-            return
         if not messagebox.askyesno("Remove mod",
                 f"Remove {r['name']} from your game?\n\nThis deletes its folder from "
                 "Mods/. Libraries shared with other installed mods are left in place.",
                 parent=self):
+            return
+        # Asked after the confirm, right before the rmtree: the confirm only
+        # blocks this window, so the player can hop to the main launcher and
+        # launch the game while it sits open.
+        if not confirm_while_game_running(self, self._is_game_running,
+                                          f"Removing {r['name']}"):
             return
         self._set_busy(True, f"Removing {r['name']}...")
         game_dir, name, mod_id = self._game_dir, r["name"], r["key"]
@@ -438,11 +393,14 @@ class ModManagerWindow(tk.Toplevel):
         if not r:
             return
         disabling = r["enabled"] is True
-        # A toggle is only a record rename, which usually survives a running
-        # game - but an ENABLE can also pull this mod's pinned libraries back
-        # into UserLibs/ (see below), and either way MelonLoader scanned Mods/
-        # at startup, so nothing here reaches the live session.
-        if not self._allowed_now(f"{'Disabling' if disabling else 'Enabling'} {r['name']}"):
+        # A disable is only a record rename, which survives a running game, so
+        # it never asks - a guard on it would just cry wolf. An ENABLE can
+        # also pull this mod's pinned libraries back into UserLibs/ (see
+        # below), a real write into the game folder, so that direction does.
+        # Either way MelonLoader scanned Mods/ at startup, so nothing here
+        # reaches the live session.
+        if not disabling and not confirm_while_game_running(
+                self, self._is_game_running, f"Enabling {r['name']}"):
             return
         self._set_busy(True, f"{'Disabling' if disabling else 'Enabling'} {r['name']}...")
         game_dir, name, kind, key = self._game_dir, r["name"], r["kind"], r["key"]
@@ -597,10 +555,14 @@ class ModManagerWindow(tk.Toplevel):
                 if plan.untracked else
                 "This modlist has nothing new to install or disable.", parent=self)
             return
-        if not self._allowed_now("Importing a modlist"):
-            return
         if not messagebox.askyesno("Import modlist",
                 "\n".join(lines) + "\n\nInstall these now?", parent=self):
+            return
+        # Asked after the confirm, right before the writes begin: the confirm
+        # only blocks this window, so the game can have been launched while it
+        # sat open.
+        if not confirm_while_game_running(self, self._is_game_running,
+                                          "Importing a modlist"):
             return
 
         self._set_busy(True, "Installing...")
