@@ -54,6 +54,31 @@ class GameIsRunning(unittest.TestCase):
         self.assertFalse(gg.game_is_running(FakeProc(exit_code=1)))
 
 
+class AnyGameRunning(unittest.TestCase):
+    """The client launcher tracks every process it has launched, because the
+    guard's prompt can be overridden and a second copy started - the guard
+    must stay live until the LAST of them exits, not the newest."""
+
+    def test_no_processes(self):
+        self.assertFalse(gg.any_game_running([]))
+
+    def test_one_live_process(self):
+        self.assertTrue(gg.any_game_running([FakeProc(exit_code=None)]))
+
+    def test_newest_exiting_does_not_blind_the_guard(self):
+        """The overridden-prompt case: the second copy exits while the first
+        still holds Mods/ open, and the guard has to keep saying so."""
+        old, new = FakeProc(exit_code=None), FakeProc(exit_code=0)
+        procs = [old, new]
+        self.assertTrue(gg.any_game_running(procs))
+        self.assertEqual(procs, [old])   # the dead handle is pruned in place
+
+    def test_all_exited(self):
+        procs = [FakeProc(exit_code=0), FakeProc(exit_code=1)]
+        self.assertFalse(gg.any_game_running(procs))
+        self.assertEqual(procs, [])
+
+
 class ConfirmWhileGameRunning(unittest.TestCase):
 
     def setUp(self):
