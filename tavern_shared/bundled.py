@@ -27,10 +27,6 @@ What makes this version safe is three rules it did not have:
     installed and says on the Setup row that it came from the shipped copy.
     See _install_tavernlib for the "bundled:<tag>" fingerprint that makes
     the next online check pull the real thing.
-
-Patch/TavernModels.dll is deliberately not listed in the manifest: nothing
-installs it (it's the plugin half of the custom_models addon, placed by
-hand), so it is a shipped file rather than a fallback for anything.
 """
 import json
 import os
