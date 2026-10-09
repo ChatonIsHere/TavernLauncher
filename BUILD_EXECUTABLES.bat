@@ -62,7 +62,7 @@ python dependencies\refresh_bundled_payloads.py
 
 echo.
 echo  Installing PyInstaller and Pillow...
-pip install pyinstaller pillow -q
+pip install pyinstaller pillow markdown tkinterweb -q
 if errorlevel 1 (
     echo  [ERROR] Failed to install PyInstaller/Pillow.
     pause
@@ -71,12 +71,12 @@ if errorlevel 1 (
 
 echo.
 echo  Building TavernLauncher - Server.exe...
-pyinstaller --onefile --windowed --clean --name "TavernLauncher - Server" --icon dependencies\att-unlocked-full.ico --add-data "dependencies\icon_data.py;." --add-data "dependencies\banner_data.py;." --add-data "dependencies\updater.py;." server\main.py
+pyinstaller --onefile --windowed --clean --name "TavernLauncher - Server" --icon dependencies\att-unlocked-full.ico --add-data "dependencies\icon_data.py;." --add-data "dependencies\banner_data.py;." --add-data "dependencies\updater.py;." --add-data "tavern_shared\help_content;tavern_shared\help_content" --collect-all tkinterweb --collect-all tkinterweb_tkhtml server\main.py
 if errorlevel 1 ( echo [ERROR] Server build failed. & pause & exit /b 1 )
 
 echo.
 echo  Building TavernLauncher - Client.exe...
-pyinstaller --onefile --windowed --clean --name "TavernLauncher - Client" --icon dependencies\att-unlocked-full.ico --add-data "dependencies\icon_data.py;." --add-data "dependencies\banner_data.py;." --add-data "dependencies\updater.py;." client\main.py
+pyinstaller --onefile --windowed --clean --name "TavernLauncher - Client" --icon dependencies\att-unlocked-full.ico --add-data "dependencies\icon_data.py;." --add-data "dependencies\banner_data.py;." --add-data "dependencies\updater.py;." --add-data "tavern_shared\help_content;tavern_shared\help_content" --collect-all tkinterweb --collect-all tkinterweb_tkhtml client\main.py
 if errorlevel 1 ( echo [ERROR] Client build failed. & pause & exit /b 1 )
 
 :: Move exes to current folder

@@ -1,9 +1,9 @@
 """
 The main Client launcher window -- username/platform/destination fields,
-Mods/Patch buttons, Check/Join Server, and the game log panel. Custom
-asset syncing is NOT hardcoded here anymore: _do_launch calls
-run_post_auth_hooks() unconditionally, and addons/custom_models/client.py
-is what actually does anything at that point, if it's part of this build.
+Setup/Mod Manager buttons, Check/Join Server, and the game log panel.
+_do_launch calls run_post_auth_hooks() unconditionally, so an addon that
+needs to act after auth (asset syncing, say) registers there rather than
+being hardcoded here.
 """
 import os
 import sys
@@ -23,6 +23,7 @@ from tavern_shared.theme import (
     _btn, _field, _hint, _section_label, _divider, _mk_combobox, _mk_scrollbar,
 )
 from tavern_shared.window_chrome import _start_hidden, _finish_dark_window, _set_window_icon, _header_crop_box
+from tavern_shared.help_pane import attach_help_tab
 from tavern_shared.assets import _HEADER_BANNER_IMG
 try:
     from PIL import Image as _PILImage, ImageTk as _PILImageTk, ImageEnhance as _PILImageEnhance
@@ -38,6 +39,7 @@ from tavern_shared.game_guard import any_game_running, confirm_while_game_runnin
 from tavern_shared.mods_window import SetupWindow
 from tavern_shared import mods
 from tavern_shared.mods.ui.manager_window import ModManagerWindow
+from tavern_shared.log_archive import archive_log_now, should_auto_archive
 from client.core.mod_diff_window import ModDiffWindow
 
 from client.core.config import (
@@ -138,6 +140,7 @@ class ClientLauncher(tk.Tk):
         self.geometry(f"{fit_w}x{fit_h}")
         self.minsize(fit_w, fit_h)
         _finish_dark_window(self)
+        attach_help_tab(self)
 
     # ── UI ─────────────────────────────────────────────────────────────────────
 
@@ -244,7 +247,13 @@ class ClientLauncher(tk.Tk):
         self._action_btn.pack(side="left", fill="x", expand=True, padx=(4,0))
 
         # ── Log ───────────────────────────────────────────────────────────────
-        _section_label(self, "GAME LOG")
+        log_header = tk.Frame(self, bg=BG)
+        log_header.pack(fill="x")
+        tk.Label(log_header, text="GAME LOG", bg=BG, fg=MUTED,
+                 font=("Georgia",8,"bold")).pack(side="left", padx=22, pady=(7,3))
+        self._archive_log_btn = _btn(log_header, "🗄 Archive Log", self._on_archive_log_click,
+             font=("Segoe UI",7), pady=2, padx=6)
+        self._archive_log_btn.pack(side="right", padx=(0,20))
         lf = tk.Frame(self, bg=BG)
         lf.pack(fill="both", expand=True, padx=20, pady=(0,8))
         lb = tk.Frame(lf, bg=SURF, highlightbackground=BORDER, highlightthickness=1)
@@ -531,6 +540,7 @@ class ClientLauncher(tk.Tk):
         self.v_show_melonloader.set(cfg.get("show_melonloader", False))
         self._print("Ready. Enter a server IP, then Check Server (optional) or Join Server.", "dim")
         self._start_log_tailer()
+        self._start_auto_archive_check()
         if _any_token_files_exist():
             self._show_token_button()
         # Immediate check at startup — the trace-driven debounce from
@@ -795,6 +805,46 @@ class ClientLauncher(tk.Tk):
         self._tailer = GameLogTailer(GAME_LOG_PATH, on_line)
         self._tailer.start()
 
+    def _archive_log_with_tailer_paused(self, on_done):
+        # The log tailer keeps its own read handle open, which blocks
+        # renaming the file -- pause it, archive, then restart it.
+        def worker():
+            self._tailer.stop_and_wait(timeout=2)
+            ok, result, locked = archive_log_now(GAME_LOG_PATH)
+            self.after(0, self._start_log_tailer)
+            self.after(0, lambda: on_done(ok, result, locked))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_archive_log_click(self):
+        def after_pausing_tailer(ok, result, locked):
+            if ok:
+                self._print(f"Log archived to {result}", "ok")
+            elif locked:
+                # Still locked with our own tailer paused -- the game
+                # itself has it open. Can't force-close a player's
+                # session to fix this, so just say what's needed.
+                self._print(
+                    "Couldn't archive the log — the game currently has it open. "
+                    "Close the game first, then try again.", "err")
+            else:
+                self._print(f"Couldn't archive log: {result}", "err")
+        self._archive_log_with_tailer_paused(after_pausing_tailer)
+
+    def _start_auto_archive_check(self):
+        # Backup for the game's own size-based archiving. Only archives
+        # when it can do so without needing the game closed.
+        try:
+            if should_auto_archive(GAME_LOG_PATH):
+                def after_pausing_tailer(ok, result, locked):
+                    if ok:
+                        self._print(f"Log passed the size threshold — auto-archived to {result}", "warn")
+                    elif not locked:
+                        self._print(f"Log passed the size threshold, but auto-archive failed: {result}", "err")
+                self._archive_log_with_tailer_paused(after_pausing_tailer)
+        except Exception:
+            pass
+        self.after(60000, self._start_auto_archive_check)
+
     def _append_log(self, line, tag):
         self.log.config(state="normal")
         self.log.insert("end", line+"\n", tag)
@@ -813,12 +863,24 @@ class ClientLauncher(tk.Tk):
         return {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
 
     def _on_join_clicked(self):
-        # Asked before anything at all — the auth handshake, the post-auth
-        # hooks (custom_models clears and re-downloads CustomAssets/), the mod
-        # render — so declining costs nothing and no game-folder write
-        # precedes the prompt.
+        # Asked before anything at all — the log archive, the auth handshake,
+        # the post-auth hooks, the mod render — so declining costs nothing
+        # and no game-folder write precedes the prompt.
         if not self._confirm_not_running("join"):
             return
+        # Archive the previous log before joining.
+        self._action_btn.config(state="disabled")
+        self._archive_log_with_tailer_paused(self._on_pre_join_archive_done)
+
+    def _on_pre_join_archive_done(self, ok, result, locked):
+        if ok:
+            self._print(f"Log archived to {result}", "ok")
+        elif not locked and result != "No active log file found to archive.":
+            self._print(f"Couldn't archive previous log: {result}", "err")
+        # Both launch paths validate before disabling the button themselves,
+        # and return early on a validation error - re-enable it first, or
+        # that early return leaves Join greyed out for good.
+        self._action_btn.config(state="normal")
         if self._selected_kind == "headless":
             self._do_launch_headless()
         else:
@@ -1289,14 +1351,18 @@ class ClientLauncher(tk.Tk):
         Mods the server doesn't require are left out, matching
         ModParity.ValidateClient: the server won't refuse a join over one, so
         neither should this. Checking them here would block launches the server
-        would have allowed, which is the whole point of the distinction."""
-        required = {m["id"]: m["version"] for m in server_mods
+        would have allowed, which is the whole point of the distinction.
+
+        A required mod with no version always mismatches, as it does in
+        ValidateClient: otherwise a client without the mod would hold "no
+        version" too and pass."""
+        required = {m["id"]: m.get("version") for m in server_mods
                     if m.get("client_side")
                     and mods.parity_required(m)}
         _, _, installed_mods, _ = mods.handshake_snapshot(game_dir)
         have = {m["id"]: m["version"] for m in installed_mods}
         return [(mid, ver, have.get(mid)) for mid, ver in required.items()
-                if have.get(mid) != ver]
+                if not ver or have.get(mid) != ver]
 
     def _report_build_divergence(self, game_dir, server_mods):
         """Advisory only: same id and version on both sides can still be
@@ -1529,7 +1595,7 @@ class ClientLauncher(tk.Tk):
         else:
             token, token_is_new, had_token_before = _token_state
 
-        user_id, error, quest_scene_required = authenticate(host, username, token, password=password)
+        user_id, error, scene_arg = authenticate(host, username, token, password=password)
 
         if error == "NEEDS_PASSWORD":
             self._action_btn.config(state="normal")
@@ -1609,10 +1675,10 @@ class ClientLauncher(tk.Tk):
         self._reconcile_mods_async(host, exe, lambda: self._launch_game(
             exe, ip, host, platform, username, user_id, token,
             lambda: self._do_launch(password=None),
-            quest_scene_required=quest_scene_required))
+            scene_arg=scene_arg))
 
     def _launch_game(self, exe, ip, host, platform, username, user_id, token,
-                     relaunch, quest_scene_required=False):
+                     relaunch, scene_arg=None):
         """Builds the tokens and starts the game. The shared tail of both join
         paths, which differ only in the token they carry (the auth flow has a
         real one, the direct flow has none) and where a rejection should rejoin
@@ -1649,11 +1715,11 @@ class ClientLauncher(tk.Tk):
         args += ["/dev_server_port", str(_valid_port(self.v_port.get()))]
         if self.v_debug_helper.get():
             args.append("/debug_helper")
-        if quest_scene_required:
+        if scene_arg:
             # Not a local preference the player can toggle — this server
             # told us during the auth handshake that it needs this, so the
             # client has to match, not choose for itself.
-            args.append("/questScene")
+            args.append(scene_arg)
 
         # Delete any stale rejection file before launching, so a file present
         # after THIS process exits was written by THIS attempt (the actual
