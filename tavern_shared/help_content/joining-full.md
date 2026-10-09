@@ -72,6 +72,7 @@ The Mod Manager keeps them up to date too. Popular ones include:
 
 When you join a server that runs mods, the client launcher compares them with yours and offers to install
 (or switch off) whatever it takes to match.
+To keep a mod you like on every server (TavernEssentials' menu boards, say), choose "Pin" when it offers to switch it off.
 
 ## Essentials
 
