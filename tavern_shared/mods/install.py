@@ -356,6 +356,31 @@ def install_mod(game_dir, mod, on_progress):
     finally:
         if os.path.isdir(staging):
             shutil.rmtree(staging, ignore_errors=True)
+    _disable_shadowed_loose_dlls(game_dir, mod.id, mod_dir)
+
+
+def _disable_shadowed_loose_dlls(game_dir, mod_id, mod_dir):
+    """A loose root Mods/<name>.dll with the same filename as a DLL this
+    install just placed is an earlier hand-installed copy of the same mod -
+    upstream TavernLauncher 1.8.5 drops TavernEssentials.dll there, for one -
+    and MelonLoader would load both. Disabled rather than deleted, by the same
+    rename as the Mod Manager's untracked toggle, so it can be turned back on.
+
+    Runs after the install has landed, and never fails it: a loose copy that
+    can't be renamed (a .disabled of that name already exists) is reported and
+    left alone. TavernLib's InstallMod applies the same rule on headless
+    servers, so both report the same untracked set afterwards."""
+    for name in sorted(os.listdir(mod_dir)):
+        if not name.lower().endswith(".dll") or not os.path.isfile(os.path.join(mod_dir, name)):
+            continue
+        try:
+            if disable_untracked_dll(game_dir, name):
+                _warn(f"Mods/{name} was a loose copy of a DLL that {mod_id} just installed; "
+                      f"disabled it so MelonLoader doesn't load it twice. It's still listed "
+                      f"under untracked mods if you want it back.")
+        except ModManagerError as e:
+            _warn(f"Mods/{name} looks like a loose copy of {mod_id}, but couldn't be "
+                  f"disabled ({e}); MelonLoader may load it twice until it's removed.")
 
 
 def collect_library_dependencies(mods):
