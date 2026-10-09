@@ -16,6 +16,7 @@ from server.core.data_store import (
     load_server_settings, save_server_settings,
     MAX_ACCOUNTS_PER_IP, SERVER_NAME_MAX_LEN, _is_valid_name, VALID_REGIONS,
 )
+from server.core.advanced_settings import AdvancedSettingsWindow
 
 class ServerSettingsWindow(tk.Toplevel):
     def __init__(self, parent, on_save=None):
@@ -36,6 +37,8 @@ class ServerSettingsWindow(tk.Toplevel):
         h.pack(fill="x"); h.pack_propagate(False)
         tk.Label(h, text="⚙  Server Settings", bg=SURF, fg=AMBER,
                  font=("Georgia",12,"bold")).pack(side="left", padx=16, pady=8)
+        _btn(h, "Advanced", self._open_advanced,
+             font=("Segoe UI",8), pady=4, padx=10).pack(side="right", padx=16)
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
         ss = load_server_settings()
 
@@ -199,6 +202,9 @@ class ServerSettingsWindow(tk.Toplevel):
 
         _btn(self, "🗑  Wipe Server Data", self._wipe_server, "danger",
              font=("Segoe UI",9), pady=7).pack(fill="x", padx=16, pady=(0,12))
+
+    def _open_advanced(self):
+        AdvancedSettingsWindow(self)
 
     def _wipe_server(self):
         target = os.path.join(

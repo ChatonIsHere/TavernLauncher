@@ -12,10 +12,6 @@ Fetches through the launcher's own _download_with_retries /
 _get_latest_release_tag / _verify_payload_type, deliberately: what ships is
 then fetched by the same code, with the same length and payload-type checks,
 that an end user's install would use.
-
-Patch/TavernModels.dll is left alone. It has no release URL to fetch from
-(it's the plugin half of the custom_models addon) and nothing installs it, so
-it's a shipped file rather than a fallback -- see tavern_shared/bundled.py.
 """
 import json
 import os

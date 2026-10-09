@@ -133,6 +133,7 @@ def load_server_settings():
     ss["enforce_ip_limit"]  = bool(ss.get("enforce_ip_limit", True))
     ss["community_listed"]  = bool(ss.get("community_listed", False))
     ss["quest_scene"]       = bool(ss.get("quest_scene", False))
+    ss["tutorial_scene"]    = bool(ss.get("tutorial_scene", False))
 
     # Restricted to the exact set the community backend will actually
     # honor, same reasoning as VALID_REGIONS' own comment above.
@@ -157,6 +158,14 @@ def load_server_settings():
     if hostname and not re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+", hostname):
         hostname = ""
     ss["public_hostname"] = hostname
+
+    try:
+        gc_timer = float(ss.get("garbage_collection_timer", 30))
+        if gc_timer <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        gc_timer = 30.0
+    ss["garbage_collection_timer"] = gc_timer
 
     return ss
 

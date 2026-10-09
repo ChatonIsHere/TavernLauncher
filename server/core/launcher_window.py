@@ -20,6 +20,7 @@ from tavern_shared.theme import (
     _btn, _field, _hint, _section_label, _divider, _mk_scrollbar,
 )
 from tavern_shared.window_chrome import _start_hidden, _finish_dark_window, _set_window_icon, _header_crop_box
+from tavern_shared.help_pane import attach_help_tab
 from tavern_shared.assets import _HEADER_BANNER_IMG
 try:
     from PIL import Image as _PILImage, ImageTk as _PILImageTk, ImageEnhance as _PILImageEnhance
@@ -32,6 +33,7 @@ from tavern_shared.game_guard import game_is_running
 from tavern_shared.mods_window import SetupWindow
 from tavern_shared import mods
 from tavern_shared.mods.ui.manager_window import ModManagerWindow
+from tavern_shared.log_archive import archive_log_now, should_auto_archive
 
 from server.core.data_store import (
     load_cfg, save_cfg, CONFIG_FILE, GAME_LOG_PATH, DISCORD_URL,
@@ -91,6 +93,7 @@ class ServerLauncher(tk.Tk):
         self._build_ui()
         self._load()
         self._start_log_tailer()
+        self._start_auto_archive_check()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         # Same reasoning as the client launcher — fit_w used to be a
         # hardcoded guess that went stale every time a row gained another
@@ -102,6 +105,7 @@ class ServerLauncher(tk.Tk):
         self.geometry(f"{fit_w}x{fit_h}")
         self.minsize(fit_w, fit_h)
         _finish_dark_window(self)
+        attach_help_tab(self)
 
     def _build_ui(self):
         self._header()
@@ -179,7 +183,13 @@ class ServerLauncher(tk.Tk):
                               font=("Georgia",12,"bold"), pady=12)
         self._btn_stop.pack(fill="x")
         self._btn_stop.config(state="disabled")
-        _section_label(self, "SERVER LOG")
+        log_header = tk.Frame(self, bg=BG)
+        log_header.pack(fill="x")
+        tk.Label(log_header, text="SERVER LOG", bg=BG, fg=MUTED,
+                 font=("Georgia",8,"bold")).pack(side="left", padx=22, pady=(7,3))
+        self._archive_log_btn = _btn(log_header, "🗄 Archive Log", self._on_archive_log_click,
+             font=("Segoe UI",7), pady=2, padx=6)
+        self._archive_log_btn.pack(side="right", padx=(0,20))
         lf = tk.Frame(self, bg=BG)
         lf.pack(fill="both", expand=True, padx=20, pady=(0,8))
         lb = tk.Frame(lf, bg=SURF, highlightbackground=BORDER, highlightthickness=1)
@@ -226,6 +236,12 @@ class ServerLauncher(tk.Tk):
         self.v_quest_scene = tk.BooleanVar(value=ss_for_quest_scene.get("quest_scene", False))
         tk.Checkbutton(df, text="Quest Scene", variable=self.v_quest_scene,
                        command=self._save_quest_scene, bg=BG, fg=MUTED, selectcolor=SURF,
+                       activebackground=BG, activeforeground=AMBER,
+                       padx=0, pady=0, borderwidth=0, highlightthickness=0,
+                       font=("Segoe UI",7)).pack(side="left", padx=(8,0))
+        self.v_tutorial_scene = tk.BooleanVar(value=ss_for_quest_scene.get("tutorial_scene", False))
+        tk.Checkbutton(df, text="Tutorial Scene", variable=self.v_tutorial_scene,
+                       command=self._save_tutorial_scene, bg=BG, fg=MUTED, selectcolor=SURF,
                        activebackground=BG, activeforeground=AMBER,
                        padx=0, pady=0, borderwidth=0, highlightthickness=0,
                        font=("Segoe UI",7)).pack(side="left", padx=(8,0))
@@ -417,8 +433,19 @@ class ServerLauncher(tk.Tk):
         something a connecting client needs to learn about via the auth
         handshake, so it has to live in server_settings.json rather than
         this launcher's own local cfg."""
+        if self.v_quest_scene.get():
+            self.v_tutorial_scene.set(False)
+        self._save_scenes()
+
+    def _save_tutorial_scene(self):
+        if self.v_tutorial_scene.get():
+            self.v_quest_scene.set(False)
+        self._save_scenes()
+
+    def _save_scenes(self):
         ss = load_server_settings()
         ss["quest_scene"] = self.v_quest_scene.get()
+        ss["tutorial_scene"] = self.v_tutorial_scene.get()
         save_server_settings(ss)
 
     def _wipe_cache(self):
@@ -621,6 +648,81 @@ class ServerLauncher(tk.Tk):
         self._tailer = GameLogTailer(GAME_LOG_PATH, on_line)
         self._tailer.start()
 
+    def _archive_log_with_tailer_paused(self, on_done):
+        # The log tailer keeps its own read handle open, which blocks
+        # renaming the file -- pause it, archive, then restart it.
+        def worker():
+            self._tailer.stop_and_wait(timeout=2)
+            ok, result, locked = archive_log_now(GAME_LOG_PATH)
+            self.after(0, self._start_log_tailer)
+            self.after(0, lambda: on_done(ok, result, locked))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_archive_log_click(self):
+        def after_pausing_tailer(ok, result, locked):
+            if ok:
+                self._print(f"Log archived to {result}", "ok")
+                return
+            if not locked:
+                self._print(f"Couldn't archive log: {result}", "err")
+                return
+
+            # Still locked with our own tailer paused -- the game itself
+            # has it open, which only happens if the server's running.
+            server_running = game_is_running(self._proc)
+            if not server_running:
+                self._print(f"Couldn't archive log: {result}", "err")
+                return
+
+            if not messagebox.askyesno("Archive Log",
+                    "The server is running and has the log file open, so it "
+                    "needs to briefly stop and restart to archive it. "
+                    "Connected players will be disconnected and can rejoin "
+                    "once it's back.\n\nContinue?", parent=self):
+                return
+
+            self._print("Archive Log: stopping the server to free the log file…", "warn")
+
+            def do_archive_then_restart():
+                ok2, result2, _locked2 = archive_log_now(GAME_LOG_PATH)
+                if ok2:
+                    self._print(f"Log archived to {result2}", "ok")
+                else:
+                    self._print(f"Couldn't archive log even after stopping the server: {result2}", "err")
+                self._start()
+
+            # _stop() clears self._proc right away, so grab it first.
+            proc_to_wait = self._proc
+            self._stop(reboot=False)
+
+            def wait_for_exit_then_archive():
+                if proc_to_wait is not None:
+                    try:
+                        proc_to_wait.wait(timeout=5)
+                    except Exception:
+                        pass
+                self.after(500, do_archive_then_restart)
+            threading.Thread(target=wait_for_exit_then_archive, daemon=True).start()
+
+        self._archive_log_with_tailer_paused(after_pausing_tailer)
+
+    def _start_auto_archive_check(self):
+        # Backup for the game's own size-based archiving, which doesn't
+        # always seem to fire reliably on a long-running server. Never
+        # restarts the server on its own -- only archives when it can do
+        # so without kicking anyone; the manual button covers the rest.
+        try:
+            if should_auto_archive(GAME_LOG_PATH):
+                def after_pausing_tailer(ok, result, locked):
+                    if ok:
+                        self._print(f"Log passed the size threshold — auto-archived to {result}", "warn")
+                    elif not locked:
+                        self._print(f"Log passed the size threshold, but auto-archive failed: {result}", "err")
+                self._archive_log_with_tailer_paused(after_pausing_tailer)
+        except Exception:
+            pass
+        self.after(60000, self._start_auto_archive_check)
+
     def _append_log(self, line, tag):
         self.log.config(state="normal")
         self.log.insert("end", line+"\n", tag)
@@ -634,6 +736,34 @@ class ServerLauncher(tk.Tk):
             messagebox.showerror("Not found",
                 "Could not find the game.\nPlease browse first.", parent=self)
             return
+        # The archive below runs on a worker thread for up to a couple of
+        # seconds before the server is actually launched, so Start has to go
+        # grey now - not when _set_running fires - or a second click in that
+        # window launches a second server.
+        if getattr(self, "_starting", False):
+            return
+        self._starting = True
+        self._btn_start.config(state="disabled")
+        # Archive the previous log before starting -- also covers auto-reboot,
+        # since that calls _start() too.
+        self._archive_log_with_tailer_paused(
+            lambda ok, result, locked: self._on_pre_start_archive_done(ok, result, locked, exe))
+
+    def _on_pre_start_archive_done(self, ok, result, locked, exe):
+        if ok:
+            self._print(f"Log archived to {result}", "ok")
+        elif not locked and result != "No active log file found to archive.":
+            self._print(f"Couldn't archive previous log: {result}", "err")
+        try:
+            self._start_after_archive(exe)
+        finally:
+            self._starting = False
+            # A launch that failed never reached _set_running(True), which
+            # is what would otherwise own the button from here.
+            if not game_is_running(self._proc):
+                self._btn_start.config(state="normal")
+
+    def _start_after_archive(self, exe):
         try: port = int(self.v_port.get())
         except: port = 1757
         self._save()
@@ -654,7 +784,9 @@ class ServerLauncher(tk.Tk):
         args += ["/fly", "/launcherauth", "/start_server", "-1", "false", str(port)]
         if self.v_debug_helper.get():
             args.append("/debug_helper")
-        if self.v_quest_scene.get():
+        if self.v_tutorial_scene.get():
+            args.append("/tutorialScene")
+        elif self.v_quest_scene.get():
             args.append("/questScene")
         self._print(f"Opening server on port {port}…", "warn")
         try:
@@ -670,6 +802,9 @@ class ServerLauncher(tk.Tk):
         self._set_running(True)
         self._print(f"Server running (PID {self._proc.pid})", "ok")
         threading.Thread(target=self._watch, daemon=True).start()
+        # Kill a still-pending reboot timer from before this start
+        if getattr(self, "_reboot_after_id", None):
+            self.after_cancel(self._reboot_after_id)
         self._reboot_after_id = None
         self._schedule_auto_reboot()
 
@@ -682,6 +817,10 @@ class ServerLauncher(tk.Tk):
             self.after(0, lambda: self._set_running(False))
 
     def _stop(self, reboot=False):
+        # A manual stop
+        if getattr(self, "_reboot_after_id", None):
+            self.after_cancel(self._reboot_after_id)
+            self._reboot_after_id = None
         if self._proc:
             try: self._proc.terminate(); self._print("Closing server…", "warn")
             except Exception as e: self._print(f"Stop failed: {e}", "err")
