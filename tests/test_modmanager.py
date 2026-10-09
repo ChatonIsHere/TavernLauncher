@@ -2549,6 +2549,43 @@ class ZipBundleInstall(_FakeInstallFixture, unittest.TestCase):
         self.assertEqual(rec["package"], "zip")
         self.assertNotIn("filename", rec)
 
+    def _loose(self, name, data=b"MZloose"):
+        os.makedirs(os.path.join(self.game, "Mods"), exist_ok=True)
+        with open(os.path.join(self.game, "Mods", name), "wb") as f:
+            f.write(data)
+
+    def test_a_loose_copy_of_an_installed_dll_is_disabled(self):
+        """Upstream 1.8.5 installs TavernEssentials as a loose
+        Mods/TavernEssentials.dll. Installing it through the manager as well
+        would have MelonLoader load it twice, so the loose copy goes."""
+        self._loose("TavernEssentials.dll")
+        self._loose("Unrelated.dll")
+        self._publish_zip("Nyx12012.Tavern-Essentials", "1.0.0",
+                          [("TavernEssentials.dll", b"MZfake")])
+        self._install("Nyx12012.Tavern-Essentials")
+
+        mods_dir = os.path.join(self.game, "Mods")
+        self.assertFalse(os.path.exists(os.path.join(mods_dir, "TavernEssentials.dll")))
+        self.assertTrue(os.path.isfile(os.path.join(mods_dir, "TavernEssentials.dll.disabled")))
+        # Disabled, not deleted, and still listed so it can be turned back on.
+        untracked = {u["name"]: u["enabled"] for u in mm.list_untracked_mods(self.game)}
+        self.assertEqual(untracked, {"TavernEssentials.dll": False, "Unrelated.dll": True})
+
+    def test_a_loose_copy_that_cant_be_disabled_doesnt_fail_the_install(self):
+        """A .disabled of the same name is someone else's file and is never
+        clobbered; the install it follows has already succeeded."""
+        self._loose("TavernEssentials.dll")
+        self._loose("TavernEssentials.dll.disabled", b"MZolder")
+        self._publish_zip("Nyx12012.Tavern-Essentials", "1.0.0",
+                          [("TavernEssentials.dll", b"MZfake")])
+        self._install("Nyx12012.Tavern-Essentials")
+
+        mods_dir = os.path.join(self.game, "Mods")
+        self.assertTrue(os.path.isfile(
+            os.path.join(mods_dir, "Nyx12012.Tavern-Essentials", "TavernEssentials.dll")))
+        with open(os.path.join(mods_dir, "TavernEssentials.dll.disabled"), "rb") as f:
+            self.assertEqual(f.read(), b"MZolder")
+
     def test_zip_shipping_its_own_manifest_json_is_not_left_damaged(self):
         """The archive's root manifest.json must not be extracted: the record
         is written under that name after the tree is hashed, so extracting it

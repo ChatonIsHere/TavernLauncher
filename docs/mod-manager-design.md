@@ -172,6 +172,15 @@ hash) but are never blocked over them, and no importer ever resolves one from
 a modlist's `untracked` block. Surfacing-and-toggling only, by design: any
 install/update path for them would be guessing identities by filename.
 
+The one exception runs the other way. When an install places a DLL whose
+filename matches a loose root `Mods/<name>.dll`, the loose copy is disabled
+(the same `.disabled` rename as the toggle), because MelonLoader would
+otherwise load the mod twice — the case for anyone who had TavernEssentials
+dropped in by upstream 1.8.5 and then installs it from the index. It never
+fails the install, and never clobbers an existing `.disabled`. Both
+`install_mod` and TavernLib's `InstallMod` apply it, so the untracked set,
+and with it the handshake hash, stays the same on both sides.
+
 ## Deliberate asymmetries (easy to "fix" wrongly)
 
 - `uninstall_mod` counts **disabled** mods as still needing their libraries;
