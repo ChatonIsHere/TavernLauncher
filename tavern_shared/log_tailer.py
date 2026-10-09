@@ -15,8 +15,24 @@ class GameLogTailer:
     def __init__(self, path, on_line, on_status=None):
         self.path, self.on_line, self.on_status = path, on_line, on_status
         self._stop = threading.Event()
-    def start(self): threading.Thread(target=self._run, daemon=True).start()
-    def stop(self):  self._stop.set()
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def stop_and_wait(self, timeout=2):
+        """Stops the tailer and waits for its file handle to actually
+        close, unlike plain stop() which just requests it. Returns True
+        if it stopped in time."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout)
+            return not self._thread.is_alive()
+        return True
     def _run(self):
         last, f, buf = -1, None, ""
         while not self._stop.is_set():

@@ -213,3 +213,11 @@ install/update path for them would be guessing identities by filename.
   server join that reinstalls them. Deliberately not backfilled by hashing
   what's on disk: that would record whatever is there now as canonical,
   including the corruption this is meant to catch.
+- TavernEssentials joins servers from its in-game board through its own
+  port-1762 handshake, and the identity JWT it builds carries `TavernToken`
+  but no `TavernMods` claim. A server enforcing client parity therefore sees
+  every board join as "no mods" and denies it whenever it requires any.
+  Joins through the launcher are unaffected. Fixing it means TavernEssentials
+  sending the claim (built the same way as `build_tokens`' `mods_claim`); it
+  can't be fixed from this side without exempting unclaimed joins, which
+  would make parity opt-out for any client.
