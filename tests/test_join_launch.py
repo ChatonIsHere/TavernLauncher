@@ -21,6 +21,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import client.core.launcher_window as lw
+from tavern_shared.mods.manifest import scene_from_arg
 
 
 class FakeWidget:
@@ -58,6 +59,7 @@ class SceneReachesTheLaunchArgs(unittest.TestCase):
 
     def _join(self, scene_arg):
         launched = []
+        self.planned_scene = []
         ns = types.SimpleNamespace(
             v_exe=FakeVar(r"C:\game\A Township Tale.exe"),
             v_username=FakeVar("Tester"),
@@ -74,11 +76,13 @@ class SceneReachesTheLaunchArgs(unittest.TestCase):
             _popen_console_kwargs=lambda: {},
             # Mod reconciliation is its own flow; here it just lets the
             # launch go ahead, the way it does when there's nothing to sync.
-            _reconcile_mods_async=lambda host, exe, go: go(),
+            _reconcile_mods_async=lambda host, exe, go, scene=None: (
+                self.planned_scene.append(scene), go()),
         )
         bind(ns, "_do_launch", "_launch_game")
         fake_mods = types.SimpleNamespace(
-            handshake_snapshot=lambda game_dir: ("", 0, [], []))
+            handshake_snapshot=lambda game_dir: ("", 0, [], []),
+            scene_from_arg=scene_from_arg)
 
         def popen(args, **kwargs):
             launched.append(args)
@@ -103,14 +107,19 @@ class SceneReachesTheLaunchArgs(unittest.TestCase):
 
     def test_a_tutorial_server_launches_into_the_tutorial_scene(self):
         self.assertIn("/tutorialScene", self._join("/tutorialScene"))
+        # ...and the mod plan is made for that scene, so pins that don't work
+        # there are left out (see plan_join's scene).
+        self.assertEqual(self.planned_scene, ["tutorial"])
 
     def test_a_quest_server_launches_into_the_quest_scene(self):
         self.assertIn("/questScene", self._join("/questScene"))
+        self.assertEqual(self.planned_scene, ["quest"])
 
     def test_a_normal_server_forces_no_scene(self):
         args = self._join(None)
         self.assertNotIn("/tutorialScene", args)
         self.assertNotIn("/questScene", args)
+        self.assertEqual(self.planned_scene, ["normal"])
 
 
 class VersionlessRequiredModFailsParity(unittest.TestCase):

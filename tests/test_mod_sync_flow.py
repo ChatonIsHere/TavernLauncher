@@ -136,7 +136,7 @@ class UnDecliningRePlans(unittest.TestCase):
         applied = []
         ns = launcher(_set_sync_busy=lambda busy: None,
                       _on_applied=lambda win: applied.append(win),
-                      _build_mod_plan=lambda game_dir, host: ("plan", (fresh, [])))
+                      _build_mod_plan=lambda game_dir, host, scene=None: ("plan", (fresh, [])))
         bind(ns, "_apply_mod_plan", "_replan_for_undeclined")
         win = FakeWindow(declined=[])
         # What the window handed back: it dropped the kept row from
@@ -159,7 +159,7 @@ class UnDecliningRePlans(unittest.TestCase):
         fresh = make_plan(entries=[entry("cool.mod"), entry("nope.mod")])
         ns = launcher(_set_sync_busy=lambda busy: None,
                       _on_applied=lambda win: None,
-                      _build_mod_plan=lambda game_dir, host: ("plan", (fresh, [])))
+                      _build_mod_plan=lambda game_dir, host, scene=None: ("plan", (fresh, [])))
         bind(ns, "_apply_mod_plan", "_replan_for_undeclined")
         self._run(ns, FakeWindow(declined=["nope.mod"]), make_plan(),
                   was_declined={"cool.mod", "nope.mod"}, was_deactivating=[])
@@ -171,7 +171,7 @@ class UnDecliningRePlans(unittest.TestCase):
         row promised, so falling back to it would be the original bug."""
         ns = launcher(_set_sync_busy=lambda busy: None,
                       _on_applied=lambda win: None,
-                      _build_mod_plan=lambda game_dir, host:
+                      _build_mod_plan=lambda game_dir, host, scene=None:
                           ("skip", "Couldn't reach the mod index: nope"))
         bind(ns, "_apply_mod_plan", "_replan_for_undeclined")
         win = FakeWindow(declined=[])
@@ -190,7 +190,7 @@ class UnDecliningRePlans(unittest.TestCase):
         without this notice it would look like the no-op being fixed here."""
         ns = launcher(_set_sync_busy=lambda busy: None,
                       _on_applied=lambda win: None,
-                      _build_mod_plan=lambda game_dir, host: ("plan", (make_plan(), [])))
+                      _build_mod_plan=lambda game_dir, host, scene=None: ("plan", (make_plan(), [])))
         bind(ns, "_apply_mod_plan", "_replan_for_undeclined")
         self._run(ns, FakeWindow(declined=[]), make_plan(),
                   was_declined={"cool.mod"}, was_deactivating=[])
@@ -205,7 +205,7 @@ class UnDecliningRePlans(unittest.TestCase):
         plan = make_plan(entries=[entry("a.mod")])
         ns = launcher(_set_sync_busy=lambda busy: None,
                       _on_applied=lambda win: None,
-                      _build_mod_plan=lambda game_dir, host: self.fail(
+                      _build_mod_plan=lambda game_dir, host, scene=None: self.fail(
                           "re-planned with nothing taken back"))
         bind(ns, "_apply_mod_plan", "_replan_for_undeclined")
         self._run(ns, FakeWindow(declined=["cool.mod"]), plan,
@@ -282,7 +282,7 @@ class NoModsVersusNoModInfo(unittest.TestCase):
             fetch_indexes=lambda bases: [],
             list_pinned=lambda cfg: [],
             list_declined=lambda cfg, host: [],
-            plan_join=lambda game_dir, sm, index, bases, pinned, declined:
+            plan_join=lambda game_dir, sm, index, bases, pinned, declined, scene=None:
                 planned.append(sm) or make_plan(to_deactivate=["local.mod"]),
         )
         ns = launcher(_get_server_mods=lambda host: server_mods)
