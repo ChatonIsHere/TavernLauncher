@@ -270,6 +270,10 @@ def _mod_record(mod, files=None):
         "libraries": [_safe_basename(l.filename)
                       for l in (mod.library_dependencies or [])],
     }
+    # Only when set: no key means every scene, on both sides (TavernLib's record
+    # omits a null one too), so older records need no rewriting.
+    if mod.scenes is not None:
+        record["scenes"] = list(mod.scenes)
     if files:
         record["files"] = dict(files)
     return record
@@ -886,7 +890,11 @@ def handshake_snapshot(game_dir):
          # version from a different repo) passes version parity but genuinely
          # diverges - this lets it at least say so. Empty when the record
          # predates the field.
-         "sha256": m.get("sha256", "")}
+         "sha256": m.get("sha256", ""),
+         # The scenes the mod works in, only when it names any - absent means
+         # every scene. Informational for the client, and like sha256 kept out
+         # of mods_hash; TavernLib's Entry omits a null one the same way.
+         **({"scenes": list(m["scenes"])} if m.get("scenes") is not None else {})}
         for m in mods
     ]
     untracked_list = [{"name": u["name"], "kind": u["kind"]} for u in untracked]

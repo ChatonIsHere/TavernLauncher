@@ -79,6 +79,48 @@ def parity_required(d):
     return value
 
 
+# The scenes a server can run, by the names a manifest's `scenes` uses.
+SCENES = ("normal", "quest", "tutorial")
+
+
+def mod_scenes(d):
+    """Which scenes a mod works in, read off a manifest, an install record, an
+    index entry or a handshake entry. None - the field absent or null - means
+    every scene, which is what every mod published before the field existed
+    gets, so this one is optional where parity_required isn't. TavernLib's
+    ModScenesField.Read is the same rule.
+
+    A present value must be a non-empty list of strings, and raises otherwise:
+    an empty list or a stray string would otherwise read as "no scenes" or "all
+    scenes" depending on who's asking. Names this build doesn't know are kept,
+    not rejected, so a scene added later doesn't make an older launcher refuse
+    the whole manifest; the index's own validator is where unknown names are
+    stopped."""
+    value = d.get("scenes")
+    if value is None:
+        return None
+    if (not isinstance(value, list) or not value
+            or not all(isinstance(s, str) and s for s in value)):
+        raise ModManagerError(
+            f"'{d.get('id', '?')}' has a scenes value of {value!r}. Leave it out "
+            f"for a mod that works in every scene, or list the ones it works in, "
+            f"out of {', '.join(SCENES)}.")
+    return list(dict.fromkeys(value))
+
+
+def runs_in_scene(scenes, scene):
+    """Whether a mod with these scenes (from mod_scenes) works in `scene`. An
+    unknown scene - None, as on a path that never learned the server's - never
+    rules a mod out."""
+    return scenes is None or scene is None or scene in scenes
+
+
+def scene_from_arg(scene_arg):
+    """The scene name for the launch argument a server asks for at auth, the
+    same mapping TavernLib's SceneIndexPatches makes from its own arguments."""
+    return {"/tutorialScene": "tutorial", "/questScene": "quest"}.get(scene_arg or "", "normal")
+
+
 @dataclass
 class ModManifest:
     manifest_version: int                   # schema version; unknown-major is skipped at parse
@@ -96,6 +138,7 @@ class ModManifest:
     source_repo: str                        # injected by fetch_indexes, NOT read from the file
     package: str = "dll"                    # "dll" (single file) or "zip" (extracted bundle)
     parity_required: bool = True            # see parity_required() above
+    scenes: list = None                     # see mod_scenes(); None = every scene
 
     def install_name(self):
         """The basename this mod's single .dll lands under in Mods/<id>/. Nothing
@@ -134,6 +177,7 @@ class ModSummary:
     source_repo: str                        # injected by fetch_indexes
     parity_required: bool = True            # carried here too, so browsing can tell
                                              # a required mod from a recommended one
+    scenes: list = None                     # the highest release's; None = every scene
 
     def highest(self):
         return max(self.versions, key=_parse_version)
@@ -194,6 +238,7 @@ def _manifest_from_dict(d, source_repo):
             source_repo=source_repo,
             package=package,
             parity_required=parity_required(d),
+            scenes=mod_scenes(d),
         )
     except KeyError as e:
         raise ModManagerError(f"manifest for {d.get('id', '?')} is missing field {e}.")
@@ -224,6 +269,13 @@ def _summary_from_dict(d, mod_id, source_repo):
         _warn(f"index entry for {mod_id} has no usable parity_required "
               f"({e}), skipped.")
         return None
+    try:
+        scenes = mod_scenes(d)
+    except ModManagerError as e:
+        # Display-only here (installs read the manifest's own), so a bad value
+        # costs the tag, not the mod.
+        _warn(f"index entry for {mod_id}: {e} Shown as working in every scene.")
+        scenes = None
     return ModSummary(
         id=mod_id,
         name=str(d.get("name", mod_id)),
@@ -234,4 +286,5 @@ def _summary_from_dict(d, mod_id, source_repo):
         versions=versions,
         source_repo=source_repo,
         parity_required=required,
+        scenes=scenes,
     )
