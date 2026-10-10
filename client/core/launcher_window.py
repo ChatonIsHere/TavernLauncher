@@ -1227,7 +1227,7 @@ class ClientLauncher(tk.Tk):
         plan is precisely the one that can't install what the row promised, and
         failing loudly is better than an apply that reports success and does
         nothing (the failure is reported in the window by the caller)."""
-        kind, payload = self._build_mod_plan(game_dir, host)
+        kind, payload = self._build_mod_plan(game_dir, host, getattr(self, "_plan_scene", None))
         if kind != "plan":
             raise mods.ModManagerError(
                 f"couldn't re-check this server's mods after you turned "
@@ -1261,12 +1261,17 @@ class ClientLauncher(tk.Tk):
         self.after(0, lambda: win.retarget(fresh))
         return fresh
 
-    def _build_mod_plan(self, game_dir, host):
+    def _build_mod_plan(self, game_dir, host, scene=None):
         """Shared front half of both mod-sync paths (the Sync Mods button and
         the pre-launch reconcile): cache what's installed, ask the server what
         it runs, and resolve that into a JoinPlan. Changes nothing on disk and
         prompts for nothing, so each caller decides for itself what a given
         outcome means. Safe to call off the UI thread.
+
+        scene is the server's, when the caller learned it at auth; plan_join
+        uses it to leave out pins that don't work there. Remembered on the
+        window so a re-plan of this same plan (_replan_for_undeclined) asks
+        the same question.
 
         Clears self._server_untracked on the way in: several of the early exits
         below return before the server is ever contacted, and a stale advisory
@@ -1282,6 +1287,7 @@ class ClientLauncher(tk.Tk):
           ("plan",  (plan, server_mods))  a usable plan, possibly blocking
         """
         self._server_untracked = []
+        self._plan_scene = scene
         if not (_melonloader_installed(game_dir) and _tavernlib_installed(game_dir)):
             return "skip", ("Community mods need MelonLoader and TavernLib "
                             "installed before they can load. Install them from "
@@ -1325,7 +1331,7 @@ class ClientLauncher(tk.Tk):
         declined = mods.list_declined(cfg, host)
         try:
             plan = mods.plan_join(game_dir, server_mods, index, repo_bases,
-                                  pinned, declined)
+                                  pinned, declined, scene=scene)
         except mods.ModManagerError as e:
             return "error", str(e)
 
@@ -1395,7 +1401,7 @@ class ClientLauncher(tk.Tk):
         except Exception:
             pass
 
-    def _reconcile_mods_async(self, host, exe, on_ready):
+    def _reconcile_mods_async(self, host, exe, on_ready, scene=None):
         """Brings Mods/ in line with this server and then calls on_ready() to
         continue the launch, or never calls it if the launch shouldn't proceed
         (having already said why and re-enabled the buttons).
@@ -1503,7 +1509,7 @@ class ClientLauncher(tk.Tk):
 
         def worker():
             try:
-                kind, payload = self._build_mod_plan(game_dir, host)
+                kind, payload = self._build_mod_plan(game_dir, host, scene)
             except Exception as e:
                 self.after(0, lambda e=e: abort(f"Could not check this server's mods: {e}"))
                 return
@@ -1675,7 +1681,7 @@ class ClientLauncher(tk.Tk):
         self._reconcile_mods_async(host, exe, lambda: self._launch_game(
             exe, ip, host, platform, username, user_id, token,
             lambda: self._do_launch(password=None),
-            scene_arg=scene_arg))
+            scene_arg=scene_arg), scene=mods.scene_from_arg(scene_arg))
 
     def _launch_game(self, exe, ip, host, platform, username, user_id, token,
                      relaunch, scene_arg=None):

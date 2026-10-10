@@ -120,7 +120,20 @@ relaunch.
   against the other side's build. `parity_required` is in it (a server can
   flip required↔recommended without a version bump); untracked stamps are in
   it (a hand-dropped DLL must move the hash). The handshake entry's `sha256`
-  field is **not** in it — additive, advisory.
+  field is **not** in it — additive, advisory. Nor is `scenes`.
+- **`scenes`** (`manifest.mod_scenes` / `ModScenesField`): optional; absent
+  or null means every scene. A present value must be a non-empty list of
+  non-empty strings or the manifest is refused; names neither side knows are
+  kept, so the index validator is the only place a misspelling is caught.
+  Records and handshake entries carry the key only when it is set, on both
+  sides. Who acts on it differs on purpose: a headless reconcile skips a
+  listed mod whose scenes exclude its launch scene (nobody to ask); the
+  server launcher asks before installing and warns at start (the operator
+  decides); a joining client drops only its own pins that exclude the
+  server's scene (mods the server runs are its own choice). Because it isn't
+  in `mods_hash`, a scenes change without a version bump reaches clients only
+  when their cached list refreshes, which is acceptable for information that
+  never blocks a join.
 - **The record shape** and the "is this folder ours" predicate (above).
 - **`_untracked_stamp`**: mtime alone, not mtime+size (a directory has no
   portable size both languages agree on).

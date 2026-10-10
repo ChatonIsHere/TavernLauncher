@@ -518,7 +518,38 @@ class ServerLauncher(tk.Tk):
             self._mod_manager_win.lift(); return
         self._mod_manager_win = ModManagerWindow(
             self, os.path.dirname(exe), side="server",
-            on_change=self._on_mods_changed)
+            on_change=self._on_mods_changed,
+            server_scene=self._server_scene)
+
+    def _server_scene(self):
+        """The scene this server is set to run, by the names a mod manifest's
+        `scenes` uses. Tutorial wins over quest, as it does for the launch
+        arguments below and in TavernLib."""
+        if self.v_tutorial_scene.get():
+            return "tutorial"
+        return "quest" if self.v_quest_scene.get() else "normal"
+
+    def _warn_mods_outside_scene(self, game_dir):
+        """Names every enabled mod that says it doesn't work in the scene this
+        start is about to run. A warning, not a block: which mods to run is the
+        operator's call, and they may know better than a manifest. A headless
+        server, with nobody to tell, skips such a mod instead."""
+        scene = self._server_scene()
+        try:
+            installed = mods.list_installed_mods(game_dir)
+        except Exception:
+            return
+        for rec in installed:
+            if not rec.get("enabled"):
+                continue
+            try:
+                scenes = mods.mod_scenes(rec)
+            except mods.ModManagerError:
+                continue
+            if not mods.runs_in_scene(scenes, scene):
+                self._print(f"{rec.get('name', rec['id'])} says it works in the "
+                            f"{', '.join(scenes)} scene{'s' if len(scenes) > 1 else ''}, "
+                            f"not the {scene} scene this server is starting in.", "warn")
 
     def _on_mods_changed(self):
         """Fires after any Setup or Mod Manager action changes what's on disk.
@@ -788,6 +819,7 @@ class ServerLauncher(tk.Tk):
             args.append("/tutorialScene")
         elif self.v_quest_scene.get():
             args.append("/questScene")
+        self._warn_mods_outside_scene(os.path.dirname(exe))
         self._print(f"Opening server on port {port}…", "warn")
         try:
             # Whether MelonLoader's console shows up is controlled by the

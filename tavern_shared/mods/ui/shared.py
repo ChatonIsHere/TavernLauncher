@@ -11,6 +11,7 @@ from tavern_shared.mod_install import (
 )
 from tavern_shared.mods.hostcfg import load_cfg
 from tavern_shared.mods.install import install_mod_closure
+from tavern_shared.mods.manifest import runs_in_scene
 from tavern_shared.mods.repos import _is_default, _source_display, list_repos
 
 
@@ -47,6 +48,17 @@ def install_mod_flow(win, mod, version=None):
             f"{mod.name} needs TavernLib. Install it from the Setup window "
             "first.", parent=win)
         return
+    # The operator's call, not a refusal: they may be about to change the
+    # scene. A headless server, with nobody to ask, skips such a mod instead.
+    server_scene = win._server_scene() if getattr(win, "_server_scene", None) else None
+    scenes = getattr(mod, "scenes", None)
+    if not runs_in_scene(scenes, server_scene):
+        if not messagebox.askyesno("Not made for this scene",
+                f"{mod.name} says it works in the {', '.join(scenes)} "
+                f"scene{'s' if len(scenes) > 1 else ''}, and this server is set "
+                f"to run the {server_scene} scene.\n\nInstall it anyway?",
+                parent=win):
+            return
     if not confirm_while_game_running(win, win._is_game_running,
                                       f"Installing {mod.name}"):
         return

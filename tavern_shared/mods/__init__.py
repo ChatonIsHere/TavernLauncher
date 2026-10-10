@@ -30,7 +30,7 @@ from tavern_shared.mods.hostcfg import set_config_accessors
 from tavern_shared.mods.layout import DISABLED_RECORD_NAME, RECORD_NAME
 from tavern_shared.mods.manifest import (
     SUPPORTED_MANIFEST_MAJOR, LibraryDependency, ModManifest, ModSummary,
-    parity_required,
+    SCENES, mod_scenes, parity_required, runs_in_scene, scene_from_arg,
 )
 from tavern_shared.mods.repos import (
     CFG_REPOS_KEY, DEFAULT_REPO, SUPPORTED_INDEX_MAJOR, add_repo, fetch_indexes,
@@ -70,7 +70,7 @@ __all__ = [
     "ModManagerError", "set_config_accessors",
     "RECORD_NAME", "DISABLED_RECORD_NAME",
     "SUPPORTED_MANIFEST_MAJOR", "LibraryDependency", "ModManifest", "ModSummary",
-    "parity_required",
+    "parity_required", "SCENES", "mod_scenes", "runs_in_scene", "scene_from_arg",
     "DEFAULT_REPO", "CFG_REPOS_KEY", "SUPPORTED_INDEX_MAJOR", "list_repos",
     "list_repos_named", "add_repo", "remove_repo", "fetch_indexes",
     "MAX_DEPENDENCY_DEPTH", "resolve_dependencies", "resolve_mod_by_id",

@@ -2975,5 +2975,109 @@ class EnsureLibraries(_TempDataDirFixture, unittest.TestCase):
         self.assertEqual(mm.ensure_mod_libraries(self.game, "ghost.m"), [])
 
 
+class Scenes(_TempDataDirFixture, unittest.TestCase):
+    """The optional `scenes` field: which of the normal/quest/tutorial scenes a
+    mod works in, absent meaning all of them. It travels like sha256 - read off
+    manifests, kept on records, reported in the handshake list - but never
+    feeds mods_hash, which has to stay byte-identical to TavernLib's."""
+
+    # parsing
+
+    def test_absent_means_every_scene(self):
+        self.assertIsNone(make_manifest("a.a", "1.0.0").scenes)
+
+    def test_a_list_is_kept_in_order_without_duplicates(self):
+        m = make_manifest("a.a", "1.0.0", scenes=["quest", "normal", "quest"])
+        self.assertEqual(m.scenes, ["quest", "normal"])
+
+    def test_an_unknown_scene_name_is_kept_not_rejected(self):
+        """A scene added later mustn't make this build refuse the manifest."""
+        self.assertEqual(make_manifest("a.a", "1.0.0", scenes=["arena"]).scenes, ["arena"])
+
+    def test_malformed_values_are_refused(self):
+        for bad in ([], "quest", ["quest", 1], [""], {"quest": True}):
+            with self.subTest(bad=bad), self.assertRaises(mm.ModManagerError):
+                make_manifest("a.a", "1.0.0", scenes=bad)
+
+    def test_index_summary_carries_scenes(self):
+        s = mm._summary_from_dict(dict(slim_entry(["1.0.0"]), scenes=["normal"]), "a.a", DEFAULT)
+        self.assertEqual(s.scenes, ["normal"])
+
+    def test_a_bad_index_value_costs_the_tag_not_the_mod(self):
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            s = mm._summary_from_dict(dict(slim_entry(["1.0.0"]), scenes=[]), "a.a", DEFAULT)
+        self.assertIsNotNone(s)
+        self.assertIsNone(s.scenes)
+
+    def test_runs_in_scene(self):
+        self.assertTrue(mm.runs_in_scene(None, "quest"))
+        self.assertTrue(mm.runs_in_scene(["normal"], None))
+        self.assertTrue(mm.runs_in_scene(["normal", "quest"], "quest"))
+        self.assertFalse(mm.runs_in_scene(["normal"], "tutorial"))
+
+    def test_scene_from_launch_arg(self):
+        self.assertEqual(mm.scene_from_arg("/tutorialScene"), "tutorial")
+        self.assertEqual(mm.scene_from_arg("/questScene"), "quest")
+        self.assertEqual(mm.scene_from_arg(None), "normal")
+        self.assertEqual(mm.scene_from_arg(False), "normal")   # authenticate's failure value
+
+    # record + handshake
+
+    def _record(self, mod_id):
+        return read_json(os.path.join(self.game, "Mods", mod_id, "manifest.json"))
+
+    def test_the_record_keeps_scenes_only_when_set(self):
+        self._install("set.m", scenes=["normal", "tutorial"])
+        self._install("unset.m")
+        self.assertEqual(self._record("set.m")["scenes"], ["normal", "tutorial"])
+        self.assertNotIn("scenes", self._record("unset.m"))
+
+    def test_the_handshake_reports_scenes_but_does_not_hash_them(self):
+        self._install("m.m")
+        before, _, entries, _ = mm.handshake_snapshot(self.game)
+        self.assertNotIn("scenes", entries[0])
+        self._install("m.m", scenes=["quest"])
+        after, _, entries, _ = mm.handshake_snapshot(self.game)
+        self.assertEqual(entries[0]["scenes"], ["quest"])
+        self.assertEqual(before, after)
+        self.assertEqual(after, hashlib.sha256(b"m.m@1.0.0@req").hexdigest())
+
+    # planning
+
+    def _plan_with_pin(self, scenes, scene, installed=False):
+        self._publish("pin.m", "1.0.0", **({"scenes": scenes} if scenes else {}))
+        if installed:
+            mm.install_mod_closure(self.game, summary("pin.m", ["1.0.0"]), [summary("pin.m", ["1.0.0"])],
+                                   [self.BASE], self.progress.append, side="client")
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            return mm.plan_join(self.game, [], [summary("pin.m", ["1.0.0"])], [self.BASE],
+                                pinned=["pin.m"], scene=scene)
+
+    def test_a_pin_for_another_scene_is_left_out_of_the_join(self):
+        plan = self._plan_with_pin(["normal"], "quest")
+        self.assertEqual(plan.entries, [])
+        self.assertFalse(plan.blocking)
+
+    def test_an_enabled_pin_for_another_scene_is_offered_as_a_deactivation(self):
+        plan = self._plan_with_pin(["normal"], "quest", installed=True)
+        self.assertEqual(plan.to_deactivate, ["pin.m"])
+
+    def test_a_pin_for_this_scene_or_any_scene_stays(self):
+        for scenes in (["quest"], None):
+            with self.subTest(scenes=scenes):
+                self.assertEqual([e.mod_id for e in self._plan_with_pin(scenes, "quest").entries],
+                                 ["pin.m"])
+
+    def test_no_known_scene_filters_nothing(self):
+        """Sync Mods and headless joins never learn the server's scene."""
+        self.assertEqual([e.mod_id for e in self._plan_with_pin(["normal"], None).entries], ["pin.m"])
+
+    def test_a_mod_the_server_runs_is_never_second_guessed(self):
+        self._publish("srv.m", "1.0.0", scenes=["normal"])
+        plan = mm.plan_join(self.game, [_srv("srv.m", "1.0.0")], [summary("srv.m", ["1.0.0"])],
+                            [self.BASE], scene="quest")
+        self.assertEqual([e.mod_id for e in plan.entries], ["srv.m"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

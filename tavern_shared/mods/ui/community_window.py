@@ -60,7 +60,7 @@ class CommunityModsWindow(tk.Toplevel):
     }
 
     def __init__(self, parent, game_dir, side="client", on_change=None,
-                 is_game_running=None):
+                 is_game_running=None, server_scene=None):
         super().__init__(parent)
         self.title("Community Mods")
         self.configure(bg=BG)
@@ -73,6 +73,10 @@ class CommunityModsWindow(tk.Toplevel):
         # install started from the browse list asks the same question one
         # started from the installed table does (see tavern_shared.game_guard).
         self._is_game_running = is_game_running
+        # Server only: a callable giving the scene the server is set to run,
+        # read at the moment of an install (see install_mod_flow). None on a
+        # client, which has no scene of its own.
+        self._server_scene = server_scene
         self._index     = []      # list[ModSummary], the merged raw index
         self._rows      = {}      # id -> row dict (see _rebuild_rows)
         self._visible_ids = []    # ids currently shown, filtered + sorted
@@ -205,6 +209,7 @@ class CommunityModsWindow(tk.Toplevel):
                 "description": s.description or "",
                 "client_side": s.client_side, "server_side": s.server_side,
                 "parity_required": s.parity_required,
+                "scenes": s.scenes,
                 "latest": s.highest(), "source": source_label(s.source_repo),
                 "summary": s, "installed": meta.get("version", "?") if meta else None,
                 "state": "missing",
@@ -296,7 +301,12 @@ class CommunityModsWindow(tk.Toplevel):
 
         side_text = self._SIDE_LABEL[(r["client_side"], r["server_side"])]
         parity_text = "Exact version required" if r["parity_required"] else "Any compatible version"
-        tk.Label(card, text=f"{side_text}  ·  {parity_text}", bg=SURF, fg=CYAN,
+        tag_text = f"{side_text}  ·  {parity_text}"
+        if r.get("scenes"):
+            # Shown only when a mod narrows it down; no segment means every scene.
+            tag_text += "  ·  " + ", ".join(s.capitalize() for s in r["scenes"]) + " scene" \
+                + ("s" if len(r["scenes"]) > 1 else "") + " only"
+        tk.Label(card, text=tag_text, bg=SURF, fg=CYAN,
                  font=("Segoe UI",8), anchor="w"
         ).pack(fill="x", padx=10, pady=(4,2))
 
