@@ -59,7 +59,7 @@ class ModManagerWindow(tk.Toplevel):
     }
 
     def __init__(self, parent, game_dir, side="client", on_change=None,
-                 is_game_running=None):
+                 is_game_running=None, server_scene=None):
         super().__init__(parent)
         self.title("Mod Manager")
         self.configure(bg=BG)
@@ -73,6 +73,10 @@ class ModManagerWindow(tk.Toplevel):
         # reading the table is harmless - and only the actions that write into
         # Mods/ ask. A launcher that passes nothing behaves as before.
         self._is_game_running = is_game_running
+        # Server only: a callable giving the scene the server is set to run,
+        # read at the moment of an install (see install_mod_flow). None on a
+        # client, which has no scene of its own.
+        self._server_scene = server_scene
         self._index     = []      # list[ModSummary], the merged raw index
         self._rows      = {}      # row id -> row dict (see _rebuild_rows)
         self._busy      = False
@@ -467,7 +471,8 @@ class ModManagerWindow(tk.Toplevel):
         self._community_win = CommunityModsWindow(
             self, self._game_dir, side=self._side,
             on_change=lambda: self._load(force=True),
-            is_game_running=self._is_game_running)
+            is_game_running=self._is_game_running,
+            server_scene=self._server_scene)
 
     def _on_export_modlist(self):
         if self._busy:

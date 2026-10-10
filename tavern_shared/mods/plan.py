@@ -15,7 +15,7 @@ from tavern_shared.mods.install import (
 from tavern_shared.mods.layout import (
     _disabled_record_path, _safe_basename, _userlibs_dir,
 )
-from tavern_shared.mods.manifest import parity_required
+from tavern_shared.mods.manifest import parity_required, runs_in_scene
 from tavern_shared.mods.pins import _parse_pin_entry
 from tavern_shared.mods.repos import _norm, _repo_shorthand
 from tavern_shared.mods.resolve import _fetch_manifest, resolve_dependencies
@@ -88,7 +88,8 @@ class JoinPlan:
         return bool(self.missing or self.needs_repo)
 
 
-def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=None):
+def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=None,
+              scene=None):
     """Computes active = required(server) UNION recommended(server, not declined)
     UNION resolve_dependencies(those) UNION pinned, and diffs it against what's
     cached/active - the render PLAN, not the render itself.
@@ -115,7 +116,12 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
     declined: mod ids the user has already said no to for THIS server. Only a
     mod the server marks parity_required false can be declined; a declined id
     the server actually requires is ignored, since no client-side choice can
-    make that join work."""
+    make that join work.
+    scene: the scene the server runs ("normal"/"quest"/"tutorial"), when the
+    caller knows it. A pin whose manifest doesn't list it is left out of this
+    join - so an enabled one shows up as a deactivation the user can still
+    Keep. Mods the server itself runs are never filtered: it chose them for its
+    own scene. None (Sync Mods, a headless join) filters nothing."""
     pinned = pinned or []
     declined = set(declined or [])
 
@@ -169,6 +175,10 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
                     needs_repo.append((mod_id, version, hint))
                 else:
                     missing.append((mod_id, version))
+            return
+        if tag == "pinned" and not runs_in_scene(manifest.scenes, scene):
+            _warn(f"pinned mod '{mod_id}' doesn't work in the {scene} scene this "
+                  f"server runs, so it's left out of this join.")
             return
         roots.append(manifest)
         reason[mod_id] = tag
