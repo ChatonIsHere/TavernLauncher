@@ -3,7 +3,7 @@ import tkinter as tk
 from tkinter import messagebox
 
 from tavern_shared.theme import BG, SURF, BORDER, AMBER, PARCH, _btn
-from tavern_shared.window_chrome import _start_hidden, _finish_dark_window
+from tavern_shared.window_chrome import _start_hidden, _finish_dark_window, _set_window_icon
 
 from server.core.data_store import load_server_settings, save_server_settings
 
@@ -20,6 +20,7 @@ class AdvancedSettingsWindow(tk.Toplevel):
         self.configure(bg=BG)
         self.geometry("380x200")
         self.resizable(False, False)
+        _set_window_icon(self)
         self._vars = {}
         self._build()
         self.update_idletasks()

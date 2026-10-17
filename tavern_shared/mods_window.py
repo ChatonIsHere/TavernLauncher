@@ -12,7 +12,7 @@ from tavern_shared.theme import (
     BG, SURF, SURF2, BORDER, AMBER, AMBERDIM, PARCH, MUTED, GREEN, RED, CYAN,
     _btn, _section_label,
 )
-from tavern_shared.window_chrome import _start_hidden, _finish_dark_window
+from tavern_shared.window_chrome import _start_hidden, _finish_dark_window, _set_window_icon
 from tavern_shared.mod_install import (
     _detect_exe_arch, _melonloader_installed, _install_melonloader,
     _melonloader_status, _tavernlib_status, _install_tavernlib,
@@ -28,6 +28,7 @@ class ModsWindow(tk.Toplevel):
         self.configure(bg=BG)
         self.geometry("520x420")
         self.resizable(False, False)
+        _set_window_icon(self)
         self._exe = exe_path
         self._game_dir = os.path.dirname(exe_path)
         self._busy = False
