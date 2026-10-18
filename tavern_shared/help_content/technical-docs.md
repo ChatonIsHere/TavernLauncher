@@ -220,3 +220,8 @@ Enabling this check will load the gameworld as the tutorial scene when the serve
 ### Check Server button
 
 This button can be clicked to probe the status of a server to make sure it's up and to see whether it has a password/whitelist or not.
+
+
+### Main Menu button
+
+This button shows up once TavernEssentials is installed (from the Mods window). It launches the game into its own main menu instead of joining a server, and the TavernEssentials server boards there let you browse and join servers from inside the game. It uses your username and platform the same way Join Server does.
