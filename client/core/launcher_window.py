@@ -235,8 +235,8 @@ class ClientLauncher(tk.Tk):
         self._sync_btn = _btn(check_row, "⇄ Sync Mods", self._on_sync_mods,
                               font=("Segoe UI",9), pady=4, padx=10)
 
-        # Check Server and Join Server sit side by side — checking is purely
-        # optional/informational now, never a gate on joining.
+        # Check Server, Join Server, and Main Menu sit side by side.
+        # Checking is purely optional/informational now, never a gate on joining.
         action_row = tk.Frame(self, bg=BG)
         action_row.pack(fill="x", padx=20, pady=(0,4))
         self._check_btn = _btn(action_row, "🔍  Check Server", self._do_check,
@@ -245,6 +245,7 @@ class ClientLauncher(tk.Tk):
         self._action_btn = _btn(action_row, "⚔  Join Server", self._on_join_clicked,
                                 style="primary", font=("Georgia",12,"bold"), pady=14)
         self._action_btn.pack(side="left", fill="x", expand=True, padx=(4,0))
+        self._menu_btn = _btn(action_row, "🏠  Main Menu", self._do_launch_menu, font=("Georgia",12,"bold"), pady=14)
 
         # ── Log ───────────────────────────────────────────────────────────────
         log_header = tk.Frame(self, bg=BG)
@@ -470,7 +471,12 @@ class ClientLauncher(tk.Tk):
 
         The checks hit the network and the disk, so they run on a worker and
         only the resulting flag is written back on the main thread -- the
-        flashing loop reads it every tick and must never block."""
+        flashing loop reads it every tick and must never block.
+
+        Also where the Main Menu button's visibility is kept current, since
+        this runs at startup, when the game path changes, and after the Setup
+        and Mod Manager windows change anything."""
+        self._refresh_menu_btn()
         exe = self.v_exe.get().strip()
         if not exe or not os.path.isfile(exe):
             self._setup_needs_attention = False
@@ -1683,6 +1689,21 @@ class ClientLauncher(tk.Tk):
             lambda: self._do_launch(password=None),
             scene_arg=scene_arg), scene=mods.scene_from_arg(scene_arg))
 
+    def _mods_claim(self, game_dir):
+        """The TavernMods claim for the tokens: id -> version of every enabled
+        managed mod. Managed mods only - the claim exists for the server's
+        exact-version parity check, and an untracked mod has no id or version
+        to check (ModParity.ValidateClient only ever looks up ids the SERVER
+        requires, so naming ours would be noise it would discard anyway).
+        Empty when Mods/ can't be read, which a server enforcing parity reads
+        as "no mods"."""
+        try:
+            _, _, mods_list, _ = mods.handshake_snapshot(game_dir)
+            return json.dumps({m["id"]: m["version"] for m in mods_list})
+        except Exception as e:
+            self._print(f"Could not read installed mods for the join handshake: {e}", "warn")
+            return ""
+
     def _launch_game(self, exe, ip, host, platform, username, user_id, token,
                      relaunch, scene_arg=None):
         """Builds the tokens and starts the game. The shared tail of both join
@@ -1693,16 +1714,7 @@ class ClientLauncher(tk.Tk):
         # Report what's actually enabled in Mods/ (after the render) so the
         # server's exact-version parity check has something to compare against;
         # see build_tokens' mods_claim.
-        mods_claim = ""
-        try:
-            _, _, mods_list, _ = mods.handshake_snapshot(os.path.dirname(exe))
-            # Managed mods only. The claim exists for the server's exact-version
-            # parity check, and an untracked mod has no id or version to check -
-            # ModParity.ValidateClient only ever looks up ids the SERVER
-            # requires, so naming ours would be noise it would discard anyway.
-            mods_claim = json.dumps({m["id"]: m["version"] for m in mods_list})
-        except Exception as e:
-            self._print(f"Could not read installed mods for the join handshake: {e}", "warn")
+        mods_claim = self._mods_claim(os.path.dirname(exe))
 
         access, refresh, identity = build_tokens(user_id, username, token, mods_claim)
         args = [exe, "/force_offline",
@@ -1924,3 +1936,99 @@ class ClientLauncher(tk.Tk):
             exe, ip, resolved_host, platform, username, user_id, "",
             self._do_launch_headless))
 
+    def _refresh_menu_btn(self):
+        """Shows Main Menu button only when TavernEssentials is installed for the selected game,
+        since that's what fills the main menu's server boards. Runs from _refresh_setup_alert,
+        so it updates on startup, when the game path changes, and after the Setup or Mod Manager
+        window changes anything."""
+        exe = self.v_exe.get().strip()
+        game_dir = os.path.dirname(exe)
+        show = bool(exe) and os.path.isfile(exe) and _tavernessentials_installed(game_dir)
+        packed = self._menu_btn.winfo_manager() == "pack"
+        if show and not packed:
+            self._menu_btn.pack(side="left", fill="x", expand=True, padx=(4, 0),
+                                after=self._action_btn)
+        elif not show and packed:
+            self._menu_btn.pack_forget()
+
+    def _do_launch_menu(self):
+        """Launches the game into its main menu instead of a server.
+        Same offline identity as a headless join (see _headless_user_id),
+        just without /join_local_server, so the game falls through to the
+        main menu on startup. No server is contacted, so there is no handshake
+        and no per-server token."""
+        exe      = self.v_exe.get().strip()
+        username = self.v_username.get().strip()
+        platform = self.v_platform.get().strip()
+        platform = PLATFORM_DISPLAY_TO_BACKEND.get(platform, platform)
+
+        if not exe or not os.path.isfile(exe):
+            messagebox.showerror("Not Found",
+                "Could not find the game.\nPlease browse to 'A Township Tale.exe'.", parent=self)
+            return
+        if not username:
+            messagebox.showerror("Missing name",
+                "Please enter your name before launching the menu.", parent=self)
+            return
+        if len(username) > USERNAME_MAX_LEN:
+            messagebox.showerror("Name Too Long",
+                f"Name can be at most {USERNAME_MAX_LEN} characters.", parent=self)
+            return
+        if not _is_valid_username(username):
+            messagebox.showerror("Invalid Name",
+                "Name can only contain letters, numbers, spaces, hyphens, and underscores.", parent=self)
+            return
+
+        self._save()
+
+        user_id = _headless_user_id(username)
+        # The same mods claim a join carries, so a server joined from the
+        # in-game boards can check this player's mods if the identity reaches it.
+        access, refresh, identity = build_tokens(user_id, username, "",
+                                                 self._mods_claim(os.path.dirname(exe)))
+        args = [exe, "/force_offline",
+                "/access_token", access, "/refresh_token", refresh,
+                "/identity_token", identity]
+
+        if platform in ("none", "fly"):
+            args.append("/fly")
+        elif platform:
+            args += ["/vrmode", platform]
+        if self.v_debug_helper.get():
+            args.append("/debug_helper")
+
+        self._print(f"Launching main menu on {platform or 'default'}...", "warn")
+        try:
+            proc = subprocess.Popen(args, cwd=os.path.dirname(exe),
+                                    **self._popen_console_kwargs())
+            # Tracked like a joined game, so the Setup and Mod Manager windows
+            # know the game is up before they write into its folder.
+            self._game_procs.append(proc)
+            self._print(f"Menu running (PID {proc.pid})", "ok")
+        except Exception as e:
+            self._print(f"Menu launch failed: {e}", "err")
+
+
+def _tavernessentials_installed(game_dir):
+    """Whether TavernEssentials will load in this game folder: an enabled
+    TavernEssentials.dll, either loose in Mods/ (how upstream 1.8.5 installed
+    it) or inside a mod folder MelonLoader loads, one with a manifest.json
+    (how the Mod Manager installs it). Read off the files rather than an index
+    id, so it holds whichever way it got there."""
+    mods_dir = os.path.join(game_dir, "Mods")
+    try:
+        entries = os.listdir(mods_dir)
+    except OSError:
+        return False
+    for name in entries:
+        full = os.path.join(mods_dir, name)
+        if name.lower() == "tavernessentials.dll" and os.path.isfile(full):
+            return True
+        if (os.path.isdir(full) and not name.startswith((".", "~"))
+                and os.path.isfile(os.path.join(full, "manifest.json"))):
+            try:
+                if any(f.lower() == "tavernessentials.dll" for f in os.listdir(full)):
+                    return True
+            except OSError:
+                pass
+    return False
