@@ -21,7 +21,7 @@ from tavern_shared.theme import (
     CYAN, _btn, _section_label,
 )
 from tavern_shared.game_guard import confirm_while_game_running
-from tavern_shared.window_chrome import _start_hidden, _finish_dark_window
+from tavern_shared.window_chrome import _start_hidden, _finish_dark_window, _set_window_icon
 from tavern_shared.manual_install import ManualInstallWindow
 from tavern_shared.patch import _patch_status, apply_patch
 from tavern_shared.mod_install import (
@@ -46,6 +46,7 @@ class SetupWindow(tk.Toplevel):
         self.configure(bg=BG)
         self.geometry("520x480")
         self.resizable(False, False)
+        _set_window_icon(self)
         self._exe = exe_path
         self._game_dir = os.path.dirname(exe_path)
         self._busy = False

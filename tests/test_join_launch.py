@@ -14,7 +14,9 @@ As in test_mod_sync_flow, the window is never built: the methods under test
 are bound onto a plain namespace, with each collaborator stood in for.
 """
 import os
+import shutil
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -79,7 +81,7 @@ class SceneReachesTheLaunchArgs(unittest.TestCase):
             _reconcile_mods_async=lambda host, exe, go, scene=None: (
                 self.planned_scene.append(scene), go()),
         )
-        bind(ns, "_do_launch", "_launch_game")
+        bind(ns, "_do_launch", "_launch_game", "_mods_claim")
         fake_mods = types.SimpleNamespace(
             handshake_snapshot=lambda game_dir: ("", 0, [], []),
             scene_from_arg=scene_from_arg)
@@ -120,6 +122,88 @@ class SceneReachesTheLaunchArgs(unittest.TestCase):
         self.assertNotIn("/tutorialScene", args)
         self.assertNotIn("/questScene", args)
         self.assertEqual(self.planned_scene, ["normal"])
+
+
+class MainMenuLaunch(unittest.TestCase):
+    """The Main Menu button (upstream 1.8.5): the game started with the
+    offline identity a headless join uses, minus /join_local_server.
+    Upstream's version called self._popen._console_kwargs(), which raised
+    inside its own try, so every launch only ever logged a failure."""
+
+    def _launch(self):
+        launched, printed = [], []
+        ns = types.SimpleNamespace(
+            v_exe=FakeVar(r"C:\game\A Township Tale.exe"), v_username=FakeVar("Tester"),
+            v_platform=FakeVar("fly"), v_debug_helper=FakeVar(False), _game_procs=[],
+            _save=lambda: None, _print=lambda msg, tag="": printed.append((msg, tag)),
+            _popen_console_kwargs=lambda: {})
+        bind(ns, "_do_launch_menu", "_mods_claim")
+        fake_mods = types.SimpleNamespace(
+            handshake_snapshot=lambda d: ("", 1, [{"id": "a.mod", "version": "1.2.3"}], []))
+        claims = []
+
+        def popen(args, **kwargs):
+            launched.append(args)
+            return FakeProc()
+
+        with mock.patch.object(lw.os.path, "isfile", lambda p: True), \
+             mock.patch.object(lw, "mods", fake_mods), \
+             mock.patch.object(lw, "build_tokens",
+                               lambda uid, name, token="", claim="": claims.append(claim) or ("a", "r", "i")), \
+             mock.patch.object(lw.subprocess, "Popen", popen):
+            ns._do_launch_menu()
+        return ns, launched, printed, claims
+
+    def test_launches_into_the_menu_not_a_server(self):
+        _, launched, printed, _ = self._launch()
+        self.assertEqual(len(launched), 1, printed)
+        self.assertIn("/fly", launched[0])
+        self.assertNotIn("/join_local_server", launched[0])
+        self.assertFalse(any(tag == "err" for _, tag in printed), printed)
+
+    def test_the_game_is_tracked_like_a_joined_one(self):
+        ns, _, _, _ = self._launch()
+        self.assertEqual(len(ns._game_procs), 1)
+
+    def test_it_carries_the_same_mods_claim_as_a_join(self):
+        _, _, _, claims = self._launch()
+        self.assertEqual(claims, ['{"a.mod": "1.2.3"}'])
+
+
+class TavernEssentialsDetection(unittest.TestCase):
+    """What shows the Main Menu button: an enabled TavernEssentials.dll,
+    loose (upstream 1.8.5's install) or in a loaded mod folder (ours)."""
+
+    def setUp(self):
+        self.game = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.game, ignore_errors=True)
+        os.makedirs(os.path.join(self.game, "Mods"))
+
+    def _file(self, *parts):
+        path = os.path.join(self.game, "Mods", *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "wb").close()
+
+    def test_nothing_installed(self):
+        self.assertFalse(lw._tavernessentials_installed(self.game))
+
+    def test_loose_dll(self):
+        self._file("TavernEssentials.dll")
+        self.assertTrue(lw._tavernessentials_installed(self.game))
+
+    def test_managed_folder(self):
+        self._file("Nyx12012.Tavern-Essentials", "manifest.json")
+        self._file("Nyx12012.Tavern-Essentials", "TavernEssentials.dll")
+        self.assertTrue(lw._tavernessentials_installed(self.game))
+
+    def test_disabled_copies_do_not_count(self):
+        self._file("TavernEssentials.dll.disabled")
+        self._file("Nyx12012.Tavern-Essentials", "manifest.disabled.json")
+        self._file("Nyx12012.Tavern-Essentials", "TavernEssentials.dll")
+        self.assertFalse(lw._tavernessentials_installed(self.game))
+
+    def test_no_game_folder(self):
+        self.assertFalse(lw._tavernessentials_installed(os.path.join(self.game, "missing")))
 
 
 class VersionlessRequiredModFailsParity(unittest.TestCase):
