@@ -1181,7 +1181,7 @@ class ClientLauncher(tk.Tk):
         self._print(f"Launching main menu on {platform or 'default'}...", "warn")
         try:
             proc = subprocess.Popen(args, cwd=os.path.dirname(exe),
-                                    **self._popen._console_kwargs())
+                                    **self._popen_console_kwargs())
             self._print(f"Menu running (PID {proc.pid})", "ok")
         except Exception as e:
             self._print(f"Menu launch failed: {e}", "err")
