@@ -12,6 +12,7 @@ import json
 import threading
 import hashlib
 import secrets
+import shutil
 import unicodedata
 
 FAIL_LIMIT, FAIL_WINDOW = 8, 60
@@ -177,6 +178,11 @@ def save_server_settings(d):
 
 _users_lock = threading.RLock()
 
+# Set when users.json exists but can't be read. Saving then would write the
+# empty fallback over every account, so _save_all_data refuses until the file
+# reads cleanly again (fix it by hand or copy users.json.bak back).
+_users_load_failed = False
+
 
 def _migrate_to_unified_users_file():
     """One-time merge: this launcher used to keep the player database,
@@ -235,11 +241,17 @@ def _load_all_data():
     """The whole unified file — {"users", "whitelist", "blacklist"} — with
     every section guaranteed present so callers never need to guard for a
     partially-populated or freshly-created file."""
+    global _users_load_failed
     with _users_lock:
         try:
             d = json.load(open(USERS_FILE))
+            _users_load_failed = not isinstance(d, dict)
+        except FileNotFoundError:
+            d = {}
+            _users_load_failed = False
         except Exception:
             d = {}
+            _users_load_failed = True
         if not isinstance(d, dict):
             d = {}
         d.setdefault("users", {})
@@ -252,7 +264,17 @@ def _load_all_data():
 
 def _save_all_data(d):
     with _users_lock:
-        try: json.dump(d, open(USERS_FILE, "w"), indent=2)
+        if _users_load_failed:
+            return
+        tmp = USERS_FILE + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(d, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.path.isfile(USERS_FILE):
+                shutil.copyfile(USERS_FILE, USERS_FILE + ".bak")
+            os.replace(tmp, USERS_FILE)
         except Exception: pass
 
 
