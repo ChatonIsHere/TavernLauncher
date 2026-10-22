@@ -7,6 +7,7 @@ itself -- NOT the admin-facing TicketsWindow UI, that's separate).
 import os
 import sys
 import re
+import math
 import time
 import json
 import threading
@@ -25,6 +26,10 @@ GAME_LOG_PATH = os.path.join(os.path.expanduser("~"), "AppData", "Roaming",
 
 PLAYERS_SAVE   = os.path.join(os.path.expanduser("~"),"AppData","Roaming",
     "A Township Tale","Servers","-1","Save","Players")
+
+# The server's whole data folder -- what the automatic backups zip up.
+SERVER_DATA_DIR = os.path.join(os.path.expanduser("~"), "AppData", "Roaming",
+    "A Township Tale", "Servers", "-1")
 
 
 USERS_FILE     = os.path.join(_tavern_data_dir(),"users.json")
@@ -167,6 +172,24 @@ def load_server_settings():
     except (TypeError, ValueError):
         gc_timer = 30.0
     ss["garbage_collection_timer"] = gc_timer
+
+    # Hours between automatic backups; 0 means no backups.
+    try:
+        backup_hours = float(ss.get("server_backup_time", 0))
+        if not math.isfinite(backup_hours) or backup_hours < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        backup_hours = 0.0
+    ss["server_backup_time"] = backup_hours
+
+    # How many backups to keep; 0 means keep them all.
+    try:
+        max_backups = int(ss.get("server_backup_max_backups", 0))
+        if max_backups < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        max_backups = 0
+    ss["server_backup_max_backups"] = max_backups
 
     return ss
 
