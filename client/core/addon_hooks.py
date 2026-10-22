@@ -19,13 +19,13 @@ def register_before_launch_hook(key, callback):
 
 def build_launcher_actions(parent, launcher):
     from tavern_shared.theme import _btn
-    for label, callback in _actions.values():
+    for label, callback in list(_actions.values()):
         _btn(parent, label, lambda cb=callback: cb(launcher),
              font=("Segoe UI", 9), pady=5, padx=10).pack(side="left", padx=(6, 0))
 
 
 def run_before_launch_hooks(host, game_exe, log_fn):
-    for key, callback in _before_launch.items():
+    for key, callback in list(_before_launch.items()):
         try:
             callback(host, game_exe, log_fn)
         except Exception:
