@@ -135,21 +135,15 @@ class SetupWindow(tk.Toplevel):
         "unknown":    ("●", MUTED, "⟳ Reinstall"),
         "current":    ("●", GREEN, "⟳ Reinstall"),
     }
-    # Every state gets a note — a row that says nothing reads as "probably
-    # fine", which is the one thing 'missing' and 'unknown' are not. The
-    # note is tinted to match the dot for the states that ask for action,
-    # so "Update available" doesn't render in the same grey as "Up to date".
+    # Every state gets a note (a silent row reads as "probably fine"), tinted
+    # like the dot for the states that ask for action.
     _STATE_NOTE = {
         "missing":    ("Not installed yet.", MUTED),
         "outdated":   ("Update available — a newer version is published.", AMBER),
-        # Deliberately says what was checked, not just that something is
-        # wrong: this state exists to catch the case where the version looks
-        # right and the file isn't, which is otherwise indistinguishable from
-        # a healthy install.
+        # Says what was checked: the version looks right, the file isn't.
         "damaged":    ("Installed file doesn't match what was installed — repair it.", RED),
-        # Installed and probably fine, but with no recorded baseline there's
-        # no damage detection, no update checks and no version display.
-        # Reinstalling records everything, and Automatic Setup does it.
+        # No recorded baseline: no damage detection, update checks or version
+        # display until a reinstall (Automatic Setup does it) records one.
         "unrecorded": ("Installed, but its install record is incomplete — "
                        "reinstall (or run Automatic Setup) to enable update checks.", AMBER),
         "unknown":    ("Installed — couldn't check for updates.", MUTED),
@@ -316,13 +310,10 @@ class SetupWindow(tk.Toplevel):
         stage = ["Patch"]
 
         def work(progress):
-            # Each step runs on AUTO_SETUP_STATES: everything that flashes
-            # the main window's Setup alert (missing/outdated/damaged), plus
-            # 'unrecorded' — an incomplete install record is repaired by
-            # exactly this reinstall. 'unknown' stays skipped: it means the
-            # update CHECK didn't happen, and reinstalling over an unreachable
-            # GitHub would turn "everything's installed" into guaranteed
-            # download failures instead of a completed no-op.
+            # AUTO_SETUP_STATES: what flashes the Setup alert, plus
+            # 'unrecorded', which this reinstall repairs. Not 'unknown': the
+            # update check failed, and reinstalling over an unreachable GitHub
+            # would turn a no-op into a guaranteed download failure.
             changed = False
             if (shown.get("patch") or _patch_status(exe)) in AUTO_SETUP_STATES:
                 progress("Applying patch…")
@@ -350,13 +341,9 @@ class SetupWindow(tk.Toplevel):
 
     def _finish_install(self, ok, msg, component=None, auto_manual=False):
         """auto_manual opens the Manual Install window itself rather than
-        just revealing the button. Reserved for a download that failed every
-        one of its retries (DownloadError): at that point "try again" has
-        demonstrably been tried, the browser route is the useful next step,
-        and waiting for the user to discover the button just delays it. Local
-        failures (blocked writes, wrong paths) still only reveal the button —
-        those aren't fixed by downloading in a browser, so the window
-        shouldn't leap out for them."""
+        just revealing the button: for a download that failed all its retries
+        (DownloadError), where the browser route is the next step. Local
+        failures (blocked writes, wrong paths) only reveal the button."""
         self._set_busy(False, msg)
         if ok:
             self._hide_manual_offer()
