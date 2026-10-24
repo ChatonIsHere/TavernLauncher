@@ -13,8 +13,8 @@ from dataclasses import dataclass
 
 from tavern_shared.mods.errors import ModManagerError
 from tavern_shared.mods.install import (
-    collect_library_dependencies, disable_mod, install_mod_set,
-    list_installed_mods, list_untracked_mods,
+    _scan_mods, collect_library_dependencies, disable_mod, install_mod_set,
+    list_installed_mods,
 )
 from tavern_shared.mods.pins import _parse_pin_entry
 from tavern_shared.mods.repos import list_repos_named
@@ -41,14 +41,11 @@ def export_modlist(game_dir, cfg, pin_versions=False):
     active set, not everything present on disk. All an exporter can honestly say
     about one is what it's called and what shape it is - there's no id, version,
     or source to record, which is exactly why no importer can act on it."""
-    entries = []
-    for m in sorted(list_installed_mods(game_dir), key=lambda r: r["id"]):
-        if not m.get("enabled"):
-            continue
-        entries.append(f"{m['id']}@{m['version']}" if pin_versions else m["id"])
+    installed, untracked = _scan_mods(game_dir)
+    entries = [f"{m['id']}@{m['version']}" if pin_versions else m["id"]
+               for m in sorted(installed, key=lambda r: r["id"]) if m.get("enabled")]
     untracked = [{"name": u["name"], "kind": u["kind"]}
-                 for u in sorted(list_untracked_mods(game_dir),
-                                 key=lambda u: u["name"].lower())
+                 for u in sorted(untracked, key=lambda u: u["name"].lower())
                  if u["enabled"]]
     return {
         "schema": MODLIST_SCHEMA,
