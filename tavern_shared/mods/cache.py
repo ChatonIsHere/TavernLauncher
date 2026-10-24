@@ -10,6 +10,7 @@ from tavern_shared.mods.errors import ModManagerError, _warn
 from tavern_shared.mods.install import (
     _clear_install_path, _invalidate_verify_memo, _read_mod_record,
     _read_sidecar, install_library_dependency, list_installed_mods,
+    verify_mod_files,
 )
 from tavern_shared.mods.layout import (
     DISABLED_RECORD_NAME, RECORD_NAME, _library_sidecar_path, _mod_dir_path,
@@ -73,6 +74,8 @@ def cache_store_mod(game_dir, mod_id):
     dest = _cache_mod_dir(mod_id, version)
     if os.path.isdir(dest):
         return version
+    if verify_mod_files(game_dir, mod_id) is False:
+        return None     # never cache a damaged copy as the good one
 
     src = _mod_dir_path(game_dir, mod_id)
     staging = dest + ".caching"
