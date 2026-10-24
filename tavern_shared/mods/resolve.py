@@ -5,19 +5,12 @@ from tavern_shared.mods.manifest import _manifest_from_dict
 from tavern_shared.mods.repos import _norm
 from tavern_shared.mods.version import _parse_version
 
-# _get_json is reached through the module (repos._get_json) rather than
-# imported by name on purpose: it is the network seam the tests stub, and a
-# by-name import would bind a second copy here that stubbing repos wouldn't
-# reach. _norm is a pure function nothing ever replaces, so it imports plainly.
+# repos._get_json is reached through the module: it's the network seam tests
+# stub, and a by-name import wouldn't see the stub.
 
 
-# A backstop distinct from cycle detection: a real cycle (A -> B -> A) is caught
-# regardless of this number, but a long strictly-acyclic chain would still
-# recurse once per link, and a broken/adversarial chain doesn't have to be a
-# cycle to be a problem. Kept deliberately low: real chains are 1 to 2 hops,
-# occasionally 3; anything hitting this cap is almost certainly a mistake. Turns
-# a pathological chain into one clear "too deep" error instead of a raw
-# RecursionError.
+# A backstop for long acyclic chains (cycles are caught regardless). Real
+# chains are one to three hops.
 MAX_DEPENDENCY_DEPTH = 5
 
 
@@ -35,56 +28,28 @@ def _clear_manifest_memo():
 
 
 def _runs_on(manifest, side):
-    """Whether this mod can load at all in a `side` process, straight off its own
-    manifest's client_side/server_side. Read from the per-version MANIFEST, never
-    from a ModSummary: the manifest requires both fields (a missing one is a parse
-    error), while a summary defaults them to False, so a hand-rolled third-party
-    index omitting them would otherwise prune the dependency on both sides."""
+    """Whether this mod can load in a `side` process. Read off the per-version
+    manifest, which requires both flags; a ModSummary defaults them to False."""
     return manifest.client_side if side == "client" else manifest.server_side
 
 
 def resolve_dependencies(roots, summary_index, fetch_manifest, side):
-    """Resolves the full dependency *closure* of one OR MORE root mods, returning
-    a flat, deduplicated list of ModManifests (the roots themselves not included;
-    the caller already has them).
+    """The dependency closure of one or more roots as a flat, deduplicated
+    list of ModManifests, roots excluded. Several roots at once is what lets
+    two independent required mods be caught pulling incompatible versions of
+    a shared dependency.
 
-    `side` is "client" or "server" -- the kind of process this closure is being
-    installed into -- and is mandatory, with no default. A dependency that can't
-    run on that side is dropped, along with everything only it needed. That is a
-    derivation, not a guess: server_side false means the mod cannot load in a
-    server process at all, so nothing running in a server process can hard-depend
-    on it, and "M depends on D" where D is client-only has exactly one coherent
-    reading -- M's client half needs D. (A mod whose server half genuinely
-    referenced a client-only assembly would be unloadable no matter what we did
-    here; installing D wouldn't save it, since D doesn't work there either. That
-    case is a manifest bug, and belongs to submission validation, not to us.)
-    Dropping is reported through _warn rather than done silently: a quiet prune is
-    indistinguishable from a broken resolver.
+    Minimum-version-with-major-lock: for each dependency, the highest version
+    summary_index lists in the required major that is >= the running minimum.
+    fetch_manifest(id, version, source_repo) loads only what the closure uses.
 
-    Two inputs beyond the roots:
-      - summary_index: the collision-resolved list[ModSummary] from fetch_indexes.
-        Used only to PICK a dependency's version within a major (the index knows
-        which versions exist; the manifest itself is not in the index).
-      - fetch_manifest(id, version, source_repo) -> ModManifest: loads the chosen
-        version's manifest on demand, so its own dependencies/libraries can be
-        walked. Only manifests actually in the closure are fetched.
+    `side` ("client"/"server", no default) is the process being installed
+    into. A dependency that can't load there is pruned, with everything only
+    it needed, before its constraints are recorded, and reported via _warn.
 
-    Taking a LIST of roots is deliberate: the point of diamond-conflict detection
-    is catching when two *independent* required mods (e.g. every mod a server
-    requires) pull in incompatible versions of a shared dependency. A single-mod
-    install just passes [mod].
-
-    Minimum-Required-Version-with-Major-Lock: for each id -> min_version, keep the
-    versions the index lists in the required major that are >= the running
-    minimum, take the highest, and fetch that one. This picks a version within a
-    major; it does NOT re-arbitrate repos (fetch_indexes already did).
-
-    Three failure modes, each raising a specific, actionable message:
-      - Circular dependency (A -> B -> A): detected via the chain of ids being
-        resolved; raises naming the cycle.
-      - Chain too deep: a strictly acyclic chain longer than MAX_DEPENDENCY_DEPTH.
-      - Diamond conflict: two branches need the same id at incompatible majors;
-        raises naming both requiring mods and both constraints."""
+    Raises, naming the mods involved, on a cycle, a chain deeper than
+    MAX_DEPENDENCY_DEPTH, a cross-major (diamond) conflict, or a missing
+    version."""
     if side not in SIDES:
         raise ModManagerError(
             f"resolve_dependencies needs side={' or '.join(map(repr, SIDES))}, "
@@ -105,9 +70,7 @@ def resolve_dependencies(roots, summary_index, fetch_manifest, side):
 
     def add_requirement(dep_id, min_v, requirer, chain):
         if dep_id in pruned:
-            # Already established this one can't run here. Still reported, so a
-            # second requirer of the same wrong-side dep isn't invisible, but not
-            # re-fetched and not re-walked.
+            # Reported for every requirer, fetched and walked once.
             _warn(f"{requirer} depends on '{dep_id}', which doesn't run on the "
                   f"{side}; skipped.")
             return
@@ -151,10 +114,8 @@ def resolve_dependencies(roots, summary_index, fetch_manifest, side):
 
         manifest = fetch_manifest(dep_id, pick_version, summary.source_repo)
         if not _runs_on(manifest, side):
-            # Pruned BEFORE its constraints are recorded, so a mod we aren't
-            # installing can't go on to raise a diamond conflict against a later
-            # requirer, and its own dependencies are never walked -- nothing
-            # reached only through it is needed either.
+            # Before record(): a mod we aren't installing can't raise a diamond
+            # conflict, and nothing only it needs is walked.
             pruned[dep_id] = manifest
             _warn(f"{requirer} depends on '{dep_id}' {pick_version}, which doesn't "
                   f"run on the {side}; skipped, along with anything only it needed.")
@@ -179,14 +140,11 @@ def resolve_dependencies(roots, summary_index, fetch_manifest, side):
     for root in roots:
         visit(root, [root.id])
 
-    # The roots themselves are the caller's; never hand them back even if one
-    # root happens to be a dependency of another.
     return [m for mid, m in chosen.items() if mid not in root_ids]
 
 
 def _repo_order(repo_bases, prefer_repo):
-    """prefer_repo first (the repo a previous fetch/install already used, the
-    common case with no searching), then the rest of repo_bases, de-duplicated."""
+    """prefer_repo first, then the rest of repo_bases, de-duplicated."""
     order = []
     if prefer_repo:
         order.append(prefer_repo)
@@ -210,11 +168,11 @@ def _index_source(index, mod_id, repo_bases, version=None):
 
 def _fetch_manifest_leaf(repo_bases, mod_id, leaf, prefer_repo=None, what=None,
                          expect_version=None):
-    """Fetches one manifest file (leaf, e.g. "1.0.4.json" or "latest.1.json") from
-    manifests/<author>/<repo>/ across the configured repos in preference order,
-    returning the first that parses. <author>/<repo> is mod_id split on the first
-    '.', which requires mod_id to be a well-formed '<github-user>.<github-repo>'
-    (guarded just below). Raises if no repo has it."""
+    """Fetches manifests/<author>/<repo>/<leaf> from each repo in preference
+    order and returns the first that parses; <author>/<repo> is mod_id split
+    on its first '.'. With expect_version, a manifest naming another id or
+    version fails that repo like a 404 does, and successes are memoized.
+    Raises if no repo has it."""
     if "." not in mod_id:
         raise ModManagerError(
             f"Mod id {mod_id!r} isn't '<github-user>.<github-repo>'.")
@@ -234,8 +192,6 @@ def _fetch_manifest_leaf(repo_bases, mod_id, leaf, prefer_repo=None, what=None,
         if m is None:
             continue
         if expect_version is not None and (m.id, m.version) != (mod_id, expect_version):
-            # A repo serving another mod's manifest at this path is a failure
-            # for that repo, never an install of whatever it named.
             last_err = ModManagerError(
                 f"{url} serves '{m.id}' {m.version}, not the requested "
                 f"'{mod_id}' {expect_version}.")
@@ -249,9 +205,7 @@ def _fetch_manifest_leaf(repo_bases, mod_id, leaf, prefer_repo=None, what=None,
 
 
 def _fetch_manifest(repo_bases, mod_id, version, prefer_repo=None):
-    """Loads the full manifest for an EXACT version, the on-demand fetch the slim
-    index leans on: the index names which versions exist, this pulls the one
-    chosen. Immutable per-version file, so it's safe to cache within a resolve."""
+    """The manifest for an exact version (memoized; see _manifest_memo)."""
     return _fetch_manifest_leaf(
         repo_bases, mod_id, f"{version}.json", prefer_repo,
         what=f"mod '{mod_id}' version {version}", expect_version=version)
