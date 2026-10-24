@@ -8,9 +8,9 @@ from tavern_shared.paths import _sha256_file
 from tavern_shared.mods import layout
 from tavern_shared.mods.errors import ModManagerError, _warn
 from tavern_shared.mods.install import (
-    _clear_install_path, _invalidate_verify_memo, _read_mod_record,
-    _read_sidecar, install_library_dependency, list_installed_mods,
-    verify_mod_files,
+    _clear_install_path, _invalidate_verify_memo, _library_present,
+    _read_mod_record, _read_sidecar, install_library_dependency,
+    list_installed_mods, verify_mod_files,
 )
 from tavern_shared.mods.layout import (
     DISABLED_RECORD_NAME, RECORD_NAME, _library_sidecar_path, _mod_dir_path,
@@ -106,6 +106,8 @@ def cache_store_library(game_dir, filename):
     dest = _cache_library_dir(filename, sha256)
     if os.path.isdir(dest):
         return sha256
+    if not _library_present(game_dir, filename, sha256):
+        return None     # the file no longer matches its sidecar
 
     staging = dest + ".caching"
     if os.path.isdir(staging):
@@ -205,28 +207,31 @@ def cache_restore_mod(game_dir, mod_id, version):
     _invalidate_verify_memo(game_dir, mod_id)
 
 
-def _library_present(game_dir, filename, sha256):
-    """UserLibs/<filename> is on disk with a sidecar recording exactly this
-    sha256 - the "already active" test every restore path runs before touching
-    anything. The sidecar is the authority, matching how libraries have no
-    version: a file at the right name with no (or a different) recorded hash
-    needs reinstalling."""
-    existing = _read_sidecar(_library_sidecar_path(game_dir, filename))
-    return (os.path.isfile(os.path.join(_userlibs_dir(game_dir), filename))
-            and bool(existing) and existing.get("sha256") == sha256)
-
-
 def cache_restore_library(game_dir, filename, sha256):
     """Copies a cached library (and its sidecar) into UserLibs/, unless it's
-    already there with a matching hash. Raises if that exact
-    filename+sha256 isn't cached."""
+    already there intact. The copy is hashed before it's swapped in; a cache
+    entry that fails is discarded and raises, like cache_restore_mod. Raises
+    if that exact filename+sha256 isn't cached."""
     if _library_present(game_dir, filename, sha256):
         return
 
     src = _cache_library_dir(filename, sha256)
     if not os.path.isdir(src):
         raise ModManagerError(f"Library '{filename}' ({sha256[:12]}...) isn't in the local cache.")
-    shutil.copy2(os.path.join(src, filename), os.path.join(_userlibs_dir(game_dir), filename))
+    dest = os.path.join(_userlibs_dir(game_dir), filename)
+    staging = os.path.join(_userlibs_dir(game_dir), f".{filename}.restoring")
+    try:
+        shutil.copy2(os.path.join(src, filename), staging)
+        if _sha256_file(staging).lower() != sha256.lower():
+            shutil.rmtree(src, ignore_errors=True)
+            raise ModManagerError(
+                f"The cached copy of library '{filename}' no longer matches its "
+                f"hash. The bad cache entry has been discarded; it will need to "
+                f"be re-downloaded.")
+        os.replace(staging, dest)
+    finally:
+        if os.path.isfile(staging):
+            os.remove(staging)
     shutil.copy2(os.path.join(src, f"{filename}.meta.json"), _library_sidecar_path(game_dir, filename))
 
 
@@ -243,11 +248,14 @@ def _ensure_library(game_dir, lib, progress, verb="Restoring"):
         return False
     if os.path.isdir(_cache_library_dir(filename, lib.sha256)):
         progress(f"{verb} library {filename} (cached)")
-        cache_restore_library(game_dir, filename, lib.sha256)
-    else:
-        progress(f"Downloading library {filename}")
-        install_library_dependency(game_dir, lib, progress)
-        cache_store_library(game_dir, filename)
+        try:
+            cache_restore_library(game_dir, filename, lib.sha256)
+            return True
+        except ModManagerError as e:
+            progress(f"Cache copy unusable ({e}) - downloading instead")
+    progress(f"Downloading library {filename}")
+    install_library_dependency(game_dir, lib, progress)
+    cache_store_library(game_dir, filename)
     return True
 
 
