@@ -535,6 +535,20 @@ def _read_sidecar(path):
         return None
 
 
+def _library_present(game_dir, filename, sha256):
+    """UserLibs/<filename> is on disk at exactly this sha256, by its sidecar
+    AND by hashing the file - TavernLib's VerifyLibrary terms. A file at the
+    right name with any other content needs reinstalling."""
+    want = (sha256 or "").lower()
+    meta = _read_sidecar(_library_sidecar_path(game_dir, filename))
+    if not want or not meta or str(meta.get("sha256", "")).lower() != want:
+        return False
+    try:
+        return _sha256_file(os.path.join(_userlibs_dir(game_dir), filename)).lower() == want
+    except OSError:
+        return False
+
+
 def _read_mod_record(game_dir, mod_id):
     """The install record for a mod, from whichever state it's in: the enabled
     folder record (Mods/<id>/manifest.json), then the disabled one
