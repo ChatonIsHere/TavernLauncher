@@ -30,10 +30,10 @@ class PlanEntry:
     mod_id: str
     version: str
     source_repo: str
-    reason: str        # "required" (server needs it) | "dependency" | "pinned"
-    cached: bool       # already in the local cache at this exact version
-    active: bool       # Mods/<id>/ is already enabled at exactly this version - a no-op
-    manifest: object   # the resolved ModManifest - render_active_set installs straight
+    reason: str        # "required" | "recommended" | "dependency" | "pinned"
+    cached: bool       # this exact version is in the local cache
+    active: bool       # already enabled, at this version and intact: a no-op
+    manifest: object   # the resolved ModManifest render_active_set installs from
 
 
 @dataclass
@@ -41,84 +41,42 @@ class JoinPlan:
     entries: list           # list[PlanEntry] - the full computed active set
     to_deactivate: list      # mod ids enabled in Mods/ that aren't in the active set
     libraries: list         # list[LibraryDependency] the active set needs
-    missing: list           # [(mod_id, version)] required by the SERVER, unresolvable from
-                             # any repo the client has configured - blocks launching
-    needs_repo: list        # [(mod_id, version, source_repo)] required by the server and
-                             # resolvable, but only from a repo the client hasn't added -
-                             # blocking (see `blocking` below), but with a row that names
-                             # the exact source to add, so the fix is in the user's hands
-    pin_conflicts: list      # [(mod_id, pinned_version, server_version)] - a pinned mod's
-                             # exact version disagrees with what the server runs; the
-                             # user decides whether to unpin or accept the server's version
+    missing: list           # [(mod_id, version)] required, in no configured repo
+    needs_repo: list        # [(mod_id, version, source_repo)] required, only in a repo
+                             # the client hasn't added (the row names it)
+    pin_conflicts: list      # [(mod_id, pinned_version, server_version)]
     declined: list = field(default_factory=list)
-                             # [(mod_id, version)] mods this server runs and doesn't require
-                             # that the user has already said no to. Not in the active set
-                             # and not touched on disk; carried so the comparison can show
-                             # them and let the choice be taken back
+                             # [(mod_id, version)] recommended mods the user declined for
+                             # this server; untouched on disk, shown so it can be undone
     unresolved_pins: list = field(default_factory=list)
-                             # [(mod_id, version_or_"latest")] the user's OWN always-on pins
-                             # that resolve from nowhere - a typo'd id, or a version its
-                             # author has since unpublished. Kept strictly apart from
-                             # `missing` because the two have opposite consequences: a
-                             # server's required mod being unavailable makes the join
-                             # impossible, whereas a broken pin is the client's own setting
-                             # and no server ever asked for it. Folding them together (as
-                             # this once did) meant one bad pin blocked EVERY join, on every
-                             # server, reported as though the server had demanded it.
+                             # [(mod_id, version_or_"latest")] the user's own pins that
+                             # resolve from nowhere. Kept apart from `missing`: no server
+                             # asked for them, so they never block a join
 
     @property
     def blocking(self):
-        """True if applying this plan can't produce a joinable state - some
-        mod the server actually requires isn't going to be installed, either
-        because no configured repo has it (missing) or because the only repo
-        that does hasn't been added (needs_repo).
-
-        needs_repo used to be advisory-only, on the theory that it's
-        information for the user to act on rather than a hard stop. But a
-        required mod is required either way: an apply that skips it renders
-        everything else, then fails the post-render parity check with "mods
-        still don't match" - the user was invited to press a button that
-        could never succeed. Blocking up front, with the row still naming
-        exactly which source to add, is the honest version of the same
-        information. unresolved_pins still never blocks: nothing the server
-        asked for is missing, so the join itself is fine."""
+        """True when a mod the server requires won't be installed: missing (no
+        configured repo has it) or needs_repo (only an unadded repo does). Either
+        way an apply could only fail the post-render parity check.
+        unresolved_pins never blocks: the server didn't ask for them."""
         return bool(self.missing or self.needs_repo)
 
 
 def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=None,
               scene=None):
-    """Computes active = required(server) UNION recommended(server, not declined)
-    UNION resolve_dependencies(those) UNION pinned, and diffs it against what's
-    cached/active - the render PLAN, not the render itself.
+    """Computes the active set for a join: required(server) + recommended
+    (server, not declined) + their dependency closure + pinned, diffed against
+    disk and cache. The plan, not the render.
 
-    server_mods: entries as returned by the ping/pong handshake's full list
-    (handshake_snapshot's mods_list, or the equivalent fetched over the wire) -
-    {"id","version","client_side","server_side","parity_required","source_repo"}.
-    Only client_side entries concern the client at all; server_side-only entries
-    are ignored here. Of those, parity_required splits them two ways:
-
-      true   the server enforces this exact version on join, so it goes in the
-             active set and a client that can't resolve it is blocked.
-      false  the server won't block over it. Still planned in by default, at the
-             server's version, so the common case is that everyone matches - but
-             the user can decline, and a declined mod is left out entirely
-             rather than installed, updated, or deactivated.
-
-    index: the client's own merged index (fetch_indexes(repo_bases)) - used to
-    pick each dependency's version within a major.
-    repo_bases: the client's configured repos (list_repos(cfg)) - the only
-    repos anything is actually fetched from.
-    pinned: "id" / "id@version" strings (the launcher's always-on set) -
-    unioned in regardless of which server is being joined.
-    declined: mod ids the user has already said no to for THIS server. Only a
-    mod the server marks parity_required false can be declined; a declined id
-    the server actually requires is ignored, since no client-side choice can
-    make that join work.
-    scene: the scene the server runs ("normal"/"quest"/"tutorial"), when the
-    caller knows it. A pin whose manifest doesn't list it is left out of this
-    join - so an enabled one shows up as a deactivation the user can still
-    Keep. Mods the server itself runs are never filtered: it chose them for its
-    own scene. None (Sync Mods, a headless join) filters nothing."""
+    server_mods: the handshake's mods list; only client_side entries matter.
+    parity_required true goes in and blocks if unresolvable; false goes in by
+    default but can be declined, and is never deactivated for that.
+    index / repo_bases: the client's merged index and its own repos, the only
+    sources anything is fetched from.
+    pinned: "id" / "id@version" always-on pins. declined: ids declined for this
+    server (ignored for required mods). scene: the server's scene when known; a
+    pin whose manifest excludes it is left out. Mods the server runs are never
+    scene-filtered."""
     pinned = pinned or []
     declined = set(declined or [])
 
@@ -129,8 +87,7 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
                    if not parity_required(m)}
     hinted_repo = {m["id"]: m.get("source_repo") for m in server_mods if m.get("source_repo")}
 
-    # A decline only ever applies to a mod the server marks optional. Declining
-    # something required would just move the rejection from here to the server.
+    # Only an optional mod can be declined.
     skipped = [(mid, ver) for mid, ver in recommended.items() if mid in declined]
 
     roots = []
@@ -141,30 +98,20 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
     exact_pin = {}      # mod_id -> pinned version (None if pinned to latest)
 
     def resolve_root(mod_id, version, tag):
-        """Resolves one root, routing a failure by WHO asked for it. The three
-        tags have genuinely different consequences and must not share a bucket:
-        only something the server requires can make a join impossible."""
+        """Resolves one root, routing a failure by who asked: only a mod the
+        server requires can make the join impossible."""
         try:
             manifest = _fetch_manifest(repo_bases, mod_id, version,
                                        _index_source(index, mod_id, repo_bases, version))
         except ModManagerError:
             if tag == "pinned":
-                # The user's own always-on pin, which this server never asked
-                # for. Reported so a broken pin is visible and fixable, but
-                # never blocking - refusing to launch would punish the player
-                # on every server for a setting unrelated to any of them.
                 unresolved_pins.append((mod_id, version))
                 _warn(f"pinned mod '{mod_id}' {version} isn't available from any "
                       f"configured source; it won't be installed, and it doesn't "
                       f"affect joining.")
             elif tag == "recommended":
-                # Unresolvable and not actually required: silently doing without
-                # it beats blocking or nagging over a mod the server allows the
-                # client not to have. Checked BEFORE the repo hint below, so a
-                # recommendation never lands in needs_repo - every consumer of
-                # that list treats its entries as things the server requires,
-                # and a row saying "required" about a mod the server would let
-                # you join without is simply untrue.
+                # Before the repo hint: needs_repo means "required", which a
+                # recommendation never is.
                 _warn(f"'{mod_id}' {version} is recommended by this server but "
                       f"isn't available from any configured source; skipped.")
             else:
@@ -196,9 +143,6 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
         if version is None:
             matches = [s for s in index if s.id == mod_id]
             if not matches:
-                # Same reasoning as resolve_root's "pinned" branch: the user's
-                # own pin naming something no configured source carries, not a
-                # demand from this server.
                 unresolved_pins.append((mod_id, "latest"))
                 _warn(f"pinned mod '{mod_id}' isn't in any configured source's "
                       f"index; it won't be installed, and it doesn't affect joining.")
@@ -206,15 +150,9 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
             version = max((v for s in matches for v in s.versions), key=_parse_version)
         resolve_root(mod_id, version, "pinned")
 
-    # A conflict is precisely "the plan is about to install a version other
-    # than the one you pinned", so it's keyed off what actually resolved as a
-    # root, not off what the server merely lists. That covers recommendations
-    # as well as requirements - a recommendation overrules a pin just the same,
-    # and leaving those out meant the pin was silently overridden with nothing
-    # on screen to say so. It also excludes a mod that was declined or failed
-    # to resolve: neither is being installed, so neither is overruling
-    # anything, and reporting one would open the comparison window on every
-    # join over a change that isn't happening.
+    # A conflict is "about to install a version other than the one pinned", so
+    # it keys off what resolved as a required or recommended root: a declined
+    # or unresolvable mod overrules nothing.
     server_versions = {**recommended, **required}
     pin_conflicts = [
         (mod_id, pinned_version, server_versions[mod_id])
@@ -226,10 +164,7 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
     def fetch_manifest(mod_id, version, source_repo):
         return _fetch_manifest(repo_bases, mod_id, version, prefer_repo=source_repo)
 
-    # "client" is fixed, not a parameter: this is the join flow, which only ever
-    # runs in the client launcher, and the server's own side is resolved
-    # independently by whatever installed its mods (the server launcher, or
-    # TavernLib's ModReconciler on a headless host).
+    # Always "client": joins only run in the client launcher.
     dependencies = resolve_dependencies(roots, index, fetch_manifest, "client") if roots else []
     for dep in dependencies:
         reason.setdefault(dep.id, "dependency")
@@ -250,8 +185,7 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
                                   manifest=mod))
 
     active_ids = {e.mod_id for e in entries}
-    # Declining is "don't add it", never "take it away". A mod the user already
-    # chose to have and the server doesn't require stays exactly as it is.
+    # Declining is "don't add it", never "take it away".
     to_deactivate = [mod_id for mod_id, rec in installed.items()
                       if rec.get("enabled") and mod_id not in active_ids
                       and mod_id not in declined]
@@ -263,12 +197,8 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
                     declined=skipped, unresolved_pins=unresolved_pins)
 
 
-# Client-vs-server comparison
-#
-# A JoinPlan says what to DO. This says what the two sides currently look like
-# and how each mod differs, which is what a person actually needs to see before
-# agreeing to it. Pure: derived from a plan plus what's on disk, no display and
-# no network, so it's testable on its own and the window below only renders it.
+# Client-vs-server comparison: what each side has and what a plan would change,
+# derived from the plan and disk only (no display, no network).
 
 # What will happen to each mod. The first six change the client; the rest are
 # informational or blocking.
@@ -313,42 +243,28 @@ class DiffRow:
 
     @property
     def recommended(self):
-        """A mod this server runs but doesn't require. The user's call in either
-        direction, and the reason a row can be overruled towards NOT installing
-        something, rather than only towards keeping something."""
+        """A mod this server runs but doesn't require: the user's call either way."""
         return self.reason == "recommended" or self.action == ACTION_SKIPPED
 
     @property
     def downloads(self):
-        """True when applying this row actually fetches bytes. The only part of
-        a plan that takes real time, so it's what the summary counts and what
-        each row is labelled with."""
+        """True when applying this row fetches bytes; what the summary counts."""
         return (not self.cached) and self.action in (
             ACTION_INSTALL, ACTION_UPDATE, ACTION_DOWNGRADE)
 
     @property
     def blocking(self):
-        """Only a mod the SERVER requires can stop a join. An unavailable mod
-        the user pinned themselves gets the same ACTION_MISSING row - it is
-        genuinely missing and worth seeing - but carries reason "pinned", and
-        nothing about it makes this server unjoinable. A needs-repo row blocks
-        on the same terms as a missing one (JoinPlan.blocking explains why);
-        its note is what makes it the fixable variant."""
+        """Only a mod the SERVER requires can stop a join: a missing row with reason
+        "required", or a needs-repo row. A missing pin (reason "pinned") is shown
+        but never blocks."""
         return ((self.action == ACTION_MISSING and self.reason == "required")
                 or self.action == ACTION_NEEDS_REPO)
 
 
 def build_mod_diff(game_dir, server_mods, plan):
-    """The full comparison behind a JoinPlan: one DiffRow per mod on either
-    side, sorted problems-first. server_mods is the handshake list; plan is what
-    plan_join computed from it.
-
-    Two kinds of row are marked optional, both because the server's parity check
-    can't fail over them. Deactivations: a mod the server doesn't run at all can
-    stay active here without affecting the join. Recommendations: a mod the
-    server does run but doesn't require, which it won't block over either
-    way. Everything else is what the server actually enforces, so it isn't
-    presented as a choice."""
+    """One DiffRow per mod on either side of a JoinPlan, problems first then by
+    display name. Only deactivations and recommendations are optional: the
+    server's parity check can't fail over either."""
     installed = {r["id"]: r for r in list_installed_mods(game_dir)}
     required = {m["id"]: m.get("version", "") for m in server_mods if m.get("client_side")}
     conflicts = {mid: (pv, sv) for mid, pv, sv in plan.pin_conflicts}
@@ -444,22 +360,13 @@ def build_mod_diff(game_dir, server_mods, plan):
                  f"it. This server doesn't run it either, so it won't stop you "
                  f"joining - remove the pin in Mod Manager to clear this.")
 
-    # Sorted by display name, not id, so the on-screen order matches what's
-    # actually shown - a mod_id-sorted list would look shuffled once the
-    # window renders names instead of ids.
     return sorted(rows, key=lambda r: (_ACTION_ORDER.get(r.action, 9), r.name.lower()))
 
 
 def _prune_orphaned_libraries(game_dir):
-    """After the active set changes, removes any UserLibs/ library no longer
-    pinned by a currently-ENABLED mod's record. Each library was already
-    cache_store_library'd when its owning mod was installed/adopted, so
-    nothing is lost - it just isn't present in UserLibs/ until something
-    needs it again.
-
-    Enabled rather than merely installed, because a disabled mod isn't loading
-    and neither should its libraries be. Enabling it again restores them: the
-    library pass runs over the whole active set, after the pass that enables."""
+    """Removes (after caching) every UserLibs/ library no ENABLED mod's record
+    pins. Enabled-only is safe here because enabling again runs a library
+    pass; uninstall_mod has no such pass and keeps disabled mods' libraries."""
     still_needed = set()
     for rec in list_installed_mods(game_dir):
         if rec.get("enabled"):
@@ -481,29 +388,22 @@ def _prune_orphaned_libraries(game_dir):
 
 
 def render_plan_steps(plan):
-    """How many items render_active_set will work through for this plan: one per
-    mod it changes, per library it checks, and per mod it deactivates. Exactly
-    the set that reports through on_step, so a caller can size a progress bar
-    before starting and have it end full."""
+    """The number of on_step items render_active_set will report for this plan,
+    so a caller can size a progress bar that ends full."""
     return (len([e for e in plan.entries if not e.active])
             + len(plan.libraries) + len(plan.to_deactivate))
 
 
 def render_active_set(game_dir, plan, on_progress=None, on_step=None):
-    """Applies a JoinPlan to disk - the actual render step. Restores from
-    cache wherever cached (a file move), downloads only what's
-    genuinely missing, then deactivates anything no longer needed - never
-    deleting a mod outright (it's cached first) and never re-downloading
-    something already cached. Raises ModManagerError immediately if
-    plan.blocking; callers must check that themselves before deciding whether
-    to show a plan at all, same as install_mod_closure surfaces resolution
-    errors before touching disk.
+    """Applies a JoinPlan: enable-in-place where the exact version sits on disk
+    disabled and intact, cache restore where cached (falling back to a
+    download if the entry fails its check), verified download otherwise, then
+    the library pass, deactivations (cached, then disabled), and the orphaned
+    library prune. Raises up front if plan.blocking.
 
-    on_progress takes a line of human-readable detail. on_step brackets each
-    item with on_step(item_id, "start") and on_step(item_id, "done"): mod ids
-    for mods, filenames for libraries, one pair per item counted by
-    render_plan_steps. A library already active at the pinned content still
-    reports both, so the count a caller sized against is always reached."""
+    on_progress gets lines of detail; on_step(item, "start"/"done") brackets
+    each item render_plan_steps counts, including libraries already in
+    place."""
     if plan.blocking:
         raise ModManagerError(
             "This plan has required mods that can't be installed - not in any "
@@ -521,10 +421,6 @@ def render_active_set(game_dir, plan, on_progress=None, on_step=None):
                          and os.path.isfile(_disabled_record_path(game_dir, entry.mod_id))
                          and verify_mod_files(game_dir, entry.mod_id) is not False)
         if disabled_here:
-            # Already on disk at exactly this version, just switched off. Renaming
-            # the record back is the whole job: no copy out of the cache, no
-            # download, and it works with no network at all. The counterpart to
-            # deactivating by disabling below.
             progress(f"Enabling {entry.mod_id} {entry.version}")
             enable_mod(game_dir, entry.mod_id)
         elif entry.cached:
@@ -532,11 +428,8 @@ def render_active_set(game_dir, plan, on_progress=None, on_step=None):
             try:
                 cache_restore_mod(game_dir, entry.mod_id, entry.version)
             except ModManagerError as e:
-                # The entry vanished or failed its restore-time verification
-                # (which also discarded it) between planning and now. The plan
-                # still carries the manifest, so the render degrades to what a
-                # non-cached entry does - a verified download - instead of
-                # dying over an optimization.
+                # Vanished or failed its check (and was discarded) since
+                # planning: download it instead.
                 progress(f"Cache copy unusable ({e}) - downloading instead")
                 install_mod(game_dir, entry.manifest, progress)
                 cache_store_mod(game_dir, entry.mod_id)
@@ -549,20 +442,13 @@ def render_active_set(game_dir, plan, on_progress=None, on_step=None):
     for lib in plan.libraries:
         filename = _safe_basename(lib.filename)
         step(filename, "start")
-        # One already active at the exact pinned content is a no-op inside
-        # _ensure_library, but both steps still report either way (see the
-        # docstring above).
         _ensure_library(game_dir, lib, progress, verb="Installing")
         step(filename, "done")
 
     for mod_id in plan.to_deactivate:
         step(mod_id, "start")
         progress(f"Deactivating {mod_id}")
-        # Disabled, not uninstalled: the record is renamed so MelonLoader skips
-        # the folder, and every file stays exactly where it is. The mod keeps its
-        # place in the installed list and comes back on with a rename rather than
-        # a download. Cached first all the same, so a later version switch is a
-        # file move whichever way it goes.
+        # Disabled, not uninstalled: it comes back with a rename.
         cache_store_mod(game_dir, mod_id)
         disable_mod(game_dir, mod_id)
         step(mod_id, "done")
@@ -571,20 +457,10 @@ def render_active_set(game_dir, plan, on_progress=None, on_step=None):
 
 
 def resolve_missing_mods(missing, index, repo_bases):
-    """Resolves a rejection payload's `missing` entries
-    ({"id","version","source_repo"}) into installable manifests, for the
-    post-reject recovery flow: after a join is denied for a mod mismatch, the
-    launcher runs this to fetch exactly the mods+versions the server said
-    were wrong, installs them, and rejoins. `source_repo` is a HINT only:
-    resolution always goes through the client's own configured repos
-    (repo_bases), never a URL
-    taken from the payload; an entry resolvable nowhere raises naming its
-    hint if it has one, same missing/needs_repo distinction plan_join uses.
-
-    Returns (roots, dependencies): roots is one ModManifest per resolved
-    missing entry, in order; dependencies is resolve_dependencies' closure
-    over all of them (the same shape install_mod_closure computes for a
-    single root, generalized to plan_join's multi-root case)."""
+    """Resolves a rejection payload's `missing` entries ({"id", "version",
+    "source_repo"}) through the client's own repos only; source_repo is a hint
+    for the error message, never a source. Returns (roots, dependencies), or
+    raises naming every entry that can't be resolved."""
     roots = []
     unresolved = []
     for entry in missing:
