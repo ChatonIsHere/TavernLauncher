@@ -4,12 +4,12 @@ import os
 import shutil
 import time
 
+from tavern_shared import paths
 from tavern_shared.paths import _sha256_file
 
-from tavern_shared.mods import layout
 from tavern_shared.mods.errors import ModManagerError, _warn
 from tavern_shared.mods.install import (
-    _clear_install_path, _invalidate_verify_memo, _library_present,
+    _clear_install_path, _files_intact, _invalidate_verify_memo, _library_present,
     _read_mod_record, _read_sidecar, install_library_dependency,
     list_installed_mods, verify_mod_files,
 )
@@ -19,14 +19,12 @@ from tavern_shared.mods.layout import (
 )
 from tavern_shared.mods.manifest import _library_from_dict
 
-# _tavern_data_dir goes through the module (layout._tavern_data_dir) rather
-# than being imported by name: tests redirect the cache to a temp directory by
-# replacing it, and a by-name import here would keep pointing at the real
-# %AppData% regardless.
+# Reached through the module, not imported by name, so tests can point the
+# cache at a temp directory by replacing paths._tavern_data_dir.
 
 
 def _cache_base():
-    return os.path.join(layout._tavern_data_dir(), "mod_cache")
+    return os.path.join(paths._tavern_data_dir(), "mod_cache")
 
 
 def _cache_mod_dir(mod_id, version):
@@ -191,18 +189,15 @@ def cache_restore_mod(game_dir, mod_id, version):
     shutil.copytree(src, staging)
     rec = _read_sidecar(os.path.join(staging, RECORD_NAME))
     files = (rec or {}).get("files")
-    if isinstance(files, dict) and files:
-        for rel, expected in files.items():
-            path = os.path.join(staging, rel.replace("/", os.sep))
-            if os.path.isfile(path) and _sha256_file(path).lower() == str(expected).lower():
-                continue
-            shutil.rmtree(staging, ignore_errors=True)
-            shutil.rmtree(src, ignore_errors=True)
-            raise ModManagerError(
-                f"The cached copy of '{mod_id}' {version} no longer matches "
-                f"what was stored ({rel} is missing or altered). The bad cache "
-                f"entry has been discarded; this version will need to be "
-                f"re-downloaded.")
+    bad = _files_intact(staging, files) if isinstance(files, dict) and files else None
+    if bad is not None:
+        shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(src, ignore_errors=True)
+        raise ModManagerError(
+            f"The cached copy of '{mod_id}' {version} no longer matches "
+            f"what was stored ({bad} is missing or altered). The bad cache "
+            f"entry has been discarded; this version will need to be "
+            f"re-downloaded.")
     _clear_install_path(game_dir, mod_id)
     os.makedirs(_mods_base(game_dir), exist_ok=True)
     os.replace(staging, dest)

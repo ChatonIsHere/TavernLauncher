@@ -6,16 +6,6 @@ import os
 from tavern_shared.mods.errors import ModManagerError
 
 
-def _tavern_data_dir():
-    """The same %AppData%/TheModdingTavern folder tavern_shared.paths resolves,
-    kept as a small local copy rather than an import: it is a pure function of
-    the environment, and this module is the one the tests redirect (see
-    cache._cache_base) to point the mod cache at a temp directory. Home for the
-    client mod cache."""
-    base = os.environ.get("APPDATA", os.path.join(os.path.expanduser("~"), "AppData", "Roaming"))
-    return os.path.join(base, "TheModdingTavern")
-
-
 def _safe_basename(name):
     """Last-line path-traversal guard, applied to mod.filename and every
     library_dependencies.filename right before it touches disk. Raises if name
@@ -63,12 +53,6 @@ def _mods_base(game_dir):
     # The Mods/ path WITHOUT creating it, for building paths in read-only code
     # (status/listing) that shouldn't have the side effect of making folders.
     return os.path.join(game_dir, "Mods")
-
-
-def _mods_dir(game_dir):
-    d = _mods_base(game_dir)
-    os.makedirs(d, exist_ok=True)
-    return d
 
 
 def _userlibs_dir(game_dir):
