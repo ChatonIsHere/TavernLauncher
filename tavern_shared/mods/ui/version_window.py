@@ -1,9 +1,9 @@
 """Pick a specific version of an already-installed mod."""
-import threading
 import tkinter as tk
 
+from tavern_shared.bg import post, run_bg
 from tavern_shared.theme import (
-    AMBER, BG, BORDER, CYAN, GREEN, MUTED, SURF, _btn, _mk_tree,
+    BG, CYAN, GREEN, MUTED, _btn, _mk_tree, _window_header,
 )
 from tavern_shared.window_chrome import _enable_dark_titlebar
 
@@ -35,6 +35,7 @@ class ModVersionWindow(tk.Toplevel):
         self._installed_version = installed_version
         self._repo_bases = repo_bases
         self._on_install = on_install
+        self._closed = False
         self._build()
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         _enable_dark_titlebar(self)
@@ -42,11 +43,7 @@ class ModVersionWindow(tk.Toplevel):
         self._load_requires()
 
     def _build(self):
-        h = tk.Frame(self, bg=SURF, height=44)
-        h.pack(fill="x"); h.pack_propagate(False)
-        tk.Label(h, text=f"{self._mod.name} — Versions", bg=SURF, fg=AMBER,
-                 font=("Georgia",12,"bold")).pack(side="left", padx=16, pady=8)
-        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
+        _window_header(self, f"{self._mod.name} — Versions")
 
         tk.Label(self,
             text="Every release this mod has published, newest first. Mod authors "
@@ -79,17 +76,18 @@ class ModVersionWindow(tk.Toplevel):
 
     def _load_requires(self):
         mod, repo_bases, versions = self._mod, self._repo_bases, self._versions
-        def worker():
+        def fetch():
             for v in versions:
+                if self._closed:
+                    return
                 try:
                     manifest = _fetch_manifest(repo_bases, mod.id, v, prefer_repo=mod.source_repo)
                     deps = manifest.dependencies or {}
                     text = ", ".join(f"{dep_id}>={min_v}" for dep_id, min_v in sorted(deps.items())) or "-"
                 except ModManagerError:
                     text = "?"
-                self.after(0, lambda v=v, t=text: self._apply_requires(v, t))
-            self.after(0, lambda: self._status.set(""))
-        threading.Thread(target=worker, daemon=True).start()
+                post(self, self._apply_requires, v, text)
+        run_bg(self, fetch, on_ok=lambda _: self._status.set(""))
 
     def _apply_requires(self, version, text):
         if self._tree.exists(version):
@@ -104,3 +102,7 @@ class ModVersionWindow(tk.Toplevel):
         version = sel[0]
         self.destroy()
         self._on_install(version)
+
+    def destroy(self):
+        self._closed = True   # stops the manifest fetches early
+        super().destroy()

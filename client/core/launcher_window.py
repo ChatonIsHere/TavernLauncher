@@ -30,15 +30,12 @@ try:
 except ImportError:
     pass
 from tavern_shared.log_tailer import GameLogTailer
-from tavern_shared.mod_install import (
-    _melonloader_installed, _mods_need_attention, _tavernlib_installed,
-)
-from tavern_shared.patch import _patch_needs_attention
+from tavern_shared.mod_install import _melonloader_installed, _tavernlib_installed
 from tavern_shared.paths import _delete_last_rejection_file, _last_rejection_path
 from tavern_shared.game_guard import any_game_running, confirm_while_game_running
-from tavern_shared.mods_window import SetupWindow
 from tavern_shared import mods
-from tavern_shared.mods.ui.manager_window import ModManagerWindow
+from tavern_shared.bg import run_bg
+from tavern_shared.launcher_common import LauncherCommon
 from tavern_shared.log_archive import archive_log_now, should_auto_archive
 from client.core.mod_diff_window import ModDiffWindow
 
@@ -69,7 +66,7 @@ try:
 except ImportError:
     _updater = None
 
-class ClientLauncher(tk.Tk):
+class ClientLauncher(LauncherCommon, tk.Tk):
     def __init__(self):
         super().__init__()
         _start_hidden(self)
@@ -93,37 +90,22 @@ class ClientLauncher(tk.Tk):
             ttk.Style().theme_use("clam")
         self._tailer      = None
         self._server_ok   = False   # True once Check Server succeeds
-        # The address Sync Mods works against, resolved the same way the join
-        # flow resolves it (see _check_ok), plus the string the player actually
-        # typed, which is the one worth showing them.
+        # From the last good Check Server: the resolved address Sync Mods works
+        # against, what the player typed, and the server's mods_hash.
         self._checked_host = None
         self._checked_display = None
+        self._checked_mods_hash = None
         # Tracks whether the currently-filled-in server (from the Community
         # browser) is an official Tavern server or a headless/direct-connect
         # one — controls whether Join Server goes through the auth handshake
         # at all. Manually typed IPs and Saved/Recent selections always reset
         # this back to "official", matching how they've always behaved.
         self._selected_kind = "official"
-        # Read every tick by start_flashing_button on the main thread, and only
-        # ever written from the main thread (see _refresh_setup_alert), so the
-        # background check behind it can't tear it.
-        self._setup_needs_attention = False
-        self._exe_check_job   = None
-        # Join-time mod reconciliation cache: host -> (mods_hash, mods_list,
-        # untracked), so rejoining a server whose mods haven't changed since
-        # last time skips the extra "mods_list" round trip entirely (see
-        # _get_server_mods). The server's untracked mods are cached alongside
-        # rather than refetched, so a cache hit still has something to report.
-        self._mods_list_cache = {}
-        # What the last _get_server_mods call learned the server runs but
-        # couldn't identify. Advisory only; see _report_server_untracked.
-        self._server_untracked = []
-        self._mod_manager_win = None
-        # Every game process this launcher has started, kept so every path
-        # that writes into the game folder can ask whether one of them still
-        # holds those files open (see _game_is_running). A list, not the last
-        # handle: the guard's prompt can be overridden and a second copy
-        # launched, and that must not make the guard forget the first.
+        self._init_launcher_common()
+        self._mods_list_cache = {}    # host -> (mods_hash, mods, untracked)
+        self._server_untracked = []   # see _report_server_untracked
+        # Every game this launcher started, not just the last: the running-game
+        # guard can be overridden to launch a second copy.
         self._game_procs = []
         self._build_ui()
         self._load()
@@ -169,8 +151,6 @@ class ClientLauncher(tk.Tk):
         self._mod_manager_btn.pack(side="left", padx=(6,0))
         _btn(btn_row_mods, "🎮 Game Settings", self._open_game_settings,
              font=("Segoe UI",9), pady=5, padx=10).pack(side="right")
-        _hint(self, "Run Setup before you launch the game, in order — "
-                    "Patch, then MelonLoader, then TavernLib")
 
         _divider(self)
 
@@ -224,10 +204,8 @@ class ClientLauncher(tk.Tk):
         # ── Action area ──────────────────────────────────────────────────────
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=20, pady=6)
 
-        # Status line shown after Check Server — plain label, not a box, with
-        # the mod-sync button beside it. The button is packed only once a check
-        # comes back from a server that speaks the mod protocol (see _check_ok),
-        # so it never shows for a server that has nothing to sync against.
+        # Status line shown after Check Server, with Sync Mods beside it once a
+        # check finds a server that reports its mods (see _check_ok).
         check_row = tk.Frame(self, bg=BG)
         check_row.pack(fill="x", padx=22, pady=(0,4))
         self._check_status = tk.StringVar(value="")
@@ -435,99 +413,30 @@ class ClientLauncher(tk.Tk):
         _finish_dark_window(win)
         win.transient(self)
         win.grab_set()
-        # Block until it's dismissed. The first-token case opens this from the
-        # middle of a join, and the mod comparison follows right after; without
-        # the wait both windows appear at once and the comparison's own grab
-        # takes the input, leaving the token note unreadable and unclickable.
+        # Blocks: mid-join, the mod comparison opening next would otherwise
+        # grab the input and leave this note unclickable.
         win.wait_window()
 
-    # ── Setup alert ─────────────────────────────────────────────────────────
-    # Unlike the token badge, this flashes only *while there's a problem* —
-    # a mod missing or out of date — and stops on its own once resolved.
+    # ── Setup / Mod Manager hooks (see LauncherCommon) ─────────────────────────
 
-    def _on_exe_changed(self, *_):
-        if self._exe_check_job:
-            try: self.after_cancel(self._exe_check_job)
-            except Exception: pass
-        self._exe_check_job = self.after(800, self._refresh_tool_states)
+    def _setup_window_kwargs(self):
+        return {"is_game_running": self._game_is_running}
 
-    def _refresh_tool_states(self):
-        """Enables/disables the Setup and Mod Manager buttons based on whether
-        a valid game exe is selected, then separately refreshes the Setup
-        button's flashing-alert condition. State is only ever touched here, and
-        start_flashing_button only ever touches bg — kept deliberately separate
-        so neither path can clobber the other."""
-        exe = self.v_exe.get().strip()
-        valid = bool(exe and os.path.isfile(exe))
-        state = "normal" if valid else "disabled"
-        try: self._setup_btn.config(state=state)
-        except Exception: pass
-        try: self._mod_manager_btn.config(state=state)
-        except Exception: pass
-        self._refresh_setup_alert()
+    def _mod_manager_kwargs(self):
+        return {"is_game_running": self._game_is_running}
 
-    def _refresh_setup_alert(self):
-        """One alert for the whole Setup sequence: any of the three
-        components (patch, MelonLoader, TavernLib) missing, outdated or
-        damaged. These used to be two separately flashing buttons for what
-        is really one "this install isn't ready yet" state.
+    def _alert_probe(self, game_dir):
+        return _tavernessentials_installed(game_dir)
 
-        The checks hit the network and the disk, so they run on a worker and
-        only the resulting flag is written back on the main thread -- the
-        flashing loop reads it every tick and must never block.
-
-        Also where the Main Menu button's visibility is kept current, since
-        this runs at startup, when the game path changes, and after the Setup
-        and Mod Manager windows change anything."""
-        self._refresh_menu_btn()
-        exe = self.v_exe.get().strip()
-        if not exe or not os.path.isfile(exe):
-            self._setup_needs_attention = False
-            self._set_mod_manager_badge(0)
-            return
-        game_dir = os.path.dirname(exe)
-        def worker():
-            try:
-                # The patch is judged by the same missing/outdated/damaged
-                # rule as the other two components — so a newly published
-                # patch release flashes this alert instead of sitting
-                # invisible behind an applied-but-stale install, and a failed
-                # update check (network down) still never false-alarms.
-                need = _mods_need_attention(game_dir) or _patch_needs_attention(exe)
-            except Exception:
-                need = False
-            badge = self._count_mods_needing_attention(game_dir)
-            self.after(0, lambda: (setattr(self, "_setup_needs_attention", need),
-                                   self._set_mod_manager_badge(badge)))
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _count_mods_needing_attention(self, game_dir):
-        """How many installed community mods are outdated or damaged - the
-        quiet counterpart of the Setup alert, shown as a count on the Mod
-        Manager button rather than a flash. Quiet on purpose: joins
-        force-correct the mods that matter for a server anyway, so an
-        available update is information, not an emergency. 0 on any failure
-        (index unreachable, nothing installed), which just leaves the button
-        unadorned - same never-false-alarm rule the Setup alert follows.
-        Runs off the UI thread only (it hits the network and hashes files)."""
-        try:
-            installed = [r for r in mods.list_installed_mods(game_dir)
-                         if r.get("client_side")]
-            if not installed:
-                return 0
-            index = mods.fetch_indexes(mods.list_repos(load_cfg()))
-            return sum(1 for r in installed
-                       if mods.mod_status(game_dir, r["id"], index)
-                       in ("outdated", "damaged"))
-        except Exception:
-            return 0
-
-    def _set_mod_manager_badge(self, count):
-        label = "📦 Mod Manager"
-        if count:
-            label += f"  ({count} need{'s' if count == 1 else ''} attention)"
-        try: self._mod_manager_btn.config(text=label)
-        except Exception: pass
+    def _alert_probe_done(self, te_installed):
+        """Shows Main Menu only when TavernEssentials is installed for the
+        selected game, since that's what fills the main menu's server boards."""
+        packed = self._menu_btn.winfo_manager() == "pack"
+        if te_installed and not packed:
+            self._menu_btn.pack(side="left", fill="x", expand=True, padx=(4, 0),
+                                after=self._action_btn)
+        elif not te_installed and packed:
+            self._menu_btn.pack_forget()
 
     # ── Persistence ────────────────────────────────────────────────────────────
 
@@ -559,40 +468,7 @@ class ClientLauncher(tk.Tk):
         # Update check runs a couple seconds after startup, off the UI
         # thread, so it never delays the window actually appearing.
         self.after(2000, self._check_for_launcher_update)
-        self.after(1200, self._report_partial_update)
-
-    def _report_partial_update(self):
-        """Tells the user when the update they just applied replaced the exe
-        but couldn't replace everything else.
-
-        The staging process that does the install has no UI of its own, and it
-        used to log those files as "(non-fatal)" and then log "Update applied
-        successfully" regardless — so a Patch/ or addons/ file held by
-        antivirus or refused by Controlled Folder Access left the launcher
-        running new code against old data files, reporting a clean update, and
-        nothing anywhere said otherwise. This is the other half of that fix:
-        the marker is written there and read here, because here is the first
-        place there's a window to say it in."""
-        if _updater is None:
-            return
-        marker = _updater.read_partial_update_marker()
-        if not marker:
-            return
-        _updater.clear_partial_update_marker()
-        files = marker.get("files", [])
-        self._print(f"Update warning: {len(files)} file(s) could not be replaced.", "warn")
-        for f in files:
-            self._print(f"  · {f}", "warn")
-        messagebox.showwarning("Update didn't fully apply",
-            f"The launcher itself updated, but {len(files)} file(s) couldn't be "
-            "replaced:\n\n" + "\n".join(f"  • {f}" for f in files[:10])
-            + ("\n  • …" if len(files) > 10 else "")
-            + "\n\nThey were most likely locked by antivirus, or blocked by "
-              "Windows' Controlled Folder Access. The launcher is running the new "
-              "version, but these files are still the old ones.\n\n"
-              "Re-running the update usually fixes it. If it doesn't, add an "
-              "exclusion for the launcher's folder in Windows Security first.",
-            parent=self)
+        self.after(1200, lambda: self._report_partial_update(_updater))
 
     def _check_for_launcher_update(self):
         if _updater is None:
@@ -614,15 +490,9 @@ class ClientLauncher(tk.Tk):
             try:
                 _updater.download_and_apply_update(url, UPDATE_APP_FOLDER,
                     on_progress=lambda m: self.after(0, lambda: self._print(m, "warn")))
-                # download_and_apply_update relaunches and calls os._exit() on
-                # success, and those are its last two statements — so every
-                # path that raises does so before them, and everything it
-                # touched up to that point lives in a temp staging folder. The
-                # installed copy really is untouched here, which is why the
-                # message below can say so. (The install itself happens in the
-                # relaunched process; when that half goes wrong it reports via
-                # _report_partial_update instead, since this handler is long
-                # gone by then.)
+                # download_and_apply_update relaunches and calls os._exit()
+                # on success; anything it raises comes before the installed
+                # copy is touched.
             except Exception as e:
                 self.after(0, lambda e=e: messagebox.showerror("Update failed",
                     f"Couldn't apply the update:\n{e}\n\n"
@@ -719,53 +589,10 @@ class ClientLauncher(tk.Tk):
             win.v_host.set(host)
 
     def _game_is_running(self):
-        """Whether any game this launcher started is still up, and therefore
-        still holding the files in Mods/ (and MelonLoader's own) open. Every
-        window that writes into the game folder gets this as a callback rather
-        than a snapshot, so it asks at the moment of the action rather than at
-        the moment it opened — a player can easily open the Mod Manager,
-        launch, and come back."""
+        """Whether a game this launcher started still holds the game folder's
+        files open. Passed to the mod windows as a callback, so it's asked at
+        the moment of a write rather than when the window opened."""
         return any_game_running(self._game_procs)
-
-    _GUARD_VERBS = {"sync": "Syncing this server's mods",
-                    "join": "Joining a server (which first re-syncs your mods)"}
-
-    def _confirm_not_running(self, verb):
-        """The Sync button and the join flow ask the same "close the game
-        first" question; deriving both the prompt and the decline line from
-        one verb keeps the two from drifting apart. The player can override,
-        because a wedged session they're about to kill shouldn't lock them
-        out of their own launcher."""
-        if confirm_while_game_running(self, self._game_is_running,
-                                      self._GUARD_VERBS[verb]):
-            return True
-        self._print(f"The game is already running; close it first, then "
-                    f"{verb} again.", "warn")
-        return False
-
-    def _open_setup(self):
-        exe = self.v_exe.get().strip()
-        if not exe or not os.path.isfile(exe):
-            messagebox.showerror("Game not found",
-                "Please set the path to 'A Township Tale.exe' above first.", parent=self)
-            return
-        SetupWindow(self, exe, on_status_change=self._refresh_setup_alert,
-                    is_game_running=self._game_is_running)
-
-    def _open_mod_manager(self):
-        exe = self.v_exe.get().strip()
-        if not exe or not os.path.isfile(exe):
-            messagebox.showerror("Game not found",
-                "Please set the path to 'A Township Tale.exe' above first.", parent=self)
-            return
-        if self._mod_manager_win and self._mod_manager_win.winfo_exists():
-            self._mod_manager_win.lift(); return
-        # Browsing is harmless while the game runs, so the window opens either
-        # way; the guard is on the actions that actually write.
-        self._mod_manager_win = ModManagerWindow(
-            self, os.path.dirname(exe), side="client",
-            on_change=self._refresh_setup_alert,
-            is_game_running=self._game_is_running)
 
     def _open_addons(self):
         from client.core import addon_loader
@@ -788,16 +615,19 @@ class ClientLauncher(tk.Tk):
         self._server_ok    = False
         self._checked_host = None
         self._checked_display = None
+        self._checked_mods_hash = None
         self._selected_kind = "official"
         self._check_status.set("")
         try: self._check_label.config(fg=MUTED)
         except: pass
-        try: self._show_sync_button(False)
-        except AttributeError: pass   # fired by the trace before _build_ui ran
+        self._show_sync_button(False)
 
     # ── Log helpers ─────────────────────────────────────────────────────────
 
     def _print(self, msg, tag=""):
+        if threading.current_thread() is not threading.main_thread():
+            self.after(0, lambda: self._print(msg, tag))
+            return
         self.log.config(state="normal")
         self.log.insert("end", f"[{time.strftime('%H:%M:%S')}] {msg}\n", tag)
         self.log.see("end"); self.log.config(state="disabled")
@@ -872,10 +702,12 @@ class ClientLauncher(tk.Tk):
         return {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
 
     def _on_join_clicked(self):
-        # Asked before anything at all — the log archive, the auth handshake,
-        # the post-auth hooks, the mod render — so declining costs nothing
-        # and no game-folder write precedes the prompt.
-        if not self._confirm_not_running("join"):
+        # Asked before anything else, so no game-folder write precedes it.
+        if not confirm_while_game_running(
+                self, self._game_is_running,
+                "Joining a server (which first re-syncs your mods)"):
+            self._print("The game is already running; close it first, then "
+                        "join again.", "warn")
             return
         # Archive the previous log before joining.
         self._action_btn.config(state="disabled")
@@ -886,9 +718,8 @@ class ClientLauncher(tk.Tk):
             self._print(f"Log archived to {result}", "ok")
         elif not locked and result != "No active log file found to archive.":
             self._print(f"Couldn't archive previous log: {result}", "err")
-        # Both launch paths validate before disabling the button themselves,
-        # and return early on a validation error - re-enable it first, or
-        # that early return leaves Join greyed out for good.
+        # Re-enabled first: both launch paths return early on a validation
+        # error, which would otherwise leave Join greyed out for good.
         self._action_btn.config(state="normal")
         if self._selected_kind == "headless":
             self._do_launch_headless()
@@ -932,36 +763,29 @@ class ClientLauncher(tk.Tk):
                     flags.append(f"🧩 {mods_count} mod{'s' if mods_count != 1 else ''}")
                 if flags:  lines.append("  ".join(flags))
                 msg = "\n".join(lines)
-                # Resolved on this worker thread (it's a DNS lookup) so the UI
-                # thread never blocks on one; see _check_ok for why Sync needs
-                # the resolved form rather than what was typed.
+                # A DNS lookup, so done here rather than on the Tk thread.
                 resolved = _resolve_ip_for_game(host)
+                mods_hash = resp.get("mods_hash")
                 self.after(0, lambda: self._check_ok(resolved, host, msg,
-                                                     game_port, mods_count))
+                                                     game_port, mods_count, mods_hash))
             else:
                 self.after(0, lambda: self._check_fail(f"Unexpected response from {host}"))
         except Exception as e:
             self.after(0, lambda e=e: self._check_fail(f"✘  Cannot reach server — {e}"))
 
-    def _check_ok(self, host, display_host, msg, game_port=None, mods_count=None):
+    def _check_ok(self, host, display_host, msg, game_port=None, mods_count=None,
+                  mods_hash=None):
         self._server_ok    = True
-        # host is already resolved to an IP. The join flow resolves before it
-        # does anything identity-sensitive (tokens, the auth handshake, the
-        # game's own /dev_server_ip), and declines and the mods-list cache are
-        # keyed by whatever host the mod plan was built against - so Sync has to
-        # key them by the same string, or a decline made here is a decline the
-        # join path never sees on a server reached by a DNS name.
+        # host is resolved, like the join flow's: declines and the mods-list
+        # cache are keyed by it, so Sync and Join must agree on the string.
         self._checked_host = host
         self._checked_display = display_host
+        self._checked_mods_hash = mods_hash
         self._check_status.set(msg)
         self._check_label.config(fg=GREEN)
         self._check_btn.config(state="normal")
-        # Offered whenever the server answered with a mod count at all, zero
-        # included: a server running no mods still means anything currently
-        # active here gets deactivated on join, which is a change worth being
-        # able to see and apply up front. A server that can't tell us anything
-        # about its mods sends no count at all (and no mods_hash), which is the
-        # case _get_server_mods bails on.
+        # Zero counts: a server running no mods still deactivates whatever is
+        # active here. Only a server that sends no count has nothing to sync.
         self._show_sync_button(mods_count is not None)
         # The server just told us its actual configured port — trust that
         # over whatever was already in the field, since it's the ground truth.
@@ -972,6 +796,7 @@ class ClientLauncher(tk.Tk):
         self._server_ok    = False
         self._checked_host = None
         self._checked_display = None
+        self._checked_mods_hash = None
         self._check_status.set(msg)
         self._check_label.config(fg=RED)
         self._check_btn.config(state="normal")
@@ -980,39 +805,24 @@ class ClientLauncher(tk.Tk):
     # ── Mod reconciliation ────────────────────────────────────────────────────
 
     def _show_sync_button(self, show):
-        """Sync Mods only makes sense against a server we just successfully
-        checked, so it appears with a good result and goes away the moment that
-        result is cleared or replaced."""
+        """Sync Mods shows only while a successful check is on screen."""
         if show:
             self._sync_btn.pack(side="right", padx=(8,0))
         else:
             self._sync_btn.pack_forget()
 
-    def _get_server_mods(self, host):
-        """The server's full installed-mods list, for plan_join. Uses the
-        ping/pong's mods_hash as a cache key (self._mods_list_cache) so
-        rejoining a server whose mods haven't changed since the last check
-        skips the extra "mods_list" round trip entirely.
-
-        Returns None when the server told us nothing about its mods at all - an
-        older TavernLib, an unreachable server, or one that couldn't read its
-        own Mods/ (that one sends mods_hash/mods_count as null rather than the
-        hash of an empty list). That is NOT the same as an empty list, which is
-        a real answer: a server genuinely running no mods still sends a hash,
-        and planning against its empty list is what deactivates everything
-        active here. Folding the two together meant a zero-mod server got
-        "nothing to sync" and a join that left every local mod enabled.
-
-        Any untracked mods the server reported are stashed in
-        self._server_untracked for the caller to surface (see
-        _report_server_untracked); they're never returned here, because what
-        comes back from this feeds plan_join, which resolves every entry it's
-        given."""
-        try:
-            resp, _ms = ping_server(host)
-        except Exception:
-            return None
-        mods_hash = resp.get("mods_hash")
+    def _get_server_mods(self, host, mods_hash=None):
+        """The server's installed-mods list for plan_join, or None when the
+        server said nothing about its mods (unlike an empty list, which is a
+        real answer that deactivates everything here). Cached per host against
+        the ping's mods_hash; a caller that already has the hash skips the ping.
+        Untracked mods go to self._server_untracked, never into the list."""
+        if mods_hash is None:
+            try:
+                resp, _ms = ping_server(host)
+            except Exception:
+                return None
+            mods_hash = resp.get("mods_hash")
         if not mods_hash:
             return None
         cached = self._mods_list_cache.get(host)
@@ -1029,14 +839,8 @@ class ClientLauncher(tk.Tk):
         return server_mods
 
     def _report_server_untracked(self):
-        """Tells the user about mods the server runs that it couldn't identify.
-
-        Deliberately not phrased as a problem and never able to stop anything:
-        the server can't tell us an id, a version, or where to get one, so
-        there's nothing to install and nothing to match. What it replaces is
-        worse - the mod affecting the session with no sign it exists. Printed
-        once per check/join, after the real mod comparison, so it can't be
-        mistaken for part of it."""
+        """Names the mods the server runs but couldn't identify. Advisory and
+        never blocking: there's no id, version or source to act on."""
         if not self._server_untracked:
             return
         for entry in self._server_untracked:
@@ -1047,74 +851,23 @@ class ClientLauncher(tk.Tk):
                     "without them.", "warn")
 
     def _on_sync_mods(self):
-        """Brings Mods/ in line with the server just checked, without launching
-        the game, so the downloading can be done up front and the actual join is
-        instant. Same plan/confirm/apply flow the join path runs; the only
-        difference is that nothing launches at the end.
-
-        Unlike that path, everything here runs on a worker thread: the player
-        pressed a button and is watching the window, so resolving an index and
-        pulling down mods must not freeze it."""
+        """Brings Mods/ in line with the server just checked, without
+        launching, so the downloading is done before the join."""
         host = self._checked_host
         if not host:
             return
-        exe = self.v_exe.get().strip()
-        if not exe or not os.path.isfile(exe):
-            messagebox.showerror("Game not found",
-                "Please set the path to 'A Township Tale.exe' above first.", parent=self)
+        exe = self._require_exe()
+        if not exe:
             return
-
-        if not self._confirm_not_running("sync"):
+        if not confirm_while_game_running(self, self._game_is_running,
+                                          "Syncing this server's mods"):
+            self._print("The game is already running; close it first, then "
+                        "sync again.", "warn")
             return
-
-        game_dir = os.path.dirname(exe)
-        self._set_sync_busy(True)
-        # The log says what was typed; everything below works against the
-        # resolved address (see _check_ok).
-        self._print(f"Checking which mods {self._checked_display or host} needs…", "dim")
-
-        def worker():
-            try:
-                kind, payload = self._build_mod_plan(game_dir, host)
-            except Exception as e:
-                self.after(0, lambda e=e: self._sync_failed(e))
-                return
-            self.after(0, lambda: self._sync_planned(game_dir, host, kind, payload))
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _sync_planned(self, game_dir, host, kind, payload):
-        """Back on the UI thread with a resolved plan: show the comparison, which
-        then does the applying and reports the result in place.
-
-        The window opens whatever the plan says. A blocking one disables Apply
-        for itself, and seeing which mod is unavailable beside everything that's
-        fine is what tells the player whether to add a source or ask the server
-        owner; an all-matching one is the answer to the question they asked by
-        pressing the button."""
-        self._set_sync_busy(False)
-        self._report_server_untracked()
-        if kind == "skip":
-            self._print(payload, "warn")
-            return
-        if kind == "error":
-            self._print(f"Couldn't work out this server's mods: {payload}", "err")
-            return
-
-        plan, server_mods = payload
-        self._open_mod_diff(plan, server_mods, game_dir, host, joining=False,
-                            on_applied=self._sync_done,
-                            on_cancel=lambda win: self._set_sync_busy(False),
-                            display_host=self._checked_display)
-
-    def _sync_done(self, win):
-        self._set_sync_busy(False)
-        self._print("Mods are now in sync with the server.", "ok")
-        win.apply_finished(True, "Your mods now match this server, so joining "
-                                 "won't need to download anything.")
-
-    def _sync_failed(self, err):
-        self._set_sync_busy(False)
-        self._print(f"Mod sync failed: {err}", "err")
+        display = self._checked_display or host
+        self._print(f"Checking which mods {display} needs…", "dim")
+        self._reconcile_mods(host, exe, display=display,
+                             mods_hash=self._checked_mods_hash)
 
     def _set_sync_busy(self, busy):
         """Sync, Check and Join all move the same Mods/ folder or depend on its
@@ -1124,68 +877,48 @@ class ClientLauncher(tk.Tk):
             btn.config(state=state)
 
     def _open_mod_diff(self, plan, server_mods, game_dir, host, joining,
-                       on_applied=None, on_cancel=None, display_host=None):
-        """Shows the full client-vs-server comparison, so nothing is installed,
-        moved, or switched off without being seen first, and then hosts the
-        applying too: pressing Apply turns the same table into a progress view
-        and the window reports the outcome itself.
-
-        Returns straight away. on_applied(window) runs once the render has
-        finished, on the UI thread, and owns what happens next (verify, launch,
-        or just say it's done). on_cancel(window) runs instead if the window
-        closes without a successful apply. With neither, it's a read-only view
-        of a plan that can't be applied.
-
-        The window edits the plan before applying: a mod the server doesn't run
-        at all is the player's to keep, and keeping it drops that id from
-        plan.to_deactivate. So this plan object is the one to render.
-
-        display_host is what to put on the window; host is the resolved address
-        everything else keys off and is used for both when there's no separate
-        one to show."""
+                       on_applied=None, on_cancel=None, display_host=None,
+                       scene=None):
+        """Shows the client-vs-server comparison, which also hosts the apply.
+        Returns at once. on_applied(window) runs on the Tk thread once the
+        render has finished; on_cancel(window) if the window closes without a
+        successful apply; with neither it's read-only. The window edits `plan`
+        to match the player's choices, so it is the plan to render."""
         rows = mods.build_mod_diff(game_dir, server_mods, plan)
         label = (f"{display_host or host}  "
                  f"({'joining' if joining else 'sync only'})")
         action = None
         if on_applied is not None:
-            # Snapshotted before the window starts editing the plan in place:
-            # both are needed to tell what the player changed once it hands the
-            # plan back (see _apply_mod_plan).
+            # Snapshotted before the window edits the plan, so _apply_mod_plan
+            # can tell what the player changed.
             was_declined = {mod_id for mod_id, _v in plan.declined}
             was_deactivating = list(plan.to_deactivate)
             action = lambda win: self._apply_mod_plan(
                 win, game_dir, plan, on_applied, host,
-                was_declined=was_declined, was_deactivating=was_deactivating)
+                was_declined=was_declined, was_deactivating=was_deactivating,
+                scene=scene)
         return ModDiffWindow(
             self, rows, plan, server_label=label, apply_action=action,
             close_on_success=joining, on_cancel=on_cancel)
 
     def _apply_mod_plan(self, win, game_dir, plan, on_applied, host=None,
-                        was_declined=(), was_deactivating=()):
-        """Renders the plan on a worker, feeding the window's progress view as it
-        goes, then hands back to on_applied. Same work either path does; only
-        what follows it differs.
-
-        was_declined/was_deactivating are what the plan looked like before the
-        window edited it, so a choice the player took back can be spotted here
-        (see _replan_for_undeclined)."""
+                        was_declined=(), was_deactivating=(), scene=None):
+        """Renders the plan on a worker, feeding the window's progress view,
+        then hands back to on_applied. was_declined/was_deactivating are the
+        plan before the window edited it (see _replan_for_undeclined)."""
         self._set_sync_busy(True)
+        cfg = load_cfg()
         if host:
-            # Remember which recommended mods were turned off for this server
-            # before any rendering, so the choice survives even if applying
-            # fails partway. Written whole, so taking a choice back sticks too.
+            # Saved before rendering, so the choice survives a failed apply.
+            # Written whole, so taking a choice back sticks too.
             try:
-                mods.set_declined(load_cfg(), host, win.declined)
+                mods.set_declined(cfg, host, win.declined)
             except Exception as e:
                 self._print(f"Could not save your recommended-mod choices: {e}", "warn")
-        # Kept rows the user chose to make durable ("Pin" on a deactivation
-        # toggle): recorded as always-on pins, the same setting as Mod
-        # Manager's Keep Enabled, so future joins stop proposing the
-        # deactivation instead of asking again every time. Saved before the
-        # render for the same reason the declines are.
+        # "Pin" on a deactivation row: an always-on pin (Keep Enabled).
         for mod_id in getattr(win, "pinned_keeps", []):
             try:
-                mods.add_pin(load_cfg(), mod_id)
+                mods.add_pin(cfg, mod_id)
                 self._print(f"Pinned {mod_id} - it will stay enabled on every "
                             f"server (undo in Mod Manager with Keep Enabled).", "dim")
             except Exception as e:
@@ -1200,116 +933,76 @@ class ClientLauncher(tk.Tk):
             self._print(f"Applying the mod changes failed: {err}", "err")
             win.apply_finished(False, f"Couldn't apply the changes: {err}")
 
-        # A decline the player took back can't be honoured by editing this plan:
-        # plan_join never resolved that mod at all (it has no entry, only a
-        # declined row), so there is nothing here to render and applying would
-        # report success having installed nothing. The stored declines were just
-        # rewritten above, so re-planning against them produces the entry.
+        # plan_join never resolved a mod whose decline was taken back (it has
+        # only a declined row), so this plan can't install it; re-planning
+        # against the declines just saved can.
         undeclined = set(was_declined) - set(win.declined)
-        # Plain "Keep" is only ever in the window; unlike a Pin it isn't saved
-        # anywhere, so a fresh plan would propose the same deactivations again.
+        # A plain Keep isn't saved, so a re-plan has to be told about it.
         kept = [m for m in was_deactivating if m not in plan.to_deactivate]
 
-        def worker():
+        def render():
             live = plan
-            try:
-                if undeclined and host:
-                    live = self._replan_for_undeclined(game_dir, host, win,
-                                                       undeclined, kept)
-                mods.render_active_set(
-                    game_dir, live,
-                    lambda m: self.after(0, lambda m=m: report(m)),
-                    lambda i, s: self.after(0, lambda i=i, s=s: win.set_step(i, s)))
-            except Exception as e:
-                self.after(0, lambda e=e: failed(e))
-                return
-            self.after(0, lambda: on_applied(win))
-        threading.Thread(target=worker, daemon=True).start()
+            if undeclined and host:
+                live = self._replan_for_undeclined(game_dir, host, win,
+                                                   undeclined, kept, scene)
+            mods.render_active_set(
+                game_dir, live,
+                lambda m: self.after(0, lambda: report(m)),
+                lambda i, s: self.after(0, lambda: win.set_step(i, s)))
+        run_bg(self, render, on_ok=lambda _: on_applied(win), on_err=failed)
 
-    def _replan_for_undeclined(self, game_dir, host, win, undeclined, kept):
+    def _replan_for_undeclined(self, game_dir, host, win, undeclined, kept, scene):
         """The plan to render when the player un-declined something, resolved
-        against the declines just saved. Runs once, inline in the apply worker,
-        and its result is never re-planned: nothing here can un-decline anything
-        further, so there is no second pass to fall into.
-
-        Raises rather than falling back to the plan that was on screen - that
-        plan is precisely the one that can't install what the row promised, and
-        failing loudly is better than an apply that reports success and does
-        nothing (the failure is reported in the window by the caller)."""
-        kind, payload = self._build_mod_plan(game_dir, host, getattr(self, "_plan_scene", None))
+        against the declines just saved. Runs once, on the apply worker. Raises
+        rather than falling back to the plan on screen, which is precisely the
+        one that can't install what the row promised."""
+        kind, payload = self._build_mod_plan(game_dir, host, scene)
         if kind != "plan":
             raise mods.ModManagerError(
                 f"couldn't re-check this server's mods after you turned "
                 f"{', '.join(sorted(undeclined))} back on: {payload}")
         fresh, _server_mods = payload
         if fresh.blocking:
-            # Apply is only ever enabled on a non-blocking plan, so this means
-            # the server's requirements moved while the comparison was on
-            # screen. Rendering anyway would install everything else and then
-            # fail the parity check with the join already half-committed.
+            # The server's requirements moved while the comparison was on
+            # screen; rendering anyway would fail parity half-committed.
             raise mods.ModManagerError(
                 "this server now needs mods that aren't available from any "
                 "source you've added; check the server again")
-        # The same two edits the window made to the plan it was given. Declines
-        # are already baked into `fresh` via the config write, but only if that
-        # write succeeded - filtering again costs nothing and means a failed
-        # save can't quietly install something the player said no to.
+        # The window's two edits again; filtering declines here too means a
+        # failed config save can't install something the player said no to.
         declined = set(win.declined)
         fresh.entries = [e for e in fresh.entries if e.mod_id not in declined]
         fresh.to_deactivate = [m for m in fresh.to_deactivate if m not in kept]
-        # A recommendation nobody can supply isn't blocking (the server allows
-        # joining without it), so it just isn't in the plan - which would look
-        # exactly like the silent no-op this whole path exists to fix.
+        # An unsuppliable recommendation isn't blocking, so it's simply absent,
+        # which would look like the silent no-op this path exists to fix.
         unresolved = [m for m in sorted(undeclined)
                       if m not in {e.mod_id for e in fresh.entries}]
         if unresolved:
-            self.after(0, lambda: self._print(
-                f"Couldn't install {', '.join(unresolved)}: this server "
-                f"recommends it but no source you've added has it. Joining "
-                f"isn't affected.", "warn"))
+            self._print(f"Couldn't install {', '.join(unresolved)}: this server "
+                        f"recommends it but no source you've added has it. "
+                        f"Joining isn't affected.", "warn")
         self.after(0, lambda: win.retarget(fresh))
         return fresh
 
-    def _build_mod_plan(self, game_dir, host, scene=None):
-        """Shared front half of both mod-sync paths (the Sync Mods button and
-        the pre-launch reconcile): cache what's installed, ask the server what
-        it runs, and resolve that into a JoinPlan. Changes nothing on disk and
-        prompts for nothing, so each caller decides for itself what a given
-        outcome means. Safe to call off the UI thread.
+    def _build_mod_plan(self, game_dir, host, scene=None, mods_hash=None):
+        """The front half of a sync: cache what's installed, ask the server
+        what it runs, and resolve that into a JoinPlan. Writes nothing to Mods/
+        and prompts for nothing; safe off the Tk thread. scene (the server's,
+        from auth) lets plan_join leave out pins that don't work there.
 
-        scene is the server's, when the caller learned it at auth; plan_join
-        uses it to leave out pins that don't work there. Remembered on the
-        window so a re-plan of this same plan (_replan_for_undeclined) asks
-        the same question.
-
-        Clears self._server_untracked on the way in: several of the early exits
-        below return before the server is ever contacted, and a stale advisory
-        from the last server checked would then be reported against this one.
-
-        Returns (kind, payload):
-          ("skip",  reason)               nothing to sync against, which is a
-                                          normal outcome: MelonLoader/TavernLib
-                                          aren't installed, the server reported
-                                          nothing about its mods, or the index
-                                          is unreachable
-          ("error", message)              the server's mods couldn't be resolved
-          ("plan",  (plan, server_mods))  a usable plan, possibly blocking
-        """
+        Returns ("skip", reason) when there's nothing to sync against,
+        ("error", message) when the server's mods can't be resolved, or
+        ("plan", (plan, server_mods)), possibly blocking."""
+        # Cleared first, so an early exit can't report the last server's.
         self._server_untracked = []
-        self._plan_scene = scene
         if not (_melonloader_installed(game_dir) and _tavernlib_installed(game_dir)):
             return "skip", ("Community mods need MelonLoader and TavernLib "
                             "installed before they can load. Install them from "
                             "the Setup window first.")
 
-        # Cache whatever is in Mods/ right now, BEFORE anything below can
-        # overwrite it. Without this, a mod installed straight to Mods/ (the
-        # Community Mods window, or an older launcher with no cache at all) is
-        # unknown to the cache, so rendering an active set that needs a
-        # different version of it replaces the folder and destroys the only copy
-        # of the version that was there - making a later switch back a
-        # re-download instead of the file move the cache exists to guarantee.
-        # Idempotent: an already-cached version is skipped.
+        # Cache what's in Mods/ before anything can replace it. A mod
+        # installed straight to Mods/ isn't cached yet, and rendering a
+        # different version would destroy the only copy of this one.
         try:
             adopted = mods.adopt_installed_mods(game_dir)
             if adopted:
@@ -1318,10 +1011,7 @@ class ClientLauncher(tk.Tk):
         except Exception as e:
             self._print(f"Could not cache the currently-installed mods: {e}", "warn")
 
-        # None, not []: a server that runs no mods is planned against normally,
-        # because its empty set is exactly what deactivates whatever is active
-        # here. Only a server that couldn't tell us anything skips.
-        server_mods = self._get_server_mods(host)
+        server_mods = self._get_server_mods(host, mods_hash)
         if server_mods is None:
             return "skip", ("This server didn't report what mods it runs, so "
                             "there's nothing to sync against.")
@@ -1335,8 +1025,6 @@ class ClientLauncher(tk.Tk):
             return "skip", f"Couldn't reach the mod index: {e}"
 
         pinned = mods.list_pinned(cfg)
-        # Recommended mods this player has already turned down for this server
-        # stay turned down, rather than being re-offered on every join.
         declined = mods.list_declined(cfg, host)
         try:
             plan = mods.plan_join(game_dir, server_mods, index, repo_bases,
@@ -1344,93 +1032,69 @@ class ClientLauncher(tk.Tk):
         except mods.ModManagerError as e:
             return "error", str(e)
 
-        # A pin naming something no configured source carries. Reported in the
-        # log rather than by opening the comparison window: it's the player's
-        # own setting, it has nothing to do with this server, and it would
-        # otherwise be a modal on every single join until they fixed it.
-        # Marshalled onto the UI thread because _print writes to a Tk widget
-        # and this method runs on a worker.
+        # The player's own setting, so a log line rather than a modal.
         for mod_id, version in plan.unresolved_pins:
-            self.after(0, lambda i=mod_id, v=version: self._print(
-                f"Your pinned mod {i} ({v}) isn't in any source you've added, "
-                f"so it can't be installed. This doesn't affect joining - "
-                f"remove the pin in Mod Manager to stop this notice.", "warn"))
+            self._print(f"Your pinned mod {mod_id} ({version}) isn't in any "
+                        f"source you've added, so it can't be installed. This "
+                        f"doesn't affect joining - remove the pin in Mod "
+                        f"Manager to stop this notice.", "warn")
         return "plan", (plan, server_mods)
 
-    def _verify_mod_parity(self, game_dir, server_mods):
-        """Every mod the server requires of clients, checked against what's
-        actually enabled here at EXACTLY the right version (the same rule the
-        server applies on join). Returns the mismatches, empty when parity
-        holds. Just a Mods/ scan, so it's cheap enough to run inline.
-
-        Mods the server doesn't require are left out, matching
-        ModParity.ValidateClient: the server won't refuse a join over one, so
-        neither should this. Checking them here would block launches the server
-        would have allowed, which is the whole point of the distinction.
-
-        A required mod with no version always mismatches, as it does in
-        ValidateClient: otherwise a client without the mod would hold "no
-        version" too and pass."""
+    def _verify_mod_parity(self, server_mods, installed):
+        """(id, needed, have) for every mod the server requires of clients that
+        `installed` doesn't match at exactly that version; empty when parity
+        holds. ModParity.ValidateClient's rule: mods the server doesn't require
+        are skipped, and a required mod with no version always mismatches."""
         required = {m["id"]: m.get("version") for m in server_mods
                     if m.get("client_side")
                     and mods.parity_required(m)}
-        _, _, installed_mods, _ = mods.handshake_snapshot(game_dir)
-        have = {m["id"]: m["version"] for m in installed_mods}
+        have = {m["id"]: m.get("version") for m in installed}
         return [(mid, ver, have.get(mid)) for mid, ver in required.items()
                 if not ver or have.get(mid) != ver]
 
-    def _report_build_divergence(self, game_dir, server_mods):
-        """Advisory only: same id and version on both sides can still be
-        different bytes - a release re-published without a version bump, or
-        the same version pulled from two different repos. Version parity (the
-        only thing the server enforces) passes, so the join goes ahead; this
-        just says so in the log, because an in-game misbehaviour from that
-        divergence is otherwise undiagnosable. Only possible when both sides
-        report a sha256 - older records and older servers simply don't, and
-        silence there is correct."""
-        try:
-            _, _, installed_mods, _ = mods.handshake_snapshot(game_dir)
-            have = {m["id"]: m for m in installed_mods}
-            for m in server_mods:
-                if not m.get("client_side"):
-                    continue
-                local = have.get(m["id"])
-                if not local or local.get("version") != m.get("version"):
-                    continue
-                server_sha = (m.get("sha256") or "").lower()
-                local_sha = (local.get("sha256") or "").lower()
-                if server_sha and local_sha and server_sha != local_sha:
-                    self._print(
-                        f"Heads up: {m['id']} {m.get('version')} is the same "
-                        f"version on both sides but a different build (the "
-                        f"published file changed without a version bump). The "
-                        f"server won't block your join over it, but if this mod "
-                        f"misbehaves in-game, that's why - worth telling the "
-                        f"server owner.", "warn")
-        except Exception:
-            pass
+    def _build_divergence(self, server_mods, installed):
+        """Warnings for mods with the same id and version on both sides but a
+        different sha256: version parity passes, but an in-game misbehaviour
+        from it would otherwise be undiagnosable. Silent when either side
+        predates the sha256 field."""
+        have = {m["id"]: m for m in installed}
+        warnings = []
+        for m in server_mods:
+            local = have.get(m["id"]) if m.get("client_side") else None
+            if not local or local.get("version") != m.get("version"):
+                continue
+            server_sha = (m.get("sha256") or "").lower()
+            local_sha = (local.get("sha256") or "").lower()
+            if server_sha and local_sha and server_sha != local_sha:
+                warnings.append(
+                    f"Heads up: {m['id']} {m.get('version')} is the same "
+                    f"version on both sides but a different build (the "
+                    f"published file changed without a version bump). The "
+                    f"server won't block your join over it, but if this mod "
+                    f"misbehaves in-game, that's why - worth telling the "
+                    f"server owner.")
+        return warnings
 
-    def _reconcile_mods_async(self, host, exe, on_ready, scene=None):
-        """Brings Mods/ in line with this server and then calls on_ready() to
-        continue the launch, or never calls it if the launch shouldn't proceed
-        (having already said why and re-enabled the buttons).
+    def _post_render_check(self, game_dir, server_mods):
+        """Worker half of the verify: one read of Mods/ feeds the parity check,
+        the build-divergence advisory and the join's mods claim."""
+        installed = _enabled_mods(game_dir)
+        return (self._verify_mod_parity(server_mods, installed),
+                self._build_divergence(server_mods, installed), installed)
 
-        Continuation-passing rather than a blocking call, because the slow parts
-        here are a repo index fetch and potentially hundreds of megabytes of
-        downloads. Run inline they would freeze the window for the whole of it,
-        with no redraw and no way to cancel; the download helper's own wall-clock
-        cap is 30 minutes, so that freeze is not theoretical. The two slow steps
-        run on workers and everything that touches Tk hops back via after().
+    def _reconcile_mods(self, host, exe, then=None, scene=None, display=None,
+                        mods_hash=None):
+        """Brings Mods/ in line with this server: plan, show the comparison,
+        apply, then verify parity, with the slow steps on workers. The verify
+        is never skipped after a render: an accepted pin conflict or a
+        fail-soft render can still leave a mismatch.
 
-        The order is fixed: resolve, show the comparison, apply, then verify.
-        Verification is deliberately not skipped even when the render reported
-        success, since an accepted pin conflict or a fail-soft render can still
-        leave a mismatch that would otherwise only surface as an in-game
-        rejection."""
+        With `then` this is the join: then(installed) launches once parity
+        holds, and a server with nothing to sync against fails open. Without
+        it this is Sync Mods, which ends at the verified result. Either way
+        the buttons come back however it ends."""
+        joining = then is not None
         game_dir = os.path.dirname(exe)
-        # The "close the game first" question was already asked at the very
-        # top of the join flow (_on_join_clicked), before the auth handshake
-        # or any post-auth hook could write into the game folder.
         self._set_sync_busy(True)
 
         def abort(msg=None, tag="err"):
@@ -1438,92 +1102,105 @@ class ClientLauncher(tk.Tk):
                 self._print(msg, tag)
             self._set_sync_busy(False)
 
-        def verified(server_mods, win=None):
-            """Parity check after the render. A mismatch here is reported in the
-            comparison window when there is one, so the player is looking at the
-            table the rows came from rather than a detached error box."""
-            mismatched = self._verify_mod_parity(game_dir, server_mods)
+        def verify(server_mods, win=None):
+            def check_failed(e):
+                abort(f"Couldn't check your mods after applying: {e}")
+                if win is not None:
+                    win.apply_finished(False, f"Couldn't check your mods: {e}")
+            self._set_sync_busy(True)
+            run_bg(self, lambda: self._post_render_check(game_dir, server_mods),
+                   on_ok=lambda result: verified(*result, win=win),
+                   on_err=check_failed)
+
+        def verified(mismatched, warnings, installed, win=None):
             if mismatched:
                 lines = "; ".join(f"{mid} needs {ver}, have {have_ver or 'nothing'}"
                                   for mid, ver, have_ver in mismatched)
-                self._print(f"Mods still don't match this server ({lines}); "
-                            "joining would be rejected, not launching.", "err")
-                abort()
+                abort(f"Mods still don't match this server ({lines}); joining "
+                      f"would be rejected{', not launching' if joining else ''}.")
                 if win is not None:
                     win.apply_finished(False,
                         "Your mods still don't match this server: " + lines +
-                        ". Joining would be rejected, so the game wasn't launched.")
+                        (". Joining would be rejected, so the game wasn't launched."
+                         if joining else "."))
                 return
-            self._report_build_divergence(game_dir, server_mods)
-            if win is not None:
-                win.apply_finished(True)      # closes it, the launch follows
+            for warning in warnings:
+                self._print(warning, "warn")
             self._set_sync_busy(False)
-            on_ready()
+            if joining:
+                if win is not None:
+                    win.apply_finished(True)      # closes it; the launch follows
+                then(installed)
+                return
+            self._print("Mods are now in sync with the server.", "ok")
+            if win is not None:
+                win.apply_finished(True, "Your mods now match this server, so "
+                                         "joining won't need to download anything.")
 
-        def planned(kind, payload):
-            # Before any branch below, including the ones that go straight on to
-            # launch: this is advisory, so it must never depend on the plan
-            # having turned out a particular way.
+        def planned(result):
+            kind, payload, installed = result
+            # Advisory, so it never depends on how the plan turned out.
             self._report_server_untracked()
             if kind == "skip":
-                self._set_sync_busy(False)
-                on_ready()                    # fail open, never block a join
+                if joining:
+                    self._set_sync_busy(False)
+                    then(installed)               # fail open, never block a join
+                else:
+                    abort(payload, "warn")
                 return
             if kind == "error":
-                abort(f"Could not resolve this server's required mods: {payload}")
+                abort(f"Could not resolve this server's mods: {payload}")
                 return
 
             plan, server_mods = payload
             if plan.blocking:
-                # Show the comparison rather than a bare error: seeing which mod
-                # is unavailable, beside everything that is fine, is what tells
-                # the player whether to add a source or ask the server owner.
-                # No apply_action, so this is a read-only view and can't continue.
-                reasons = []
-                if plan.missing:
-                    reasons.append("aren't in any source you've added")
-                if plan.needs_repo:
-                    reasons.append("are only in a source you haven't added yet "
-                                   "(the comparison names it)")
-                self._print("This server needs mods that "
-                            + " or ".join(reasons) + "; not launching.", "err")
+                # Read-only, but it shows the player whether to add a source
+                # or ask the server owner.
+                if joining:
+                    reasons = []
+                    if plan.missing:
+                        reasons.append("aren't in any source you've added")
+                    if plan.needs_repo:
+                        reasons.append("are only in a source you haven't added yet "
+                                       "(the comparison names it)")
+                    self._print("This server needs mods that "
+                                + " or ".join(reasons) + "; not launching.", "err")
                 abort()
-                self._open_mod_diff(plan, server_mods, game_dir, host, joining=True)
+                self._open_mod_diff(plan, server_mods, game_dir, host, joining,
+                                    display_host=display)
                 return
 
-            # needs_repo doesn't appear here: a plan carrying one is blocking
-            # (a required mod that won't be installed), handled above.
+            # A join with nothing to change goes straight to the verify; Sync
+            # shows the all-matching table, since that is what was asked.
             changed = [e for e in plan.entries if not e.active]
-            if not (changed or plan.to_deactivate or plan.pin_conflicts):
-                verified(server_mods)         # already correct, nothing to apply
+            if joining and not (changed or plan.to_deactivate or plan.pin_conflicts):
+                verify(server_mods)
                 return
 
             def cancelled(win):
-                # A close after a failed apply has already been explained, both
-                # in the log and in the window itself; only a close with no
-                # attempt behind it is a decline.
-                if win.apply_attempted:
+                # Only a close with no apply attempt behind it is a decline.
+                if joining and not win.apply_attempted:
+                    abort("Mod changes declined; not launching.", "warn")
+                else:
                     self._set_sync_busy(False)
-                    return
-                abort("Mod changes declined; not launching.", "warn")
 
-            # Hand over to the window: it applies, shows progress, and calls back
-            # here when the render is done. Buttons come back on if it's closed
-            # without applying, which is also what stops the launch.
             self._set_sync_busy(False)
             self._open_mod_diff(
-                plan, server_mods, game_dir, host, joining=True,
-                on_applied=lambda win: verified(server_mods, win),
-                on_cancel=cancelled)
+                plan, server_mods, game_dir, host, joining,
+                on_applied=lambda win: verify(server_mods, win),
+                on_cancel=cancelled, display_host=display, scene=scene)
 
-        def worker():
-            try:
-                kind, payload = self._build_mod_plan(game_dir, host, scene)
-            except Exception as e:
-                self.after(0, lambda e=e: abort(f"Could not check this server's mods: {e}"))
-                return
-            self.after(0, lambda: planned(kind, payload))
-        threading.Thread(target=worker, daemon=True).start()
+        def make_plan():
+            kind, payload = self._build_mod_plan(game_dir, host, scene, mods_hash)
+            installed = None
+            if joining and kind == "skip":
+                # For the fail-open launch's mods claim, read off the Tk thread.
+                try: installed = _enabled_mods(game_dir)
+                except Exception: pass
+            return kind, payload, installed
+
+        run_bg(self, make_plan, on_ok=planned,
+               on_err=lambda e: abort(f"Could not check this server's mods: {e}"))
 
     # ── Launch ────────────────────────────────────────────────────────────────
 
@@ -1684,40 +1361,33 @@ class ClientLauncher(tk.Tk):
         cfg["recent_servers"] = recent[:20]
         save_cfg(cfg)
 
-        # Mod reconciliation can download hundreds of megabytes, so it runs off
-        # the UI thread and calls back only when the launch should go ahead.
-        # Everything above this point is quick.
-        self._reconcile_mods_async(host, exe, lambda: self._launch_game(
+        self._reconcile_mods(host, exe, lambda installed: self._launch_game(
             exe, ip, host, platform, username, user_id, token,
             lambda: self._do_launch(password=None),
-            scene_arg=scene_arg), scene=mods.scene_from_arg(scene_arg))
+            scene_arg=scene_arg, installed=installed),
+            scene=mods.scene_from_arg(scene_arg))
 
-    def _mods_claim(self, game_dir):
-        """The TavernMods claim for the tokens: id -> version of every enabled
-        managed mod. Managed mods only - the claim exists for the server's
-        exact-version parity check, and an untracked mod has no id or version
-        to check (ModParity.ValidateClient only ever looks up ids the SERVER
-        requires, so naming ours would be noise it would discard anyway).
-        Empty when Mods/ can't be read, which a server enforcing parity reads
-        as "no mods"."""
+    def _mods_claim(self, game_dir, installed=None):
+        """The TavernMods claim: {id: version} of every enabled managed mod,
+        for the server's exact-version parity check (an untracked mod has no
+        id or version to claim). Empty when Mods/ can't be read, which a server
+        enforcing parity reads as "no mods"."""
         try:
-            _, _, mods_list, _ = mods.handshake_snapshot(game_dir)
-            return json.dumps({m["id"]: m["version"] for m in mods_list})
+            if installed is None:
+                installed = _enabled_mods(game_dir)
+            return json.dumps({m["id"]: m.get("version", "") for m in installed},
+                              sort_keys=True)
         except Exception as e:
             self._print(f"Could not read installed mods for the join handshake: {e}", "warn")
             return ""
 
     def _launch_game(self, exe, ip, host, platform, username, user_id, token,
-                     relaunch, scene_arg=None):
-        """Builds the tokens and starts the game. The shared tail of both join
-        paths, which differ only in the token they carry (the auth flow has a
-        real one, the direct flow has none) and where a rejection should rejoin
-        to. Runs on the UI thread and returns immediately: everything slow has
-        already finished by the time anything reaches here."""
-        # Report what's actually enabled in Mods/ (after the render) so the
-        # server's exact-version parity check has something to compare against;
-        # see build_tokens' mods_claim.
-        mods_claim = self._mods_claim(os.path.dirname(exe))
+                     relaunch, scene_arg=None, installed=None):
+        """Builds the tokens and starts the game: the shared tail of both join
+        paths, which differ only in the token (none on the direct flow) and in
+        how a rejection rejoins. `installed` is the enabled mods the verify
+        just read, for the mods claim."""
+        mods_claim = self._mods_claim(os.path.dirname(exe), installed)
 
         access, refresh, identity = build_tokens(user_id, username, token, mods_claim)
         args = [exe, "/force_offline",
@@ -1742,10 +1412,8 @@ class ClientLauncher(tk.Tk):
             # client has to match, not choose for itself.
             args.append(scene_arg)
 
-        # Delete any stale rejection file before launching, so a file present
-        # after THIS process exits was written by THIS attempt (the actual
-        # staleness guard is that we wait for this exact process and nothing
-        # else runs in between; see _watch_for_rejection).
+        # A rejection file present after this process exits must be this
+        # attempt's (see _watch_for_rejection).
         _delete_last_rejection_file()
 
         self._print(f"Launching on {platform or 'default'}…", "warn")
@@ -1757,9 +1425,7 @@ class ClientLauncher(tk.Tk):
             run_before_launch_hooks(host, exe, self._print)
             proc = subprocess.Popen(args, cwd=os.path.dirname(exe),
                                     **self._popen_console_kwargs())
-            # Held on the launcher, not just handed to the watcher thread:
-            # everything that installs, removes, or renders mods asks these
-            # handles whether a game still has the folder open first.
+            # Kept for the running-game guard (see _game_is_running).
             self._game_procs.append(proc)
             self._print(f"Game running (PID {proc.pid})", "ok")
             threading.Thread(target=self._watch_for_rejection,
@@ -1769,19 +1435,11 @@ class ClientLauncher(tk.Tk):
         self._action_btn.config(state="normal")
 
     def _watch_for_rejection(self, proc, host, relaunch):
-        """Runs on a background thread once the game process is launched.
-        Waits for it to exit, then checks for TavernLib's last_rejection.json,
-        written by this same client's own TavernLib instance right before
-        exiting, if (and only if) the server denied the join for a mod-mismatch
-        reason. The launch path already deleted any stale copy before this
-        process started, so a file present now was written by this exact
-        attempt.
-
-        relaunch is the caller's own way back in, so recovery rejoins via the
-        path the player actually used - _do_launch for the auth-gated flow,
-        _do_launch_headless for the direct one. Hardcoding _do_launch here
-        would send a headless join through an auth handshake its server never
-        answers."""
+        """Background thread: waits for the game to exit, then reads the
+        last_rejection.json TavernLib writes when a server denies the join over
+        mods. The launch deleted any stale copy, so one present now is this
+        attempt's. relaunch rejoins the way the player joined (auth-gated or
+        direct)."""
         proc.wait()
         path = _last_rejection_path()
         if not os.path.isfile(path):
@@ -1790,12 +1448,7 @@ class ClientLauncher(tk.Tk):
             with open(path, "r", encoding="utf-8") as f:
                 payload = json.load(f)
         except Exception as e:
-            # Bound as a default, not captured: Python clears the `as e` name
-            # when the except block ends, and this lambda runs later on the UI
-            # thread, so a free reference would be a NameError instead of the
-            # warning it is meant to print.
-            self.after(0, lambda e=e: self._print(
-                f"Could not read the rejection file: {e}", "warn"))
+            self._print(f"Could not read the rejection file: {e}", "warn")
             return
         finally:
             try: os.remove(path)   # consumed either way, never re-act on it twice
@@ -1804,9 +1457,7 @@ class ClientLauncher(tk.Tk):
         if payload.get("schema") != 1:
             return
         server = payload.get("server") or {}
-        # Extra cross-check beyond the delete-before-launch guard above: a
-        # host mismatch means this file wasn't actually about the server we
-        # just tried to join.
+        # A different host means the file isn't about this join.
         if server.get("host") and server.get("host") != host:
             return
         missing = payload.get("missing") or []
@@ -1816,15 +1467,8 @@ class ClientLauncher(tk.Tk):
 
     def _offer_rejection_recovery(self, payload, relaunch):
         """The server rejected the join over exact mods the client didn't have.
-        Offers to fetch exactly those (and their dependencies), same
-        confirm-before-install and never-auto-add-a-repo rules as everywhere
-        else, then rejoins.
-
-        Only the prompt runs here, on the UI thread; the index fetch and the
-        downloads go to a worker, same as every other install path in this
-        file. Doing them inline would freeze the whole launcher for the length
-        of a download - up to the 30-minute wall-clock cap - with no window
-        redraw and no way to cancel."""
+        Offers to fetch exactly those (and their dependencies) from the
+        client's own sources, on a worker, then rejoins."""
         missing = payload.get("missing") or []
         names = "\n".join(f"  • {m['id']} {m['version']}" for m in missing)
         if not messagebox.askyesno("Mods needed to rejoin",
@@ -1877,22 +1521,13 @@ class ClientLauncher(tk.Tk):
         relaunch()
 
     def _do_launch_headless(self):
-        """Same launch as _do_launch, minus the port-1762 auth handshake, for
-        servers hosted directly via the game itself with no auth gate.
+        """Same launch as _do_launch, minus the port-1762 handshake entirely —
+        for servers hosted directly via the game itself with no auth gate.
         user_id has no server to come from here, so it's derived locally
         instead (see _headless_user_id); everything after that point is
-        identical to the official flow.
-
-        Mod reconciliation still runs, because it is a separate concern from
-        auth. TavernLib's join-time parity check (PlayerJoinFilter) is a
-        Harmony patch on the join pipeline, not part of the auth service, so it
-        applies to this path exactly as it does to the official one: a server
-        reached this way still rejects a client whose mods don't match.
-        Skipping the mod work here would therefore mean presenting an empty
-        mods claim to a server that requires mods and being rejected every
-        single time, with no rejection watcher running to recover from it
-        either. If the host serves no mod info at all, _reconcile_mods_async is
-        a no-op."""
+        identical to the official flow. That includes the mod sync: TavernLib's
+        join-time parity check is part of the join pipeline, not the auth
+        service, so it applies here too."""
         exe      = self.v_exe.get().strip()
         username = self.v_username.get().strip()
         platform = self.v_platform.get()
@@ -1929,31 +1564,12 @@ class ClientLauncher(tk.Tk):
         cfg["recent_servers"] = recent[:20]
         save_cfg(cfg)
 
-        # Same resolution the /dev_server_ip arg uses, so the host the
-        # reconcile and the rejection watcher key off is the one the game
-        # actually connects to (TavernLib records the resolved address in the
-        # rejection payload, and _watch_for_rejection cross-checks against it).
+        # The address the game connects to (/dev_server_ip), which is also
+        # what TavernLib records in a rejection.
         resolved_host = _resolve_ip_for_game(host)
-        # Off the UI thread, same as the auth-gated path. No token to carry
-        # here, and a rejection rejoins through this same direct flow.
-        self._reconcile_mods_async(resolved_host, exe, lambda: self._launch_game(
+        self._reconcile_mods(resolved_host, exe, lambda installed: self._launch_game(
             exe, ip, resolved_host, platform, username, user_id, "",
-            self._do_launch_headless))
-
-    def _refresh_menu_btn(self):
-        """Shows Main Menu button only when TavernEssentials is installed for the selected game,
-        since that's what fills the main menu's server boards. Runs from _refresh_setup_alert,
-        so it updates on startup, when the game path changes, and after the Setup or Mod Manager
-        window changes anything."""
-        exe = self.v_exe.get().strip()
-        game_dir = os.path.dirname(exe)
-        show = bool(exe) and os.path.isfile(exe) and _tavernessentials_installed(game_dir)
-        packed = self._menu_btn.winfo_manager() == "pack"
-        if show and not packed:
-            self._menu_btn.pack(side="left", fill="x", expand=True, padx=(4, 0),
-                                after=self._action_btn)
-        elif not show and packed:
-            self._menu_btn.pack_forget()
+            self._do_launch_headless, installed=installed))
 
     def _do_launch_menu(self):
         """Launches the game into its main menu instead of a server.
@@ -2005,12 +1621,15 @@ class ClientLauncher(tk.Tk):
         try:
             proc = subprocess.Popen(args, cwd=os.path.dirname(exe),
                                     **self._popen_console_kwargs())
-            # Tracked like a joined game, so the Setup and Mod Manager windows
-            # know the game is up before they write into its folder.
+            # Tracked like a joined game, for the running-game guard.
             self._game_procs.append(proc)
             self._print(f"Menu running (PID {proc.pid})", "ok")
         except Exception as e:
             self._print(f"Menu launch failed: {e}", "err")
+
+
+def _enabled_mods(game_dir):
+    return [m for m in mods.list_installed_mods(game_dir) if m.get("enabled")]
 
 
 def _tavernessentials_installed(game_dir):

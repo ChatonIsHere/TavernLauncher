@@ -64,15 +64,8 @@ That's it. If the Setup button has stopped flashing you should be on the latest 
 
 ### Optional mods
 
-Optional mods are installed from the "Mod Manager": click "Community Mods", find the mod and click "Install".
-The Mod Manager keeps them up to date too. Popular ones include:
-
-- **CircuitsVoiceChat** — Voice chat inside the game, since the official service was retired. Highly recommended.
-- **TavernEssentials** — A framework that restores the original main menu functionality, plus plenty of social features and more. Created by Shadow!
-
-When you join a server that runs mods, the client launcher compares them with yours and offers to install
-(or switch off) whatever it takes to match.
-To keep a mod you like on every server (TavernEssentials' menu boards, say), choose "Pin" when it offers to switch it off.
+Install optional mods such as **CircuitsVoiceChat** (voice chat) and **TavernEssentials** (main menu and social features, by Shadow!) from "Mod Manager" → "Community Mods".
+Joining a server offers to match its mods; choose "Pin" to keep one of yours on every server.
 
 ## Essentials
 

@@ -127,6 +127,38 @@ def build_server_tokens():
     return a, r, i
 
 
+# handshake_snapshot reads every record in Mods/ and is asked for on every
+# ping, so it's cached briefly per game folder (TavernLib's handshake does the
+# same with the same TTL). The generation stops a snapshot that started before
+# an invalidation from being stored after it.
+_SNAPSHOT_TTL = 5.0
+_snapshot_lock = threading.Lock()
+_snapshot_cache = {}       # game_dir -> (taken_at, snapshot)
+_snapshot_generation = 0
+
+
+def _mods_snapshot(game_dir):
+    now = time.monotonic()
+    with _snapshot_lock:
+        hit = _snapshot_cache.get(game_dir)
+        if hit and now - hit[0] < _SNAPSHOT_TTL:
+            return hit[1]
+        generation = _snapshot_generation
+    snapshot = mods.handshake_snapshot(game_dir)
+    with _snapshot_lock:
+        if generation == _snapshot_generation:
+            _snapshot_cache[game_dir] = (now, snapshot)
+    return snapshot
+
+
+def invalidate_mods_snapshot():
+    """Call after anything changes Mods/, so the next ping reads it afresh."""
+    global _snapshot_generation
+    with _snapshot_lock:
+        _snapshot_generation += 1
+        _snapshot_cache.clear()
+
+
 def _send_framed(conn, obj):
     """Length-prefixed write: a 4-byte big-endian byte count, then the JSON
     body. Used only for responses that can genuinely grow past a single
@@ -136,7 +168,7 @@ def _send_framed(conn, obj):
     conn.sendall(len(body).to_bytes(4, "big") + body)
 
 
-def _handle_auth(conn, addr, log_fn, game_dir):
+def _handle_auth(conn, addr, log_fn, get_game_dir):
     ip = addr[0] if addr else "?"
     try:
         conn.settimeout(5)
@@ -163,12 +195,14 @@ def _handle_auth(conn, addr, log_fn, game_dir):
             live_count, live_limit = _read_live_player_status()
             if live_count is not None: resp["player_count"] = live_count
             if live_limit is not None and live_limit > 0: resp["player_limit"] = live_limit
-            try:
-                mods_hash, mods_count, _, _ = mods.handshake_snapshot(game_dir)
-                resp["mods_hash"]  = mods_hash
-                resp["mods_count"] = mods_count
-            except Exception as e:
-                log_fn(f"mod handshake: couldn't build ping fingerprint ({e})", "warn")
+            game_dir = get_game_dir()
+            if game_dir:
+                try:
+                    mods_hash, mods_count, _, _ = _mods_snapshot(game_dir)
+                    resp["mods_hash"]  = mods_hash
+                    resp["mods_count"] = mods_count
+                except Exception as e:
+                    log_fn(f"mod handshake: couldn't build ping fingerprint ({e})", "warn")
             conn.sendall(json.dumps(resp).encode())
             return
 
@@ -177,7 +211,10 @@ def _handle_auth(conn, addr, log_fn, game_dir):
         # can outgrow a single recv unlike everything else on this port ──
         if req.get("mods_list"):
             try:
-                _, _, mods_list, untracked = mods.handshake_snapshot(game_dir)
+                game_dir = get_game_dir()
+                if not game_dir:
+                    raise RuntimeError("this server has no game folder set")
+                _, _, mods_list, untracked = _mods_snapshot(game_dir)
                 # "untracked" is additive and advisory: a client too old to know
                 # the key ignores it and joins exactly as before, which is the
                 # right outcome for something that never blocks a join anyway.
@@ -365,7 +402,9 @@ def _handle_auth(conn, addr, log_fn, game_dir):
         except: pass
 
 
-def start_auth_service(log_fn, game_dir, port=AUTH_PORT):
+def start_auth_service(log_fn, get_game_dir, port=AUTH_PORT):
+    """get_game_dir() is the folder whose Mods/ the handshake describes, asked
+    per request so it follows the server to a different install."""
     def serve():
         try:
             s = socket.socket()
@@ -375,7 +414,7 @@ def start_auth_service(log_fn, game_dir, port=AUTH_PORT):
             while True:
                 conn, addr = s.accept()
                 threading.Thread(target=_handle_auth,
-                                  args=(conn,addr,log_fn,game_dir), daemon=True).start()
+                                  args=(conn,addr,log_fn,get_game_dir), daemon=True).start()
         except Exception as e:
             log_fn(f"Auth service failed: {e}", "err")
     threading.Thread(target=serve, daemon=True).start()
