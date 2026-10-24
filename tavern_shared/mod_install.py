@@ -243,23 +243,37 @@ def _tavernlib_installed(game_dir):
     return os.path.isfile(os.path.join(game_dir, "Plugins", TAVERNLIB_FILENAME))
 
 
+_ipv4_lock = threading.Lock()
+_ipv4_users = 0
+_ipv4_saved = None
+
+
 @contextlib.contextmanager
 def _force_ipv4():
-    """Temporarily makes socket.getaddrinfo only return IPv4 results.
-    Fixes a common real-world failure: a network where IPv6 is technically
-    configured but the actual route is dead/blackholed, so anything that
-    tries the (often-preferred) IPv6 address first just hangs instead of
-    failing over. Browsers and curl dodge this automatically by racing both
-    address families ("happy eyeballs"); plain urllib doesn't, so this
-    nudges it into only ever trying IPv4."""
-    _orig = socket.getaddrinfo
-    def _ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
-        return _orig(host, port, socket.AF_INET, type, proto, flags)
-    socket.getaddrinfo = _ipv4_only
+    """Makes socket.getaddrinfo return only IPv4 results while any caller is
+    inside. Fixes networks where IPv6 is configured but its route is dead:
+    plain urllib tries the preferred IPv6 address and hangs instead of
+    failing over, where browsers race both families.
+
+    The patch is process-wide (the lookup can run on _urlopen_hard_timeout's
+    helper thread), so it is reference-counted under a lock: installed by the
+    first caller in, removed by the last one out, however threads overlap."""
+    global _ipv4_users, _ipv4_saved
+    with _ipv4_lock:
+        if _ipv4_users == 0:
+            _ipv4_saved = orig = socket.getaddrinfo
+
+            def _ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+                return orig(host, port, socket.AF_INET, type, proto, flags)
+            socket.getaddrinfo = _ipv4_only
+        _ipv4_users += 1
     try:
         yield
     finally:
-        socket.getaddrinfo = _orig
+        with _ipv4_lock:
+            _ipv4_users -= 1
+            if _ipv4_users == 0:
+                socket.getaddrinfo, _ipv4_saved = _ipv4_saved, None
 
 
 def _urlopen_hard_timeout(req, connect_timeout=20, socket_timeout=20):
