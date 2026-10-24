@@ -1,28 +1,20 @@
-"""Semver-ish comparison. Major-lock resolution leans on this constantly and
-the stdlib has no semver, so it is the one place versions become comparable."""
+"""Version parsing: the one place versions become comparable."""
 import re
 
 from tavern_shared.mods.errors import ModManagerError
 
-# int() is looser than C#'s int.TryParse, which is what TavernLib parses the
-# same version strings with: int("0_5") is 5 and int("١٢") is 12, both of which
-# TryParse refuses. Neither side throws on an unparseable version - they skip it
-# with a warning - so accepting more here doesn't error, it silently gives the
-# launcher a different version set (and a different highest()/major) than the
-# host resolving the same index. ASCII digits only is the intersection.
+# ASCII digits only: int() also takes "0_5" and non-ASCII digits, which C#'s
+# int.TryParse refuses. Both sides skip unparseable versions, so accepting more
+# here would quietly give the launcher a different version set than the host.
 _SEGMENT = re.compile(r"[0-9]+")
+_SEGMENT_MAX = 2147483647
 
 
 def _parse_version(v):
-    """Major-lock resolution compares versions constantly and the stdlib has no
-    semver, so this is the one place versions become comparable.
-    Splits "MAJOR.MINOR.PATCH" into an int tuple so ordering is numeric, not
-    lexical. The trap this closes is that "1.10.0" < "1.9.0" as strings but
-    1.10 > 1.9 as versions.
-
-    Pre-release/build metadata ("1.2.0-rc1", "1.2.0+build") is NOT supported: a
-    version that isn't exactly three numeric segments is rejected outright
-    (below), so ordering never has to guess how to rank a pre-release tag."""
+    """"MAJOR.MINOR.PATCH" as an int tuple, so "1.10.0" orders above "1.9.0".
+    Exactly three ASCII-digit segments, each within Int32; no pre-release or
+    build metadata, so ordering never guesses. The grammar is the twin of
+    TavernLib's ModVersion: both sides must accept the same strings."""
     if not isinstance(v, str):
         raise ModManagerError(f"Version must be a string, got {v!r}")
     parts = v.strip().split(".")
@@ -33,7 +25,13 @@ def _parse_version(v):
     if not all(_SEGMENT.fullmatch(p) for p in parts):
         raise ModManagerError(
             f"Version {v!r} has a non-numeric segment; only digits are allowed.")
-    return tuple(int(p) for p in parts)
+    out = tuple(int(p) for p in parts)
+    # TavernLib parses segments as Int32; anything wider would order here and
+    # be skipped there.
+    if any(n > _SEGMENT_MAX for n in out):
+        raise ModManagerError(
+            f"Version {v!r} has a segment larger than 2147483647.")
+    return out
 
 
 def _major(v):

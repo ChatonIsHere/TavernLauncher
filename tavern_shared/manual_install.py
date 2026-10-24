@@ -1,22 +1,8 @@
-"""
-The fallback for when the automated install can't work at all.
-
-Some failures are not the launcher's to fix, and retrying them forever is not
-a strategy. A corporate/school proxy that needs PAC/WPAD config Python doesn't
-evaluate, antivirus that intercepts this specific process's downloads, a
-firewall that only allowlists browser traffic, Controlled Folder Access
-refusing writes into the game folder -- in every one of those the user's own
-browser and File Explorer work perfectly well, and only this app is blocked.
-
-So this window stops pretending and hands the job over: here is the exact file
-to fetch, here is the page to fetch it from, here is the exact folder to put it
-in, and here are buttons that open both. Nothing here downloads anything.
-
-Every path and URL shown here is imported from the modules that do the
-automated install rather than written out again, so the two can't drift into
-disagreeing about where a file goes -- a manual-install guide that is subtly
-wrong is worse than not having one.
-"""
+"""The fallback when the automated install can't work at all: a proxy Python
+can't negotiate, antivirus or a firewall that only lets the browser through,
+Controlled Folder Access. This window downloads nothing; it names the file,
+the page to fetch it from and the folder it goes in, with buttons for each.
+Every path and URL is imported from the installers, so the two can't drift."""
 import os
 import webbrowser
 import tkinter as tk
@@ -77,11 +63,8 @@ def _steps_for(component, game_dir, arch):
 
 class ManualInstallWindow(tk.Toplevel):
     """Instructions and shortcuts for installing one component by hand.
-
-    on_recheck is called when the user presses Re-check — Setup passes its own
-    _refresh_states, so confirming a manual install goes through exactly the
-    same status check as an automated one and can't report a different answer.
-    """
+    on_recheck (Setup's _refresh_states) runs the same status check an
+    automated install would."""
 
     def __init__(self, parent, exe_path, component, reason=None, on_recheck=None):
         super().__init__(parent)
@@ -156,10 +139,7 @@ class ManualInstallWindow(tk.Toplevel):
              font=("Segoe UI", 9), pady=6, padx=14).pack(side="right")
 
     def _path_box(self, label, shown):
-        """A label plus a selectable, read-only path. Selectable because the
-        whole point of this window is getting a value out of the launcher and
-        into something else -- a path the user can't copy is a path they have
-        to retype, and these are long enough to get wrong."""
+        """A label plus a read-only but selectable path, so it can be copied."""
         wrap = tk.Frame(self, bg=BG)
         wrap.pack(fill="x", padx=20, pady=2)
         tk.Label(wrap, text=label, bg=BG, fg=MUTED, font=("Segoe UI", 8),
@@ -168,8 +148,6 @@ class ManualInstallWindow(tk.Toplevel):
                          relief="flat", insertbackground=PARCH,
                          highlightbackground=BORDER, highlightthickness=1)
         entry.insert(0, shown)
-        # readonly rather than disabled: still selectable and copyable, which
-        # disabled is not.
         entry.config(state="readonly", readonlybackground=SURF2)
         entry.pack(side="left", fill="x", expand=True, ipady=3)
 
@@ -186,11 +164,8 @@ class ManualInstallWindow(tk.Toplevel):
         self._status.set("Direct download link copied to the clipboard.")
 
     def _open_dest(self):
-        """Creates the folder first if it doesn't exist. Only reachable for
-        Plugins/, which the automated install would also have created -- if
-        the *game* folder is missing, that's a wrong exe path and no amount of
-        creating directories helps, so that case is reported rather than
-        papered over."""
+        """Opens the destination, creating it if needed (only Plugins/ can be
+        missing); a missing game folder is reported instead."""
         if not os.path.isdir(self._game_dir):
             self._status.set(
                 f"The game folder doesn't exist: {self._game_dir}\n"

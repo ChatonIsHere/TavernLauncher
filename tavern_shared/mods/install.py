@@ -23,12 +23,8 @@ from tavern_shared.mods.resolve import _fetch_manifest, resolve_dependencies
 from tavern_shared.mods.version import _parse_version
 
 
-# Zip-bundle extraction caps (package="zip"). The official repo's validator
-# (CommunityMods/tools/modindex.py) checks the same intent against the archive's
-# header sizes; these run at install time against ACTUAL decompressed bytes, so
-# they also protect the one path that never saw the validator: a mod from an
-# unreviewed third-party repo. Extraction aborts (into throwaway staging) the
-# moment either cap is crossed, so a decompression bomb can't fill the disk.
+# Zip-bundle caps, enforced on the actual decompressed bytes so a bomb from an
+# unreviewed repo can't fill the disk.
 _ZIP_MAX_ENTRIES = 2000
 
 
@@ -42,13 +38,10 @@ def _write_sidecar(path, data):
 
 @contextlib.contextmanager
 def _verified_download(url, sha256, work_dir, on_progress):
-    """Download `url` to a temp file inside `work_dir` and verify its sha256,
-    then hand the temp path to the caller to move (single file) or extract
-    (zip). The temp is always created in work_dir, never the system temp dir, so
-    a follow-up os.replace within the same tree is a same-volume atomic rename;
-    routing through %TEMP% (usually C:) would make that a cross-volume move,
-    which fails with WinError 17 when the game is on another drive. The temp is
-    always cleaned up, so a failed verify/move leaves nothing behind."""
+    """Downloads url to a temp file in work_dir, verifies its sha256 and
+    yields the path; the temp is always removed. It lives in work_dir, not
+    %TEMP%, so the caller's os.replace is a same-volume rename (a cross-volume
+    one fails with WinError 17 when the game is on another drive)."""
     os.makedirs(work_dir, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".tavern_dl_", suffix=".part", dir=work_dir)
     os.close(fd)
@@ -70,25 +63,17 @@ def _verified_download(url, sha256, work_dir, on_progress):
 
 
 def _download_verify_move(url, sha256, dest_path, on_progress):
-    """Download, verify, then atomically move one file into dest_path. Never
-    leaves a half-written or unverified file behind. The temp lives in
-    dest_path's own directory so the move is a same-volume rename."""
+    """Download, verify, then atomically move one file into dest_path."""
     dest_dir = os.path.dirname(dest_path)
     with _verified_download(url, sha256, dest_dir, on_progress) as tmp:
         os.replace(tmp, dest_path)
 
 
 def _safe_extract_zip(zip_path, dest_dir):
-    """Extract a .zip into dest_dir, refusing any member that would escape it
-    (zip-slip) or that is a symlink, and capping entry count + total decompressed
-    size so a decompression bomb can't fill the disk. This is the one new attack
-    surface bundles add, and it matters because a mod can come from an unreviewed
-    source: a member named '..\\..\\evil.dll' or an absolute path would otherwise
-    write anywhere on disk. Every member's resolved path must stay within dest_dir,
-    and the running decompressed total must stay under _ZIP_MAX_TOTAL_UNCOMPRESSED;
-    the first unsafe/oversized entry raises, having written only whatever came
-    before it (the caller builds into a throwaway staging dir, so a raise discards
-    the partial extract)."""
+    """Extracts into dest_dir, refusing any member that is absolute, holds a
+    colon, is a symlink or resolves outside dest_dir, and capping the entry
+    count and the decompressed total. The first bad entry raises; callers
+    extract into throwaway staging."""
     dest_root = os.path.realpath(dest_dir)
     with zipfile.ZipFile(zip_path) as zf:
         infos = zf.infolist()
@@ -96,23 +81,18 @@ def _safe_extract_zip(zip_path, dest_dir):
             raise ModManagerError(
                 f"This mod archive has {len(infos)} entries, over the "
                 f"{_ZIP_MAX_ENTRIES} limit; refusing to extract it.")
-        # A root-level manifest.json is a natural thing for a mod to ship (it's
-        # MelonLoader's folder marker too), but the install record is written
-        # under that name AFTER the tree is hashed, so extracting it would
-        # record bytes the record then overwrites: a permanent "damaged"
-        # verdict. Matched on the resolved path, case-insensitively, so
-        # "Manifest.json" and "./manifest.json" are caught too (NTFS treats
-        # them as the same file). TavernLib's SafeExtractZip skips the same set.
+        # The record is written under these names after the tree is hashed, so
+        # extracting an archive's own copy would leave a permanent "damaged"
+        # verdict. Matched on the resolved path, case-insensitively, as NTFS
+        # does. TavernLib's SafeExtractZip skips the same set.
         record_paths = {os.path.normcase(os.path.join(dest_root, n))
                         for n in (RECORD_NAME, DISABLED_RECORD_NAME)}
         written = 0
         for info in infos:
             name = info.filename
-            # Absolute paths never belong in a mod archive, and a colon
-            # anywhere is refused rather than just a drive letter in position
-            # 1: on NTFS "mod.dll:payload" writes an alternate data stream
-            # hanging off mod.dll instead of a file, which the realpath
-            # containment check below reads as staying inside dest_root.
+            # A colon anywhere, not just a drive letter: "mod.dll:payload" is an
+            # NTFS alternate data stream, which the realpath check reads as
+            # staying inside dest_root.
             if name.startswith(("/", "\\")):
                 raise ModManagerError(
                     f"Unsafe archive entry {name!r}: absolute path.")
@@ -120,8 +100,7 @@ def _safe_extract_zip(zip_path, dest_dir):
                 raise ModManagerError(
                     f"Unsafe archive entry {name!r}: contains a colon (drive "
                     f"letter or NTFS alternate data stream).")
-            # Symlinks (unix mode in the high 16 bits of external_attr) could
-            # point outside the folder; refuse them outright.
+            # Unix mode lives in the high 16 bits of external_attr.
             mode = (info.external_attr >> 16) & 0xFFFF
             if mode and (mode & 0o170000) == 0o120000:
                 raise ModManagerError(
@@ -137,9 +116,8 @@ def _safe_extract_zip(zip_path, dest_dir):
                 os.makedirs(target, exist_ok=True)
                 continue
             os.makedirs(os.path.dirname(target), exist_ok=True)
-            # Copy in chunks against the ACTUAL decompressed size, not the header's
-            # declared file_size (which a bomb can understate), aborting the moment
-            # the running total crosses the cap.
+            # Counted on the bytes actually produced; a bomb can understate
+            # the header's file_size.
             with zf.open(info) as src, open(target, "wb") as dst:
                 while True:
                     chunk = src.read(1024 * 1024)
@@ -155,9 +133,9 @@ def _safe_extract_zip(zip_path, dest_dir):
 
 
 def _hash_tree(base):
-    """{relative path (forward slashes): sha256} for every file under base.
-    Run over the assembled staging dir at install time, before the record is
-    written into it, so the record itself is never part of the map."""
+    """{relative path (forward slashes): lowercase sha256} for every file under
+    base. Twin of TavernLib's ModInstaller.HashTree: the map must stay
+    byte-identical so either side can verify the other's records."""
     out = {}
     for root, _dirs, names in os.walk(base):
         for name in names:
@@ -167,15 +145,9 @@ def _hash_tree(base):
     return out
 
 
-# verify_mod_files results, keyed by the mod folder path with the verified
-# version alongside. Damage detection re-hashes every recorded file, and a zip
-# bundle can be hundreds of MB - the status refreshes that want this answer run
-# on every window open and every install, so an unchanged install is only ever
-# hashed once. The trade is that damage appearing AFTER a verified check isn't
-# seen until something invalidates the entry (an install/restore of that mod,
-# or the Mod Manager's Refresh button, which clears the memo whole) - the
-# realistic damage cases (antivirus at install time, a partial write) happen
-# when the files change, which is exactly when the memo is invalidated.
+# verify_mod_files results by mod folder: (version, ok). A zip bundle can be
+# hundreds of MB, so an unchanged install is hashed once; an install or restore
+# of the mod invalidates its entry, and the Mod Manager's Refresh clears all.
 _verify_memo = {}
 
 
@@ -188,21 +160,21 @@ def _invalidate_verify_memo(game_dir=None, mod_id=None):
     _verify_memo.pop(_mod_dir_path(game_dir, mod_id), None)
 
 
+def _files_intact(base, files):
+    """Whether every {relative path: sha256} in `files` is present under base
+    at that hash. Returns the first bad path, or None when all match."""
+    for rel, expected in files.items():
+        path = os.path.join(base, rel.replace("/", os.sep))
+        if not os.path.isfile(path) or _sha256_file(path).lower() != str(expected).lower():
+            return rel
+    return None
+
+
 def verify_mod_files(game_dir, mod_id):
-    """Whether an installed mod's files still match what install_mod recorded
-    putting there - the community-mod counterpart of the core components'
-    damaged detection.
-
-    Returns True (every recorded file present at its recorded hash), False
-    (something is missing or altered - damaged), or None (nothing to check:
-    not installed, or the record predates the "files" map). None is
-    deliberately not False: claiming damage with no evidence would send every
-    pre-existing install to "Damaged" the moment this shipped.
-
-    TavernLib's C# installer writes the same map on the same terms
-    (ModInstaller.HashTree/VerifyModFiles), so a mod a headless server
-    installed is checkable here, and one installed here is checked by that
-    server's reconcile."""
+    """True if every file in the record's `files` map is present at its hash,
+    False if any is missing or altered (damaged), None when there is nothing
+    to check: not installed, or a record without `files`. No evidence is not
+    damage. Twin of TavernLib's ModInstaller.VerifyModFiles."""
     rec = _read_mod_record(game_dir, mod_id)
     if not rec:
         return None
@@ -213,38 +185,16 @@ def verify_mod_files(game_dir, mod_id):
     memo = _verify_memo.get(mod_dir)
     if memo and memo[0] == rec.get("version"):
         return memo[1]
-    ok = True
-    for rel, expected in files.items():
-        path = os.path.join(mod_dir, rel.replace("/", os.sep))
-        if not os.path.isfile(path) or _sha256_file(path).lower() != str(expected).lower():
-            ok = False
-            break
+    ok = _files_intact(mod_dir, files) is None
     _verify_memo[mod_dir] = (rec.get("version"), ok)
     return ok
 
 
 def _mod_record(mod, files=None):
-    """The record written to Mods/<id>/manifest.json: the fetched manifest
-    verbatim (so status/uninstall need no re-fetch) plus install fields. Kept a
-    plain JSON object on purpose: it's also MelonLoader's folder marker, and a
-    future MelonLoader that parses it shouldn't choke. Keep this shape stable so
-    any other installer can read it too.
-
-    `files` is {relative path: sha256} for everything install_mod assembled
-    into the folder, hashed from staging right before this record is written.
-    It's what verify_mod_files checks, giving installed mods the same damaged
-    detection the core components (patch/MelonLoader/TavernLib) have - without
-    it a mod half-eaten by antivirus reads "Up to date" forever, because
-    mod_status only compares version numbers. TavernLib's C# installer writes
-    the same field, in the same shape, for the same reason, so the two
-    installers' records are interchangeable. Optional on read: a record
-    written before the field existed simply has no damage detection, which
-    verify_mod_files reports as None, never as damaged.
-
-    Note there is NO placed-dll filename here: every operation works on the
-    Mods/<id>/ folder (install swaps it, uninstall deletes it, update replaces it),
-    so nothing ever needs to find the .dll by name; recording it would be dead
-    weight."""
+    """The record written to Mods/<id>/manifest.json: the fetched manifest plus
+    install fields, `files` among them. TavernLib writes the same shape and
+    either installer reads the other's, so keep it byte-compatible. No placed
+    dll filename: everything works on the Mods/<id>/ folder."""
     record = {
         "manifest_version": mod.manifest_version,
         "id": mod.id,
@@ -254,8 +204,6 @@ def _mod_record(mod, files=None):
         "description": mod.description,
         "client_side": mod.client_side,
         "server_side": mod.server_side,
-        # Recorded so a server can report it in the handshake without re-fetching
-        # the manifest, and so the client can tell what a mod it already has is.
         "parity_required": mod.parity_required,
         "dependencies": dict(mod.dependencies or {}),
         "library_dependencies": [
@@ -266,14 +214,11 @@ def _mod_record(mod, files=None):
         "sha256": mod.sha256,
         "source_repo": mod.source_repo,
         "package": mod.package,
-        # The libraries this mod pins, by filename. uninstall_mod uses these to
-        # reference-count UserLibs/ files so an orphaned library is removed while
-        # one another installed mod still lists stays put.
+        # uninstall_mod reference-counts UserLibs/ files by these.
         "libraries": [_safe_basename(l.filename)
                       for l in (mod.library_dependencies or [])],
     }
-    # Only when set: no key means every scene, on both sides (TavernLib's record
-    # omits a null one too), so older records need no rewriting.
+    # Only when set, as TavernLib's record does: absent means every scene.
     if mod.scenes is not None:
         record["scenes"] = list(mod.scenes)
     if files:
@@ -288,16 +233,10 @@ def _reset_dir(path):
 
 
 def _clear_install_path(game_dir, mod_id):
-    """Frees Mods/<id>/ for an install. A previous install of ours is deleted -
-    it's being replaced, and it's already cached if anything wanted it kept. A
-    folder we DIDN'T install is moved into Mods/.displaced/ instead, never
-    deleted: those are someone's own files, and silently destroying them is the
-    one outcome nothing here can undo.
-
-    Ours vs. theirs is decided by whether a usable record is present - exactly
-    the test list_installed_mods and list_untracked_mods apply, so a folder
-    can't count as untracked for listing and as ours for deletion. TavernLib's
-    ClearInstallPath does the same."""
+    """Frees Mods/<id>/ for an install. A folder of ours is deleted (it's being
+    replaced); one that isn't ours is moved into Mods/.displaced/, never
+    deleted. TavernLib's ClearInstallPath does the same. Returns the displaced
+    path, or None."""
     mod_dir = _mod_dir_path(game_dir, mod_id)
     if not os.path.isdir(mod_dir):
         return None
@@ -310,8 +249,7 @@ def _clear_install_path(game_dir, mod_id):
     os.makedirs(base, exist_ok=True)
     name = _safe_basename(mod_id)
     dest = os.path.join(base, name)
-    # Counter rather than a timestamp: displacing the same name twice has to keep
-    # both, and a deterministic suffix is one a person can predict.
+    # A counter, not a timestamp: predictable, and keeps every displaced copy.
     n = 2
     while os.path.exists(dest):
         dest = os.path.join(base, f"{name}.{n}")
@@ -324,20 +262,10 @@ def _clear_install_path(game_dir, mod_id):
 
 
 def install_mod(game_dir, mod, on_progress):
-    """Installs one mod into its own folder, Mods/<id>/, and writes the record +
-    MelonLoader marker Mods/<id>/manifest.json inside it.
-
-    package="dll": mod.download_url is a single .dll placed under the name it was
-    published with (mod.install_name(), traversal-guarded); nothing looks it up by
-    name afterwards.
-    package="zip": it's an archive extracted into Mods/<id>/, so the mod can ship
-    several DLLs plus Unity asset bundles / addressables. Either way one artifact
-    is downloaded and verified against mod.sha256 before anything is written.
-
-    The mod is assembled in a throwaway staging folder and swapped into place only
-    once it's complete, so a failed download/verify/extract never leaves a partial
-    or half-upgraded mod folder, and any pre-existing install is replaced
-    atomically."""
+    """Installs one mod into Mods/<id>/ with its record. package "dll" places the
+    file under its published name (install_name); "zip" extracts the archive.
+    The artifact is verified against mod.sha256 and assembled in staging, then
+    swapped in, so a failure never leaves a partial or half-upgraded folder."""
     mod_dir = _mod_dir_path(game_dir, mod.id)
     staging = _staging_path(game_dir, mod.id)
     _reset_dir(staging)
@@ -348,14 +276,10 @@ def install_mod(game_dir, mod, on_progress):
         else:
             _download_verify_move(mod.download_url, mod.sha256,
                                   os.path.join(staging, mod.install_name()), on_progress)
-        # Hash everything just assembled (the record isn't written yet, so it
-        # never hashes itself) and put the map in the record, so
-        # verify_mod_files can later tell "still exactly what was installed"
-        # from "something ate or corrupted a file".
+        # Hashed before the record exists, so the record never hashes itself.
         _write_sidecar(os.path.join(staging, RECORD_NAME),
                        _mod_record(mod, files=_hash_tree(staging)))
 
-        # Swap staging -> Mods/<id>/ atomically, clearing any prior install first.
         _clear_install_path(game_dir, mod.id)
         os.replace(staging, mod_dir)
         _invalidate_verify_memo(game_dir, mod.id)
@@ -366,16 +290,11 @@ def install_mod(game_dir, mod, on_progress):
 
 
 def _disable_shadowed_loose_dlls(game_dir, mod_id, mod_dir):
-    """A loose root Mods/<name>.dll with the same filename as a DLL this
-    install just placed is an earlier hand-installed copy of the same mod -
-    upstream TavernLauncher 1.8.5 drops TavernEssentials.dll there, for one -
-    and MelonLoader would load both. Disabled rather than deleted, by the same
-    rename as the Mod Manager's untracked toggle, so it can be turned back on.
-
-    Runs after the install has landed, and never fails it: a loose copy that
-    can't be renamed (a .disabled of that name already exists) is reported and
-    left alone. TavernLib's InstallMod applies the same rule on headless
-    servers, so both report the same untracked set afterwards."""
+    """Disables (renames, never deletes) a loose root Mods/<name>.dll matching
+    a DLL this install placed, such as upstream 1.8.5's TavernEssentials.dll,
+    so MelonLoader doesn't load the mod twice. Never fails the install.
+    TavernLib's InstallMod applies the same rule, so the untracked set stays
+    identical on both sides."""
     for name in sorted(os.listdir(mod_dir)):
         if not name.lower().endswith(".dll") or not os.path.isfile(os.path.join(mod_dir, name)):
             continue
@@ -390,13 +309,9 @@ def _disable_shadowed_loose_dlls(game_dir, mod_id, mod_dir):
 
 
 def collect_library_dependencies(mods):
-    """Gathers every library_dependencies entry across a resolved set of mods
-    (typically the top-level mod plus resolve_dependencies' result), deduplicated
-    by filename (no id to graph by, so filename stands in for identity). Same
-    filename + matching sha256/download_url collapses to one (install once); same
-    filename + different sha256/download_url raises a conflict naming both mods
-    and both URLs, the library equivalent of a diamond conflict, by exact match
-    since there's no version-range concept for a pinned third-party file."""
+    """Every library across a resolved set of mods, deduplicated by filename
+    (libraries have no id). The same filename at a different sha256 or URL
+    raises, naming both mods: the library form of a diamond conflict."""
     by_filename = {}     # filename -> (LibraryDependency, owning mod name)
     for mod in mods:
         for lib in (mod.library_dependencies or []):
@@ -416,13 +331,9 @@ def collect_library_dependencies(mods):
 
 
 def install_library_dependency(game_dir, lib, on_progress):
-    """Same shape as install_mod: downloads lib.download_url, verifies against
-    lib.sha256, writes <game_dir>/UserLibs/<safe filename>. Sidecar goes to
-    <game_dir>/UserLibs/<filename>.meta.json, beside the .dll it describes
-    (filename is the key, no id) recording {filename, sha256, download_url}: no
-    source_repo (never came from a configured index) and no version (nothing to
-    compare against; a library is either at its pinned hash or needs reinstalling,
-    there's no "outdated" state for it)."""
+    """Downloads and verifies lib into UserLibs/<filename>, beside a
+    <filename>.meta.json sidecar {filename, sha256, download_url}. There is no
+    version: a library is at its pinned hash or needs reinstalling."""
     name = _safe_basename(lib.filename)
     dest = os.path.join(_userlibs_dir(game_dir), name)
     _download_verify_move(lib.download_url, lib.sha256, dest, on_progress)
@@ -434,23 +345,13 @@ def install_library_dependency(game_dir, lib, on_progress):
 
 
 def install_mod_closure(game_dir, mod, index, repo_bases, on_progress, side, version=None):
-    """Installs a mod AND its full closure, the flow a single COMMUNITY MODS
-    click runs. `mod` is the ModSummary the user picked; its manifest is
-    fetched at `version` if given, else mod.highest() (the ordinary
-    install/update path; an explicit version is how Community Mods' right-click
-    "Change Version" installs an older/different release instead), then
-    resolve_dependencies walks the graph fetching each dependency's manifest,
-    and collect_library_dependencies gathers the pinned libraries. Every
-    cycle/depth/diamond/library conflict is surfaced (and every manifest
-    fetched) BEFORE anything touches disk. A mod with no dependencies is just
-    the degenerate case: empty closure, one install_mod.
-
-    `side` is this launcher's own ("client" or "server"), passed straight to
-    resolve_dependencies so a dependency that can't run here is left out rather
-    than installed into a process that would crash loading it.
-
-    Manifests fetched during a single closure are cached, so a diamond (two mods
-    needing the same dependency) fetches it once."""
+    """Installs a mod and its full closure: the flow one Community Mods click
+    runs. `mod` is the picked ModSummary, fetched at `version` if given (Change
+    Version), else mod.highest(). `side` ("client"/"server") is this
+    launcher's own, so a dependency that can't load here is left out. Every
+    cycle/depth/diamond/library conflict surfaces before anything touches
+    disk; then install_mod_set puts dependencies in before the root (as
+    TavernLib does), so a failure partway leaves a loadable set."""
     fetched = {}     # (id, version) -> ModManifest
 
     def fetch(mod_id, version, source_repo):
@@ -461,31 +362,55 @@ def install_mod_closure(game_dir, mod, index, repo_bases, on_progress, side, ver
 
     root = fetch(mod.id, version or mod.highest(), mod.source_repo)
     deps = resolve_dependencies([root], index, fetch, side)
-    all_mods = [root] + deps
-    libs = collect_library_dependencies(all_mods)     # raises on conflict before any download
+    install_mod_set(game_dir, deps + [root], on_progress)
 
-    total = len(all_mods) + len(libs)
-    step = {"n": 0}
 
-    def stepped(label):
-        def report(msg):
-            on_progress(f"[{step['n']}/{total}] {label}: {msg}")
-        return report
+def _already_installed(game_dir, mod):
+    """Mods/<id>/ is ours, enabled, at exactly mod.version, and not damaged."""
+    rec = _read_sidecar(_mod_record_path(game_dir, mod.id))
+    if not rec or rec.get("id") != mod.id or rec.get("version") != mod.version:
+        return False
+    try:
+        parity_required(rec)
+    except ModManagerError:
+        return False
+    return verify_mod_files(game_dir, mod.id) is not False
 
-    for m in all_mods:
-        step["n"] += 1
-        install_mod(game_dir, m, stepped(m.name))
-    for lib in libs:
-        step["n"] += 1
-        install_library_dependency(game_dir, lib, stepped(lib.name))
+
+def install_mod_set(game_dir, mods, on_progress=None):
+    """Installs an already-resolved set of mods (ModManifests, installed in the
+    order given) plus every library they pin. A mod already enabled at that
+    version with intact files, and a library already present at its pinned
+    hash, are skipped. A library conflict raises before anything is written.
+    Progress lines read "[n/total] <name>: <detail>", one step per mod and
+    library. Returns the ids of the mods actually (re)installed."""
+    progress = on_progress or (lambda *_a: None)
+    libs = collect_library_dependencies(mods)     # raises on conflict before any download
+    total = len(mods) + len(libs)
+
+    def stepped(n, label):
+        return lambda msg: progress(f"[{n}/{total}] {label}: {msg}")
+
+    installed = []
+    for n, m in enumerate(mods, 1):
+        report = stepped(n, m.name)
+        if _already_installed(game_dir, m):
+            report(f"{m.version} already installed")
+            continue
+        install_mod(game_dir, m, report)
+        installed.append(m.id)
+    for n, lib in enumerate(libs, len(mods) + 1):
+        report = stepped(n, lib.name)
+        if _library_present(game_dir, _safe_basename(lib.filename), lib.sha256):
+            report("already installed")
+            continue
+        install_library_dependency(game_dir, lib, report)
+    return installed
 
 
 def uninstall_mod(game_dir, mod_id):
-    """Removes an installed community mod: its whole Mods/<id>/ folder. Each
-    library the mod pinned is then removed from UserLibs/ too, UNLESS another
-    still-installed mod's record lists it: shared libraries stay, orphaned ones go.
-    Returns True if anything was deleted, False if nothing was installed under that
-    id."""
+    """Deletes Mods/<id>/, then each library it pinned that no remaining mod's
+    record lists. Returns whether anything was deleted."""
     meta = _read_mod_record(game_dir, mod_id)
     removed = False
     libs = [_safe_basename(str(x)) for x in (meta.get("libraries") if meta else []) or []]
@@ -496,14 +421,9 @@ def uninstall_mod(game_dir, mod_id):
         removed = True
 
     if libs:
-        # After removing this mod's record, gather what the remaining mods still
-        # pin, then drop any library nobody else needs. Deliberately counts
-        # DISABLED mods as still needing theirs, unlike the join flow's
-        # _prune_orphaned_libraries (enabled-only): an uninstall is a one-shot
-        # user action with no library pass following it, so removing a
-        # disabled mod's library here would leave that mod broken on its next
-        # bare re-enable. The join flow can afford the tighter rule because
-        # ensure_mod_libraries/render_active_set restore libraries on enable.
+        # Counts DISABLED mods as still needing theirs, unlike the join flow's
+        # enabled-only prune: no library pass follows an uninstall, so a
+        # disabled mod would load without its libraries on its next enable.
         still_needed = set()
         for other in list_installed_mods(game_dir):
             for x in other.get("libraries", []):
@@ -535,12 +455,23 @@ def _read_sidecar(path):
         return None
 
 
+def _library_present(game_dir, filename, sha256):
+    """UserLibs/<filename> is on disk at exactly this sha256, by its sidecar
+    AND by hashing the file - TavernLib's VerifyLibrary terms. A file at the
+    right name with any other content needs reinstalling."""
+    want = (sha256 or "").lower()
+    meta = _read_sidecar(_library_sidecar_path(game_dir, filename))
+    if not want or not meta or str(meta.get("sha256", "")).lower() != want:
+        return False
+    try:
+        return _sha256_file(os.path.join(_userlibs_dir(game_dir), filename)).lower() == want
+    except OSError:
+        return False
+
+
 def _read_mod_record(game_dir, mod_id):
-    """The install record for a mod, from whichever state it's in: the enabled
-    folder record (Mods/<id>/manifest.json), then the disabled one
-    (Mods/<id>/manifest.disabled.json). A record is only accepted if it carries an
-    "id" (a bare manifest.json marker or a library sidecar without one isn't a mod
-    record). Returns None if neither has it."""
+    """The record in Mods/<id>/manifest.json, else manifest.disabled.json, if it
+    has an id; else None. Lenient: no parity check (see _owned_mod_record)."""
     for path in (_mod_record_path(game_dir, mod_id),
                  _disabled_record_path(game_dir, mod_id)):
         rec = _read_sidecar(path)
@@ -549,35 +480,38 @@ def _read_mod_record(game_dir, mod_id):
     return None
 
 
-def _owned_mod_record(game_dir, mod_id):
-    """_read_mod_record, further requiring a usable parity_required - the full
-    "is this folder OURS?" test. It has to be the same predicate
-    list_installed_mods applies (id present, parity readable), so that a folder
-    can never read as installed to one caller and as foreign to another:
-    list_untracked_mods uses this to decide what's already claimed,
-    _clear_install_path uses it to decide delete-vs-displace, and mod_status
-    uses it so "installed" means the same thing in every window. TavernLib's
-    ModRecord.Read is the same test (its parity field is Required.Always AND
-    read through a strict boolean converter, so a record with a missing or
-    non-boolean parity reads as no record there too). Returns None for a folder
-    that isn't ours by that test."""
-    rec = _read_mod_record(game_dir, mod_id)
-    if rec is None:
+def _folder_record(folder, warn=False):
+    """(record, enabled) if a Mods/<name>/ folder holds a usable record of
+    ours, else None: the enabled record, else the disabled one, with an id
+    and a readable parity_required. This is the "is this folder ours"
+    predicate; TavernLib's ModRecord.Read is the same test."""
+    rec, enabled = _read_sidecar(os.path.join(folder, RECORD_NAME)), True
+    if not (rec and rec.get("id")):
+        rec, enabled = _read_sidecar(os.path.join(folder, DISABLED_RECORD_NAME)), False
+    if not (rec and rec.get("id")):
         return None
     try:
         parity_required(rec)
-    except ModManagerError:
+    except ModManagerError as e:
+        if warn:
+            _warn(f"installed mod {rec['id']} has an unusable record ({e}), "
+                  f"so it is being ignored; reinstall it to fix.")
         return None
-    return rec
+    return rec, enabled
+
+
+def _owned_mod_record(game_dir, mod_id):
+    """The record of Mods/<mod_id>/ if that folder is ours (_folder_record),
+    else None. Listing, delete-vs-displace and mod_status all use this one
+    predicate, so a folder can't read as installed to one and foreign to
+    another."""
+    found = _folder_record(_mod_dir_path(game_dir, mod_id))
+    return found[0] if found else None
 
 
 def disable_mod(game_dir, mod_id):
-    """Disable an installed folder-layout mod WITHOUT uninstalling it: rename its
-    Mods/<id>/manifest.json to manifest.disabled.json. The folder then has no
-    manifest.json, so MelonLoader stops scanning it and the mod stops loading,
-    while every file stays in place. Returns True if it was enabled and is now
-    disabled; False if there was nothing enabled to disable (already disabled or
-    not installed)."""
+    """Renames the record to manifest.disabled.json, so MelonLoader stops loading
+    the folder while every file stays. Returns False if nothing was enabled."""
     src = _mod_record_path(game_dir, mod_id)
     if not os.path.isfile(src):
         return False
@@ -586,9 +520,7 @@ def disable_mod(game_dir, mod_id):
 
 
 def enable_mod(game_dir, mod_id):
-    """Re-enable a disabled mod: rename manifest.disabled.json back to
-    manifest.json so MelonLoader scans the folder again. Returns True if it was
-    disabled and is now enabled; False if there was nothing disabled to enable."""
+    """Reverses disable_mod. Returns False if nothing was disabled."""
     src = _disabled_record_path(game_dir, mod_id)
     if not os.path.isfile(src):
         return False
@@ -597,31 +529,11 @@ def enable_mod(game_dir, mod_id):
 
 
 def mod_status(game_dir, mod_id, index):
-    """missing / damaged / outdated / current / unknown, same shape as
-    _melonloader_status, read from the mod's install record (Mods/<id>/manifest.json
-    or its disabled variant; see _read_mod_record).
-
-    "damaged" = the folder's files no longer match what install_mod recorded
-    writing (verify_mod_files False) - antivirus ate a DLL, or a write was cut
-    short. Checked before the version comparison because a damaged install's
-    version number is a claim about files that are no longer there; a
-    reinstall fixes both at once. A record with no files map (a pre-existing
-    install, from before the field) is never called damaged - there's no
-    evidence either way.
-
-    "outdated" = the installed version is lower than the highest available across
-    all repos (any major counts; a new major still shows as an available update,
-    since the user is prompted before any update actually applies, so surfacing
-    it is informative, not automatic). "current" = it equals that highest - or
-    exceeds it (a version the index no longer lists, e.g. installed from a
-    since-removed repo, has nothing newer to offer so it isn't "outdated", and
-    calling it anything scarier would flag a working install over an index
-    bookkeeping state). "unknown" = installed but no longer present in any
-    configured index (e.g. its repo was removed), nothing to compare against."""
-    # _owned_mod_record, not the lenient reader: "installed" has to mean the
-    # same thing here as it does in the Mod Manager's table, or a folder whose
-    # record predates parity_required reads as Installed in one window and
-    # Untracked in the other, and the join planner sides with the second.
+    """missing / damaged / outdated / current / unknown. 'damaged' comes before
+    any version comparison: a damaged install's version describes files that
+    are gone. 'outdated' compares against the highest version of any major; a
+    version above everything indexed reads 'current'; 'unknown' means no
+    configured index lists the mod."""
     meta = _owned_mod_record(game_dir, mod_id)
     if not meta or "version" not in meta:
         return "missing"
@@ -639,11 +551,8 @@ def mod_status(game_dir, mod_id, index):
 
 
 def list_mods(index, side):
-    """The merged index (list[ModSummary]) collapsed to one row per id (highest
-    major), filtered to the caller's side: side="client" keeps client_side mods,
-    side="server" keeps server_side ones; each launcher passes its own, so a
-    server-only mod never shows in the client's browse list and vice versa. The only listing accessor the UI needs (libraries never appear in
-    an index; they're inline library_dependencies on a parent manifest)."""
+    """The merged index collapsed to one row per id (highest version), filtered to
+    the caller's side ("client"/"server"), sorted by name."""
     best = {}    # id -> ModSummary with the highest version seen
     for s in index:
         if side == "client" and not s.client_side:
@@ -656,119 +565,59 @@ def list_mods(index, side):
     return sorted(best.values(), key=lambda s: s.name.lower())
 
 
-def list_installed_mods(game_dir):
-    """Every installed mod's record, in both enabled/disabled states: the per-mod
-    folders (enabled Mods/<id>/manifest.json or disabled
-    Mods/<id>/manifest.disabled.json). A record counts only if it carries an "id"
-    and a usable "parity_required", so a library sidecar, a bare marker, or a
-    record written before parity_required existed is ignored. Each returned record gains
-    an in-memory "enabled" value, not written to disk: True (loaded) or False
-    (disabled). Every installed mod's client_side/server_side flags are available
-    from these records, so this is the read side for both the UI's status refresh
-    and whatever assembles the server's mod list for the pre-join check.
-    uninstall_mod also uses it to see which libraries the remaining mods still
-    pin.
-
-    A record whose parity_required is absent OR unreadable is skipped rather
-    than assumed required, because assuming is what would let a mod the server
-    actually requires be reported as something a client may decline. Skipping is
-    recoverable: the mod reads as not installed, so the next plan reinstalls it
-    and the new record carries a usable field."""
-    out = {}     # id -> record
+def _scan_mods(game_dir):
+    """One pass over Mods/: (installed records, untracked entries), the
+    results of list_installed_mods and list_untracked_mods."""
+    installed, untracked = {}, []
     mods_dir = _mods_base(game_dir)
     if not os.path.isdir(mods_dir):
-        return []
+        return [], []
     for name in os.listdir(mods_dir):
-        full = os.path.join(mods_dir, name)
-        if not os.path.isdir(full):
-            continue
-        # Skip our own staging/ignore folders (dot/tilde).
         if name.startswith((".", "~")):
             continue
-        rec = _read_sidecar(os.path.join(full, RECORD_NAME))
-        enabled = True
-        if not (rec and rec.get("id")):
-            rec = _read_sidecar(os.path.join(full, DISABLED_RECORD_NAME))
-            enabled = False
-        if rec and rec.get("id"):
-            # Asked through parity_required rather than a bare key check, so a
-            # record carrying an unusable value is skipped on the same terms as
-            # one missing the field entirely - both mean nothing here can say
-            # whether a joining client has to match this mod, and both are
-            # fixed the same way. Also keeps handshake_snapshot below, which
-            # re-reads the field on these same records, unable to raise.
-            try:
-                parity_required(rec)
-            except ModManagerError as e:
-                _warn(f"installed mod {rec['id']} has an unusable record ({e}), "
-                      f"so it is being ignored; reinstall it to fix.")
-                continue
-            rec["enabled"] = enabled       # in-memory only; not on disk
-            out[rec["id"]] = rec
-    return list(out.values())
-
-
-def list_untracked_mods(game_dir):
-    """Everything sitting in Mods/ that MelonLoader can load but this manager
-    doesn't own (docs/mod-manager-design.md "Untracked mods"): a loose root
-    Mods/*.dll (the classic drag-a-dll-in manual install, invisible to
-    list_installed_mods since it never looks at files, only subfolders), or a
-    first-level Mods/<name>/ folder that doesn't hold a usable record of ours -
-    a foreign manifest.json, or one of ours gone unusable (see the
-    skip-with-warning above). Each entry is {"name", "kind" ("file"/"folder"),
-    "enabled"}. Deliberately surfacing-and-toggling only, per the design doc:
-    there's no manifest we trust to reconcile a version/update against, so
-    this never appears anywhere near install/update, only enable/disable.
-    TavernLib's ListUntrackedMods is the same listing for headless servers,
-    and the two have to report the same set for the same folder.
-
-    A folder counts on a record file EXISTING, not on it parsing: MelonLoader's
-    folder marker is an existence check with the content unread, so a folder
-    whose manifest.json is unparseable junk still loads and still has to be
-    reported."""
-    out = []
-    mods_dir = _mods_base(game_dir)
-    if not os.path.isdir(mods_dir):
-        return out
-    for name in os.listdir(mods_dir):
         full = os.path.join(mods_dir, name)
-        if name.startswith((".", "~")):
-            continue
         if os.path.isfile(full):
             lower = name.lower()
             if lower.endswith(".dll"):
-                out.append({"name": name, "kind": "file", "enabled": True})
+                untracked.append({"name": name, "kind": "file", "enabled": True})
             elif lower.endswith(".dll.disabled"):
-                out.append({"name": name[:-len(".disabled")], "kind": "file", "enabled": False})
+                untracked.append({"name": name[:-len(".disabled")], "kind": "file",
+                                  "enabled": False})
         elif os.path.isdir(full):
-            # "Claimed" is tested per folder with the exact predicate
-            # list_installed_mods uses, rather than against the set of record
-            # ids it returned: that lister keys its result by the id INSIDE the
-            # record, so a folder whose name and record id disagree would miss
-            # an id-set lookup and be reported as untracked as well as
-            # installed. Same input, same question, one answer.
-            if _owned_mod_record(game_dir, name) is not None:
-                continue
-            if os.path.isfile(os.path.join(full, RECORD_NAME)):
-                out.append({"name": name, "kind": "folder", "enabled": True})
+            found = _folder_record(full, warn=True)
+            if found is not None:
+                rec, enabled = found
+                rec["enabled"] = enabled        # in-memory only
+                installed[rec["id"]] = rec
+            elif os.path.isfile(os.path.join(full, RECORD_NAME)):
+                untracked.append({"name": name, "kind": "folder", "enabled": True})
             elif os.path.isfile(os.path.join(full, DISABLED_RECORD_NAME)):
-                out.append({"name": name, "kind": "folder", "enabled": False})
-            # Neither present: an empty or junk folder MelonLoader wouldn't
-            # load either, so there's nothing to report.
-    return out
+                untracked.append({"name": name, "kind": "folder", "enabled": False})
+    return list(installed.values()), untracked
+
+
+def list_installed_mods(game_dir):
+    """Every installed mod's record, enabled or disabled, each with an
+    in-memory "enabled" flag. A folder counts only with a usable record of
+    ours (an id and a readable parity_required); one without is skipped with
+    a warning rather than assumed required, and reads as untracked."""
+    return _scan_mods(game_dir)[0]
+
+
+def list_untracked_mods(game_dir):
+    """Everything in Mods/ MelonLoader can load that this manager doesn't own,
+    as {"name", "kind" ("file"/"folder"), "enabled"}: a loose root *.dll, or a
+    first-level folder without a usable record of ours. A folder counts on a
+    record file EXISTING, not parsing, because MelonLoader's marker is an
+    existence check. TavernLib's ListUntrackedMods must report the same set."""
+    return _scan_mods(game_dir)[1]
 
 
 def disable_untracked_dll(game_dir, filename):
-    """Takes a loose root Mods/<filename> out of rotation without deleting
-    it, by renaming it out of MelonLoader's view - the file equivalent of
-    disable_mod's manifest rename. A root dll has no manifest to hide behind
-    and MelonLoader always loads any Mods/*.dll it finds, so the rename
-    itself has to be what stops it loading. Returns True if it was there and
-    enabled, False if not.
-
-    Refuses rather than clobbering an existing .disabled: that file is someone
-    else's mod, and a rename that quietly destroys it is the one outcome nothing
-    here can undo. TavernLib's DisableUntrackedDll refuses the same way."""
+    """Renames a loose root Mods/<filename> to <filename>.disabled, since
+    MelonLoader loads every root dll. Returns False if it wasn't there. Refuses
+    rather than clobber an existing .disabled, as TavernLib's
+    DisableUntrackedDll does."""
     src = os.path.join(_mods_base(game_dir), _safe_basename(filename))
     dest = src + ".disabled"
     if not os.path.isfile(src):
@@ -796,20 +645,10 @@ def enable_untracked_dll(game_dir, filename):
 
 
 def _untracked_stamp(game_dir, entry):
-    """A cheap "has this changed?" marker for one untracked mod: its mtime as
-    whole Unix seconds, never a content hash. This runs on every ping, and
-    hashing every loose DLL in Mods/ that often would cost far more than an
-    advisory is worth. mtime misses an in-place edit that preserves it, which
-    costs a client a stale advisory line until something else moves -
-    acceptable, where missing a changed REQUIRED mod would not be.
-
-    Deliberately mtime alone, not mtime+size: TavernLib's UntrackedStamp has to
-    produce a byte-identical fingerprint, and a directory has no portable size
-    to agree on. A directory's own mtime moves when entries are added or
-    removed, so a folder mod gaining or losing files still re-fingerprints.
-
-    Anything unreadable stamps "?" rather than raising: a mod vanishing
-    mid-scan must not take the whole handshake down with it."""
+    """An untracked mod's mtime in whole Unix seconds, "?" if unreadable. Part of
+    mods_hash and the twin of TavernLib's UntrackedStamp: mtime alone, because
+    a directory has no portable size both sides agree on. Never a content
+    hash, since this runs on every ping."""
     try:
         return str(int(os.stat(os.path.join(_mods_base(game_dir),
                                             entry["name"])).st_mtime))
@@ -818,62 +657,28 @@ def _untracked_stamp(game_dir, entry):
 
 
 def handshake_snapshot(game_dir):
-    """Fingerprint of every currently-ENABLED mod in Mods/, for the ping/pong
-    mod-sync check. Disabled mods are excluded: they aren't loaded, so a
-    joining client shouldn't be asked about them. Returns
+    """Fingerprint of the ENABLED mods for the ping/pong mod-sync check. Returns
     (mods_hash, mods_count, mods_list, untracked_list):
-    - mods_hash: sha256 of the fingerprint lines, joined with newlines: the
-      id-sorted managed "id@version@req|opt" lines ("req" when
-      parity_required, "opt" otherwise), then the name-sorted
-      "untracked:name@stamp" lines (_untracked_stamp). A client caches this
-      per server; an unchanged hash means it already has the full list and
-      skips the extra round trip.
+    - mods_hash: sha256 of newline-joined lines: id-sorted (ordinal)
+      "id@version@req|opt" for managed mods, then lowercase-name-sorted
+      "untracked:name@stamp" (_untracked_stamp).
+    - mods_count: managed mods only, so it matches mods_list.
+    - mods_list: {"id", "version", "client_side", "server_side",
+      "parity_required", "source_repo", "sha256"[, "scenes"]} by id.
+      source_repo is a hint, never a source to pull from.
+    - untracked_list: {"name", "kind"} by name, kept out of mods_list because
+      nothing can resolve an entry with no id or version.
 
-      This exact format is a cross-language invariant: TavernLib computes the
-      same hash in C# (Backend/Mods/ModHandshake.cs, whose own comment says it
-      must stay byte-identical to this) and a client compares the two. Changing
-      the separator, the ordering, or which fields take part silently breaks
-      every join against a server running the other side's build -- the hash
-      just never matches, there is no version negotiation, and nothing reports
-      a mismatch as such. Sorting is by id, ordinal on both sides; untracked
-      entries sort by lowercased name on both sides.
-    - mods_count: len(mods_list) - MANAGED mods only, deliberately. It's sent
-      in the pong so a client can sanity-check its cached mods list without
-      decoding anything, and that list is the managed one; folding untracked
-      mods into the number would make it disagree with what it's checking.
-    - mods_list: every managed entry as {"id", "version", "client_side",
-      "server_side", "parity_required", "source_repo", "sha256"}, sorted by id: what the
-      separate, length-prefixed "mods_list" request sends on a cache miss.
-      source_repo is a HINT only: plan_join uses it to tell a client which repo
-      a required mod not resolvable from any of the client's configured repos
-      would come from, so the user can add it explicitly; it's never resolved
-      into a pull on its own, same rule as everywhere else this field appears
-      (the modlist's `repos`, the rejection payload's `missing` entries).
-    - untracked_list: every enabled untracked mod as {"name", "kind"}, sorted
-      by name. A SEPARATE list, never merged into mods_list, because plan_join
-      consumes that one: an entry with no id or version would either crash it or
-      have to be special-cased in the middle of resolution. Kept apart, it can
-      only reach code that asked for it.
-
-    The advisory is honest about being an advisory. All a server can say about
-    an untracked mod is its name and shape - no id, version, or source - so a
-    client can display it but can never resolve, install, or verify it, and is
-    never blocked over one. It exists so a silent divergence becomes a visible
-    one.
-
-    Untracked entries ARE part of mods_hash, though. A client caches the whole
-    list against this hash, so leaving them out would let an operator drop a new
-    DLL into Mods/ and have every already-connected client keep reporting the
-    old set until something else happened to move the hash."""
-    mods = sorted((m for m in list_installed_mods(game_dir) if m.get("enabled")),
-                  key=lambda m: m["id"])
-    untracked = sorted((u for u in list_untracked_mods(game_dir) if u["enabled"]),
+    This hash is a cross-language invariant: TavernLib's ModHandshake computes
+    it byte-identically and a client compares the two. Changing the separator,
+    the ordering, or which fields take part silently breaks every join against
+    the other side's build; there is no version negotiation. parity_required is
+    in it (a server can flip it without a version bump), and so are untracked
+    stamps (a hand-dropped DLL must move it); sha256 and scenes are not."""
+    installed, untracked = _scan_mods(game_dir)
+    mods = sorted((m for m in installed if m.get("enabled")), key=lambda m: m["id"])
+    untracked = sorted((u for u in untracked if u["enabled"]),
                        key=lambda u: u["name"].lower())
-    # parity_required is part of the fingerprint, not just the list. A server
-    # can flip a mod between required and recommended without its version
-    # moving, and a client caches this whole list against this hash - so leaving
-    # it out would let a client keep planning against the old answer until it
-    # restarted, and skip a mod that had since become mandatory.
     lines = [f"{m['id']}@{m.get('version', '')}@{'req' if parity_required(m) else 'opt'}"
              for m in mods]
     lines += [f"untracked:{u['name']}@{_untracked_stamp(game_dir, u)}"
@@ -885,17 +690,10 @@ def handshake_snapshot(game_dir):
          "server_side": bool(m.get("server_side", False)),
          "parity_required": parity_required(m),
          "source_repo": m.get("source_repo", ""),
-         # The manifest's artifact hash, off the record. Advisory, additive,
-         # and deliberately NOT part of mods_hash (which must stay
-         # byte-identical to TavernLib's): a client that has the same id and
-         # version but a different sha (a re-published release, or the same
-         # version from a different repo) passes version parity but genuinely
-         # diverges - this lets it at least say so. Empty when the record
-         # predates the field.
+         # Advisory and outside mods_hash: lets a client notice the same
+         # version built from different bytes.
          "sha256": m.get("sha256", ""),
-         # The scenes the mod works in, only when it names any - absent means
-         # every scene. Informational for the client, and like sha256 kept out
-         # of mods_hash; TavernLib's Entry omits a null one the same way.
+         # Only when set, as TavernLib's Entry does; also outside mods_hash.
          **({"scenes": list(m["scenes"])} if m.get("scenes") is not None else {})}
         for m in mods
     ]
