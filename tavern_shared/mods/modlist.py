@@ -13,8 +13,8 @@ from dataclasses import dataclass
 
 from tavern_shared.mods.errors import ModManagerError
 from tavern_shared.mods.install import (
-    collect_library_dependencies, disable_mod, install_library_dependency,
-    install_mod, list_installed_mods, list_untracked_mods,
+    collect_library_dependencies, disable_mod, install_mod_set,
+    list_installed_mods, list_untracked_mods,
 )
 from tavern_shared.mods.pins import _parse_pin_entry
 from tavern_shared.mods.repos import list_repos_named
@@ -158,20 +158,7 @@ def apply_import(game_dir, plan, on_progress=None):
             "This modlist has mods that couldn't be resolved from any "
             "configured source; fix that before importing it.")
     progress = on_progress or (lambda *_a: None)
-    all_mods = plan.roots + plan.dependencies
-    # Collected BEFORE the first install, not between the two loops: this
-    # raises on a library conflict (two mods pinning the same filename at
-    # different hashes), and doing it afterwards meant every mod was already on
-    # disk by the time it did - a half-applied import, mods installed but the
-    # disable pass never reached. Same check-then-act rule install_mod_closure
-    # follows for exactly this reason.
-    libs = collect_library_dependencies(all_mods)
-    for mod in all_mods:
-        progress(f"Installing {mod.id} {mod.version}")
-        install_mod(game_dir, mod, progress)
-    for lib in libs:
-        progress(f"Installing library {lib.filename}")
-        install_library_dependency(game_dir, lib, progress)
+    install_mod_set(game_dir, plan.dependencies + plan.roots, progress)
 
     for mod_id in modlist_import_disables(game_dir, plan):
         progress(f"Disabling {mod_id}")
