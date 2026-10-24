@@ -800,6 +800,9 @@ class ClientLauncher(tk.Tk):
             self._print(f"Log archived to {result}", "ok")
         elif not locked and result != "No active log file found to archive.":
             self._print(f"Couldn't archive previous log: {result}", "err")
+        # Re-enabled first: both launch paths return early on a validation
+        # error, which would otherwise leave Join greyed out for good.
+        self._action_btn.config(state="normal")
         if self._selected_kind == "headless":
             self._do_launch_headless()
         else:
