@@ -2,6 +2,7 @@
 can restore it without re-downloading."""
 import os
 import shutil
+import time
 
 from tavern_shared.paths import _sha256_file
 
@@ -36,12 +37,11 @@ def _cache_library_dir(filename, sha256):
     return os.path.join(_cache_base(), "_libraries", _safe_basename(filename), sha256)
 
 
-# How many cached versions of one mod are kept. Every version ever rendered
-# used to accumulate forever, with the manual "Clear Mod Cache" nuke as the
-# only relief; three covers the realistic switching pattern (the server's
-# current version, the previous one, and one the user pinned) while keeping
-# the cache bounded. Pruned oldest-stored-first (directory mtime, stamped when
-# the entry landed), never touching the version just stored.
+# How many cached versions of one mod are kept: the server's current version,
+# the previous one, and one the user pinned. Pruned oldest-stored-first by the
+# entry directory's mtime, which cache_store_mod stamps when the entry lands
+# (copytree would otherwise carry over the install's mtime), never touching
+# the version just stored.
 _CACHE_KEEP_VERSIONS = 3
 
 
@@ -89,6 +89,8 @@ def cache_store_mod(game_dir, mod_id):
         os.replace(disabled, os.path.join(staging, RECORD_NAME))
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     os.replace(staging, dest)
+    now = time.time_ns()
+    os.utime(dest, ns=(now, now))
     _prune_mod_cache(mod_id, version)
     return version
 
