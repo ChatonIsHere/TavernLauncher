@@ -1,14 +1,14 @@
 """The Mod Manager: everything currently sitting in Mods/ on this machine."""
 import json
 import os
-import threading
 import tkinter as tk
 from tkinter import filedialog
 from tkinter import messagebox
 
+from tavern_shared.bg import post, run_bg
 from tavern_shared.theme import (
-    AMBER, AMBERDIM, BG, BORDER, CYAN, GREEN, MUTED, PARCH, RED, SURF, _btn,
-    _mk_tree,
+    AMBER, AMBERDIM, BG, CYAN, GREEN, MUTED, PARCH, RED, SURF, _btn,
+    _mk_tree, _window_header,
 )
 from tavern_shared.game_guard import confirm_while_game_running
 from tavern_shared.window_chrome import _enable_dark_titlebar
@@ -19,7 +19,7 @@ from tavern_shared.mods.hostcfg import load_cfg
 from tavern_shared.mods.install import (
     _invalidate_verify_memo, disable_mod, disable_untracked_dll, enable_mod,
     enable_untracked_dll, list_installed_mods, list_untracked_mods,
-    mod_status, uninstall_mod,
+    uninstall_mod,
 )
 from tavern_shared.mods.modlist import (
     apply_import, export_modlist, import_modlist, modlist_import_disables,
@@ -30,13 +30,13 @@ from tavern_shared.mods.pins import (
 from tavern_shared.mods.repos import fetch_indexes, list_repos
 from tavern_shared.mods.ui.community_window import CommunityModsWindow
 from tavern_shared.mods.ui.shared import (
-    install_mod_flow, meta_matches_side, source_label,
+    ModListWindow, install_mod_flow, meta_matches_side, source_label,
 )
 from tavern_shared.mods.ui.version_window import ModVersionWindow
 from tavern_shared.mods.version import _parse_version
 
 
-class ModManagerWindow(tk.Toplevel):
+class ModManagerWindow(ModListWindow):
     """Everything currently sitting in Mods/ on this machine: mods this
     manager installed (folder + manifest.json/manifest.disabled.json - see
     list_installed_mods) and mods that got there some other way (a loose
@@ -68,14 +68,11 @@ class ModManagerWindow(tk.Toplevel):
         self._game_dir  = game_dir
         self._side      = side
         self._on_change = on_change
-        # Optional "is the game up?" check from the owning launcher (see
-        # tavern_shared.game_guard). The window itself opens either way -
-        # reading the table is harmless - and only the actions that write into
-        # Mods/ ask. A launcher that passes nothing behaves as before.
+        # Optional "is the game up?" check (see tavern_shared.game_guard),
+        # asked by the actions that write into Mods/.
         self._is_game_running = is_game_running
         # Server only: a callable giving the scene the server is set to run,
-        # read at the moment of an install (see install_mod_flow). None on a
-        # client, which has no scene of its own.
+        # read at the moment of an install (see install_mod_flow).
         self._server_scene = server_scene
         self._index     = []      # list[ModSummary], the merged raw index
         self._rows      = {}      # row id -> row dict (see _rebuild_rows)
@@ -92,10 +89,7 @@ class ModManagerWindow(tk.Toplevel):
         self._load(force=False)
 
     def _build(self):
-        h = tk.Frame(self, bg=SURF, height=44)
-        h.pack(fill="x"); h.pack_propagate(False)
-        tk.Label(h, text="Mod Manager", bg=SURF, fg=AMBER,
-                 font=("Georgia",12,"bold")).pack(side="left", padx=16, pady=8)
+        h = _window_header(self, "Mod Manager")
         _btn(h, "Community Mods", self._open_community, style="dim",
              font=("Segoe UI",9), pady=4, padx=10).pack(side="right", padx=12)
         # Modlist import/export applies to both sides - a client's Mods/ and
@@ -107,7 +101,6 @@ class ModManagerWindow(tk.Toplevel):
              font=("Segoe UI",9), pady=4, padx=10).pack(side="right", padx=(12,0))
         _btn(h, "Export Modlist", self._on_export_modlist, style="dim",
              font=("Segoe UI",9), pady=4, padx=10).pack(side="right", padx=(12,0))
-        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
 
         desc = ("Every mod installed on this machine - the ones this launcher "
                  "manages plus anything dropped into Mods/ by hand (marked "
@@ -159,38 +152,41 @@ class ModManagerWindow(tk.Toplevel):
             # user gesture that says re-hash everything.
             _invalidate_verify_memo()
         prev_index = self._index
-        def worker():
+        def load():
+            on_disk = self._read_installed()
+            # The table is what's on disk; the index only adds context
+            # (author, latest, update state), so a fetch failure leaves that
+            # stale rather than hiding the table.
             try:
-                installed = list_installed_mods(self._game_dir)
-                untracked = list_untracked_mods(self._game_dir)
-            except Exception as e:
-                self.after(0, lambda e=e: self._load_failed(e))
-                return
-            # What's actually installed/untracked is purely local - a mod is
-            # still there whether or not the index is reachable right now.
-            # The index is only needed for extra context (author, latest
-            # version, update state, Change Version), so a fetch failure
-            # degrades to showing that context stale/missing rather than
-            # hiding the whole table.
-            try:
-                repos = list_repos(load_cfg())
-                index = fetch_indexes(repos, force=force)
+                index = fetch_indexes(list_repos(load_cfg()), force=force)
             except Exception:
                 index = prev_index
-            self.after(0, lambda: self._render(index, installed, untracked))
-        threading.Thread(target=worker, daemon=True).start()
+            return index, on_disk
+        run_bg(self, load, on_ok=lambda r: self._render(*r),
+               on_err=lambda e: self._set_busy(False, f"Couldn't read installed mods: {e}"))
 
-    def _load_failed(self, err):
-        self._set_busy(False, f"Couldn't read installed mods: {err}")
-
-    def _render(self, index, installed, untracked):
+    def _render(self, index, on_disk):
         self._index = index
         if self._side == "client":
             self._pinned_ids = {_parse_pin_entry(p)[0] for p in list_pinned(load_cfg())}
-        self._rebuild_rows(installed, untracked)
-        self._populate_tree()
+        self._apply_installed(on_disk)
         self._set_busy(False, "")
         self._refresh_states()
+
+    # -- ModListWindow hooks --
+
+    def _read_installed(self):
+        return list_installed_mods(self._game_dir), list_untracked_mods(self._game_dir)
+
+    def _apply_installed(self, on_disk):
+        self._rebuild_rows(*on_disk)
+        self._populate_tree()
+
+    def _state_ids(self):
+        return [r["key"] for r in self._rows.values() if r["kind"] == "managed"]
+
+    def _busy_changed(self):
+        self._sync_buttons()
 
     def _rebuild_rows(self, installed, untracked):
         summaries = {}     # id -> ModSummary with the highest version seen
@@ -255,21 +251,6 @@ class ModManagerWindow(tk.Toplevel):
         if keep and self._tree.exists(keep):
             self._tree.selection_set(keep)
         self._sync_buttons()
-
-    def _refresh_states(self):
-        managed_ids = [r["key"] for r in self._rows.values() if r["kind"] == "managed"]
-        if not managed_ids:
-            return
-        index, game_dir = self._index, self._game_dir
-        def worker():
-            states = {}
-            for mod_id in managed_ids:
-                try:
-                    states[mod_id] = mod_status(game_dir, mod_id, index)
-                except Exception:
-                    states[mod_id] = "unknown"
-            self.after(0, lambda: self._apply_states(states))
-        threading.Thread(target=worker, daemon=True).start()
 
     def _apply_states(self, states):
         for row_id, r in self._rows.items():
@@ -380,14 +361,10 @@ class ModManagerWindow(tk.Toplevel):
             return
         self._set_busy(True, f"Removing {r['name']}...")
         game_dir, name, mod_id = self._game_dir, r["name"], r["key"]
-        def worker():
-            try:
-                removed = uninstall_mod(game_dir, mod_id)
-                self.after(0, lambda: self._finish(
-                    f"{name} removed." if removed else f"{name} was not installed."))
-            except Exception as e:
-                self.after(0, lambda e=e: self._finish(f"Remove failed: {e}"))
-        threading.Thread(target=worker, daemon=True).start()
+        run_bg(self, lambda: uninstall_mod(game_dir, mod_id),
+               on_ok=lambda removed: self._finish(
+                   f"{name} removed." if removed else f"{name} was not installed."),
+               on_err=lambda e: self._finish(f"Remove failed: {e}"))
 
     def _on_toggle(self):
         if self._busy:
@@ -408,32 +385,25 @@ class ModManagerWindow(tk.Toplevel):
             return
         self._set_busy(True, f"{'Disabling' if disabling else 'Enabling'} {r['name']}...")
         game_dir, name, kind, key = self._game_dir, r["name"], r["kind"], r["key"]
-        def worker():
-            try:
-                if kind in ("managed", "untracked_folder"):
-                    ok = disable_mod(game_dir, key) if disabling else enable_mod(game_dir, key)
-                    if ok and not disabling and kind == "managed":
-                        # A bare enable is just a record rename, but this mod's
-                        # pinned libraries may have been pruned from UserLibs/
-                        # while it was disabled (the join flow removes any
-                        # library no enabled mod pins). Put them back - cache
-                        # first, download if need be - or the mod loads without
-                        # them and fails in-game with nothing pointing here.
-                        restored = ensure_mod_libraries(
-                            game_dir, key,
-                            lambda m: self.after(0, lambda m=m: self._status.set(m)))
-                        if restored:
-                            self.after(0, lambda r=restored: self._status.set(
-                                f"Restored {', '.join(r)} for {name}."))
-                else:
-                    ok = (disable_untracked_dll(game_dir, key) if disabling
-                          else enable_untracked_dll(game_dir, key))
-                verb = "disabled" if disabling else "enabled"
-                msg = f"{name} {verb}." if ok else f"Couldn't {verb[:-1]} {name}."
-                self.after(0, lambda: self._finish(msg))
-            except Exception as e:
-                self.after(0, lambda e=e: self._finish(f"Toggle failed: {e}"))
-        threading.Thread(target=worker, daemon=True).start()
+        progress = lambda m: post(self, self._status.set, m)
+        def toggle():
+            if kind in ("managed", "untracked_folder"):
+                ok = disable_mod(game_dir, key) if disabling else enable_mod(game_dir, key)
+                if ok and not disabling and kind == "managed":
+                    # The join flow prunes libraries no enabled mod pins, so a
+                    # bare enable could leave this mod without them. Put them
+                    # back (cache first), or it fails in-game with nothing
+                    # pointing here.
+                    restored = ensure_mod_libraries(game_dir, key, progress)
+                    if restored:
+                        progress(f"Restored {', '.join(restored)} for {name}.")
+            else:
+                ok = (disable_untracked_dll(game_dir, key) if disabling
+                      else enable_untracked_dll(game_dir, key))
+            verb = "disabled" if disabling else "enabled"
+            return f"{name} {verb}." if ok else f"Couldn't {verb[:-1]} {name}."
+        run_bg(self, toggle, on_ok=self._finish,
+               on_err=lambda e: self._finish(f"Toggle failed: {e}"))
 
     def _toggle_pin(self, mod_id):
         cfg = load_cfg()
@@ -447,32 +417,21 @@ class ModManagerWindow(tk.Toplevel):
             return
         self._pinned_ids = {_parse_pin_entry(p)[0] for p in list_pinned(cfg)}
 
-    def _finish(self, msg):
-        self._set_busy(False, msg)
-        # The available set didn't change, only what's on disk, so re-scan
-        # installed/untracked state locally rather than re-fetching the index.
-        self._reconcile_installed()
-        self._refresh_states()
-        if self._on_change:
-            self._on_change()
-
-    def _reconcile_installed(self):
-        try:
-            installed = list_installed_mods(self._game_dir)
-            untracked = list_untracked_mods(self._game_dir)
-        except Exception:
-            return
-        self._rebuild_rows(installed, untracked)
-        self._populate_tree()
-
     def _open_community(self):
         if self._community_win and self._community_win.winfo_exists():
             self._community_win.lift(); return
         self._community_win = CommunityModsWindow(
             self, self._game_dir, side=self._side,
-            on_change=lambda: self._load(force=True),
+            on_change=self._community_changed,
             is_game_running=self._is_game_running,
             server_scene=self._server_scene)
+
+    def _community_changed(self):
+        # An install from there invalidated its own verify memo, so no forced
+        # refetch or re-hash; the launcher still needs telling.
+        self._load(force=False)
+        if self._on_change:
+            self._on_change()
 
     def _on_export_modlist(self):
         if self._busy:
@@ -517,20 +476,16 @@ class ModManagerWindow(tk.Toplevel):
             return
 
         self._set_busy(True, "Resolving modlist...")
-        index = self._index
-        def worker():
-            try:
-                repos = list_repos(load_cfg())
-                plan = import_modlist(modlist, index, repos, self._side)
-                self.after(0, lambda: self._confirm_import(plan))
-            except Exception as e:
-                self.after(0, lambda e=e: self._finish(f"Import failed: {e}"))
-        threading.Thread(target=worker, daemon=True).start()
+        index, game_dir, side = self._index, self._game_dir, self._side
+        def resolve():
+            plan = import_modlist(modlist, index, list_repos(load_cfg()), side)
+            return plan, modlist_import_disables(game_dir, plan)
+        run_bg(self, resolve, on_ok=lambda r: self._confirm_import(*r),
+               on_err=lambda e: self._set_busy(False, f"Import failed: {e}"))
 
-    def _confirm_import(self, plan):
+    def _confirm_import(self, plan, to_disable):
         self._set_busy(False)
         all_mods = plan.roots + plan.dependencies
-        to_disable = modlist_import_disables(self._game_dir, plan)
         lines = []
         if all_mods:
             lines.append("Will install:")
@@ -572,21 +527,10 @@ class ModManagerWindow(tk.Toplevel):
 
         self._set_busy(True, "Installing...")
         game_dir = self._game_dir
-        def worker():
-            try:
-                apply_import(game_dir, plan,
-                             lambda m: self.after(0, lambda: self._status.set(m)))
-                msg = f"Imported {len(plan.roots)} mod(s)."
-                if to_disable:
-                    msg += f" Disabled {len(to_disable)}."
-                self.after(0, lambda: self._finish(msg))
-            except Exception as e:
-                self.after(0, lambda e=e: self._finish(f"Import failed: {e}"))
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _set_busy(self, busy, msg=""):
-        self._busy = busy
-        self._refresh_btn.config(state="disabled" if busy else "normal")
-        if msg or not busy:
-            self._status.set(msg)
-        self._sync_buttons()
+        msg = f"Imported {len(plan.roots)} mod(s)."
+        if to_disable:
+            msg += f" Disabled {len(to_disable)}."
+        run_bg(self, lambda: apply_import(game_dir, plan,
+                                          lambda m: post(self, self._status.set, m)),
+               on_ok=lambda _: self._finish(msg),
+               on_err=lambda e: self._finish(f"Import failed: {e}"))

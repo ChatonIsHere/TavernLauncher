@@ -1,11 +1,11 @@
 """Manage Sources: the user's community repositories."""
-import threading
 import tkinter as tk
 from tkinter import messagebox
 from tkinter import simpledialog
 
+from tavern_shared.bg import run_bg
 from tavern_shared.theme import (
-    AMBER, AMBERDIM, BG, BORDER, CYAN, MUTED, PARCH, SURF, _btn,
+    AMBERDIM, BG, BORDER, CYAN, MUTED, PARCH, SURF, _btn, _window_header,
 )
 from tavern_shared.window_chrome import _enable_dark_titlebar
 
@@ -33,11 +33,7 @@ class ModSourcesWindow(tk.Toplevel):
         self.transient(parent)
 
     def _build(self):
-        h = tk.Frame(self, bg=SURF, height=44)
-        h.pack(fill="x"); h.pack_propagate(False)
-        tk.Label(h, text="Mod Sources", bg=SURF, fg=AMBER,
-                 font=("Georgia",12,"bold")).pack(side="left", padx=16, pady=8)
-        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
+        _window_header(self, "Mod Sources")
 
         tk.Label(self,
             text="Repositories the launcher fetches community mods from. The "
@@ -88,17 +84,12 @@ class ModSourcesWindow(tk.Toplevel):
                 "Add this source anyway?", parent=self):
             return
         self._status.set("Checking source...")
-        def worker():
-            try:
-                cfg = load_cfg()
-                add_repo(cfg, url)
-                self.after(0, lambda: self._added_ok())
-            except Exception as e:
-                self.after(0, lambda e=e: self._status.set(f"Couldn't add source: {e}"))
-        threading.Thread(target=worker, daemon=True).start()
+        run_bg(self, lambda: add_repo(load_cfg(), url),
+               on_ok=lambda _: self._changed("Source added."),
+               on_err=lambda e: self._status.set(f"Couldn't add source: {e}"))
 
-    def _added_ok(self):
-        self._status.set("Source added.")
+    def _changed(self, msg):
+        self._status.set(msg)
         self._reload()
         if self._on_change:
             self._on_change()
@@ -120,7 +111,4 @@ class ModSourcesWindow(tk.Toplevel):
         except Exception as e:
             self._status.set(f"Couldn't remove: {e}")
             return
-        self._status.set("Source removed.")
-        self._reload()
-        if self._on_change:
-            self._on_change()
+        self._changed("Source removed.")
