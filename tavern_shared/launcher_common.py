@@ -142,7 +142,11 @@ class LauncherCommon:
             self._set_mod_manager_badge(badge)
             self._alert_finished()
 
-        run_bg(self, check, on_ok=done, on_err=lambda e: self._alert_finished())
+        # Started from the event loop: the first refresh is asked for during
+        # __init__, and Tkinter drops a worker's hand-back if mainloop hasn't
+        # started within a second of it.
+        self.after(0, lambda: run_bg(self, check, on_ok=done,
+                                     on_err=lambda e: self._alert_finished()))
 
     def _alert_finished(self):
         self._alert_running = False
