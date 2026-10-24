@@ -10,7 +10,7 @@ from tavern_shared.mods.cache import (
 from tavern_shared.mods.errors import ModManagerError, _warn
 from tavern_shared.mods.install import (
     _read_mod_record, collect_library_dependencies, disable_mod, enable_mod,
-    install_mod, list_installed_mods,
+    install_mod, list_installed_mods, verify_mod_files,
 )
 from tavern_shared.mods.layout import (
     _disabled_record_path, _safe_basename, _userlibs_dir,
@@ -243,7 +243,10 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
     for mod in all_mods:
         cached = os.path.isdir(_cache_mod_dir(mod.id, mod.version))
         rec = installed.get(mod.id)
-        active = bool(rec and rec.get("enabled") and rec.get("version") == mod.version)
+        # A damaged copy at the right version isn't a match: the join has to
+        # repair it or the game launches broken.
+        active = bool(rec and rec.get("enabled") and rec.get("version") == mod.version
+                      and verify_mod_files(game_dir, mod.id) is not False)
         entries.append(PlanEntry(mod_id=mod.id, version=mod.version, source_repo=mod.source_repo,
                                   reason=reason.get(mod.id, "required"), cached=cached, active=active,
                                   manifest=mod))
@@ -378,9 +381,11 @@ def build_mod_diff(game_dir, server_mods, plan):
         rec = installed.get(e.mod_id)
         cv = rec.get("version", "") if rec else ""
         enabled = bool(rec.get("enabled")) if rec else False
+        damaged = (not e.active and cv == e.version
+                   and verify_mod_files(game_dir, e.mod_id) is False)
         if e.active:
             action = ACTION_MATCH
-        elif rec is None:
+        elif rec is None or damaged:
             action = ACTION_ACTIVATE if e.cached else ACTION_INSTALL
         elif cv == e.version:
             action = ACTION_ENABLE          # right version on disk, just switched off
@@ -400,6 +405,8 @@ def build_mod_diff(game_dir, server_mods, plan):
         elif recommended:
             note = ("this server recommends it but doesn't require it; skipping "
                     "it won't stop you joining")
+        elif damaged:
+            note = "the installed copy is damaged; it will be reinstalled"
         else:
             note = ""
         rows.append(DiffRow(
@@ -561,7 +568,8 @@ def render_active_set(game_dir, plan, on_progress=None, on_step=None):
         step(entry.mod_id, "start")
         rec = _read_mod_record(game_dir, entry.mod_id)
         disabled_here = (bool(rec) and rec.get("version") == entry.version
-                         and os.path.isfile(_disabled_record_path(game_dir, entry.mod_id)))
+                         and os.path.isfile(_disabled_record_path(game_dir, entry.mod_id))
+                         and verify_mod_files(game_dir, entry.mod_id) is not False)
         if disabled_here:
             # Already on disk at exactly this version, just switched off. Renaming
             # the record back is the whole job: no copy out of the cache, no
