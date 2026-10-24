@@ -10,8 +10,9 @@ from tavern_shared.paths import _sha256_file
 from tavern_shared.bundled import bundled_tag, usable_payload
 from tavern_shared.mod_install import (
     NEEDS_ATTENTION, DownloadError, _download_with_retries,
-    _fetch_remote_fingerprint, _file_matches_recorded, _get_latest_release_tag,
-    _load_mod_meta, _record_source, _update_mod_meta, _verify_payload_type,
+    _fetch_remote_fingerprint, _get_latest_release_tag, _load_mod_meta,
+    _local_state, _record_source, _remote_state, _update_mod_meta,
+    _verify_payload_type,
 )
 
 PATCH_DOWNLOAD_URL = "https://github.com/ModdingTavern/TavernDefaults/releases/latest/download/themoddingtavern.dll"
@@ -32,87 +33,31 @@ def _patch_target_path(game_exe):
     return os.path.join(game_dir, PATCH_TARGET_SUBDIR, PATCH_TARGET_FILENAME)
 
 
-def _patch_status(game_exe):
-    """The same six states as _melonloader_status/_tavernlib_status, so the
-    Setup window can say "Update available" about the patch instead of a
-    binary applied/not — before this, a newly published patch release read
-    as "Up to date" forever, because nothing ever compared against GitHub.
-
-    "Applied" means the installed Root.Township.dll matches the hash
-    apply_patch most recently confirmed writing there, recorded in the
-    per-game-dir meta file (see _load_mod_meta) — never a comparison
-    against some local reference copy (the launcher used to bundle one,
-    and comparing against it reported "not applied" immediately after a
-    successful GitHub download). The meta file lives in game_dir, not in
-    per-launcher state, so if the client launcher already patched a given
-    game install the server launcher (or vice versa) still sees it as
-    done, as long as both point at the same game folder.
-
-    One reading differs from the other two: Root.Township.dll always exists
-    in an unmodified game (it's the game's own file being replaced), so
-    presence proves nothing. With no recorded hash the file is just the
-    vanilla DLL and the answer is 'missing' (never patched), not 'unknown'
-    (patched, but by a launcher too old to record what it did). Those need
-    to stay apart: 'missing' flashes the Setup alert unconditionally,
-    'unknown' never does.
-
-    - missing:    no Root.Township.dll at all, or nothing recorded as applied
-    - damaged:    the file no longer matches what apply_patch last confirmed
-                  writing — a game update overwrote it, or antivirus ate it
-    - outdated:   applied and intact, but GitHub's fingerprint for the
-                  published file has moved (the ETag tracks the asset's
-                  bytes, so it catches a re-upload a tag comparison misses)
-    - unrecorded: applied and intact, but the install record is incomplete —
-                  fingerprint or tag recorded by a launcher too old to write
-                  them; purely local, repaired by the reinstall Automatic
-                  Setup runs for this state
-    - unknown:    full record, but GitHub is unreachable to compare against;
-                  deliberately not an alarm and not auto-reinstalled
-    - current:    applied, intact, and matches what GitHub is serving"""
-    game_dir = os.path.dirname(game_exe)
+def _patch_local_state(game_exe):
+    """Root.Township.dll always exists in an unmodified game, so presence
+    proves nothing: with no recorded hash it's the vanilla DLL, 'missing'
+    (never patched) rather than 'unrecorded'. 'missing' alerts
+    unconditionally; that difference has to survive."""
+    meta = _load_mod_meta(os.path.dirname(game_exe))
     dst = _patch_target_path(game_exe)
-    meta = _load_mod_meta(game_dir)
-    if not os.path.isfile(dst) or not meta.get("patch_sha256"):
-        return "missing"
-    if _file_matches_recorded(dst, meta.get("patch_sha256")) is False:
-        return "damaged"
-    installed_fp = meta.get("patch_fingerprint")
-    if not (installed_fp and meta.get("patch_tag")):
-        return "unrecorded"
-    try:
-        latest_fp = _fetch_remote_fingerprint(PATCH_DOWNLOAD_URL)
-    except Exception:
-        return "unknown"
-    if not latest_fp:
-        return "unknown"
-    return "current" if latest_fp == installed_fp else "outdated"
+    return meta, _local_state(
+        os.path.isfile(dst) and bool(meta.get("patch_sha256")), dst, meta,
+        "patch_sha256", ("patch_fingerprint", "patch_tag"))
+
+
+def _patch_status(game_exe):
+    """The same states as _melonloader_status/_tavernlib_status, read from
+    the hash apply_patch last confirmed writing, recorded in the game dir's
+    meta file so either launcher sees the other's patch."""
+    meta, state = _patch_local_state(game_exe)
+    return state or _remote_state(
+        lambda: _fetch_remote_fingerprint(PATCH_DOWNLOAD_URL), meta["patch_fingerprint"])
 
 
 def _patch_needs_attention(game_exe):
-    """Whether the patch state should flash the main window's Setup alert,
-    by the same rule _mods_need_attention applies to MelonLoader/TavernLib:
-    missing/outdated/damaged do, and a failed update *check* (unknown) never
-    raises a false alarm on its own."""
+    """Whether the patch state should flash the Setup alert, by the rule
+    _mods_need_attention applies to MelonLoader/TavernLib."""
     return _patch_status(game_exe) in NEEDS_ATTENTION
-
-
-def _patch_install_broken(game_exe):
-    """Whether there is no applied patch here worth protecting. The
-    network-free half of _patch_status (see _melonloader_install_broken).
-
-    'missing' reads differently here than for the other two components and
-    that difference carries through: Root.Township.dll always exists, so an
-    absent record means the file is the game's own vanilla assembly, which
-    is exactly a state any verified patch improves on."""
-    game_dir = os.path.dirname(game_exe)
-    dst = _patch_target_path(game_exe)
-    meta = _load_mod_meta(game_dir)
-    recorded = meta.get("patch_sha256")
-    if not os.path.isfile(dst) or not recorded:
-        return True
-    if _file_matches_recorded(dst, recorded) is False:
-        return True
-    return not (meta.get("patch_fingerprint") and meta.get("patch_tag"))
 
 
 def apply_patch(game_exe, on_progress=None):
@@ -156,7 +101,7 @@ def apply_patch(game_exe, on_progress=None):
             fingerprint = (headers.get("ETag") or headers.get("Last-Modified")
                            or headers.get("Content-Length") or "")
         except DownloadError:
-            source = usable_payload("patch", _patch_install_broken(game_exe),
+            source = usable_payload("patch", _patch_local_state(game_exe)[1] is not None,
                                     _load_mod_meta(game_dir).get("patch_tag"))
             if not source:
                 raise

@@ -582,21 +582,6 @@ def _blocked_write_message(what, examples):
         "  • Use Manual Install to place the files yourself")
 
 
-def _melonloader_install_broken(game_dir):
-    """Whether there is no MelonLoader install here worth protecting —
-    missing, failing its recorded hash, or recorded incompletely. The same
-    three readings _melonloader_status calls 'missing'/'damaged'/'unrecorded',
-    but computed without touching the network, because the one caller
-    (the bundled fallback) is by definition already offline."""
-    if not _melonloader_installed(game_dir):
-        return True
-    meta = _load_mod_meta(game_dir)
-    recorded = meta.get("melonloader_version_sha256")
-    if _file_matches_recorded(os.path.join(game_dir, "version.dll"), recorded) is False:
-        return True
-    return not (meta.get("melonloader_tag") and recorded)
-
-
 def _install_melonloader(game_dir, arch, on_progress):
     """Downloads and installs the latest official MelonLoader release, with
     retries, falling back to the copy shipped in Patch/ only when that copy
@@ -632,7 +617,7 @@ def _install_melonloader(game_dir, arch, on_progress):
             # Only the x64 archive is shipped, and usable_payload's hash check
             # means an x86 request can't be served the wrong one by accident.
             source_zip = usable_payload(
-                "melonloader", _melonloader_install_broken(game_dir),
+                "melonloader", _melonloader_local_state(game_dir)[1] is not None,
                 _load_mod_meta(game_dir).get("melonloader_tag")) if arch == "x64" else None
             if not source_zip:
                 raise
@@ -687,21 +672,6 @@ def _install_melonloader(game_dir, arch, on_progress):
     _update_mod_meta(game_dir, changes, drop)
 
 
-def _tavernlib_install_broken(game_dir):
-    """Whether there is no TavernLib install here worth protecting. The
-    network-free half of _tavernlib_status, for the same reason as
-    _melonloader_install_broken."""
-    if not _tavernlib_installed(game_dir):
-        return True
-    meta = _load_mod_meta(game_dir)
-    recorded = meta.get("tavernlib_sha256")
-    if _file_matches_recorded(os.path.join(game_dir, "Plugins", TAVERNLIB_FILENAME),
-                              recorded) is False:
-        return True
-    return not (recorded and meta.get("tavernlib_fingerprint")
-                and meta.get("tavernlib_tag"))
-
-
 def _install_tavernlib(game_dir, on_progress):
     """Downloads and installs the latest TavernLib.dll, with retries, falling
     back to the verified copy shipped in Patch/ when the download fails and
@@ -732,7 +702,7 @@ def _install_tavernlib(game_dir, on_progress):
             fingerprint = (headers.get("ETag") or headers.get("Last-Modified")
                            or headers.get("Content-Length") or "")
         except DownloadError:
-            source = usable_payload("tavernlib", _tavernlib_install_broken(game_dir),
+            source = usable_payload("tavernlib", _tavernlib_local_state(game_dir)[1] is not None,
                                     _load_mod_meta(game_dir).get("tavernlib_tag"))
             if not source:
                 raise
@@ -812,68 +782,65 @@ def _file_matches_recorded(path, recorded):
         return False
 
 
-def _melonloader_status(game_dir):
-    """Returns 'missing', 'damaged', 'outdated', 'unrecorded', 'unknown', or
-    'current'.
-
-    'unrecorded' and 'unknown' are deliberately separate answers to "can't
-    compare", because they're fixed from opposite directions. 'unrecorded'
-    means the install record itself is incomplete (installed by hand, or by
-    a launcher too old to write these fields) — purely local knowledge, and
-    a reinstall repairs it, so Automatic Setup treats it as work to do.
-    'unknown' means the record is complete but the remote check didn't
-    happen (GitHub unreachable) — reinstalling over that would just fail,
-    so nothing treats it as work and nothing alarms over it.
-
-    'damaged' is checked before anything to do with versions, and is purely
-    local: the version tag we recorded describes the release we fetched, so
-    it keeps reporting 'current' regardless of what later happens to the files
-    on disk. Antivirus quarantining version.dll, a game update overwriting it,
-    or a half-finished extract all leave the tag intact and the install
-    broken."""
-    if not _melonloader_installed(game_dir):
+def _local_state(installed, path, meta, sha_key, record_keys):
+    """The network-free half of a Setup component's status: 'missing',
+    'damaged' (path no longer hashes to meta[sha_key]), 'unrecorded' (one of
+    record_keys absent, e.g. installed by hand or by an older launcher), or
+    None for an intact install with a complete record. 'damaged' comes before
+    anything about versions: a recorded tag or ETag describes the release
+    fetched, not the files on disk now. The bundled fallback asks this
+    offline to decide whether there is an install worth protecting."""
+    if not installed:
         return "missing"
-    meta = _load_mod_meta(game_dir)
-    if _file_matches_recorded(os.path.join(game_dir, "version.dll"),
-                              meta.get("melonloader_version_sha256")) is False:
+    if _file_matches_recorded(path, meta.get(sha_key)) is False:
         return "damaged"
-    installed_tag = meta.get("melonloader_tag")
-    if not installed_tag or not meta.get("melonloader_version_sha256"):
+    if not all(meta.get(k) for k in record_keys):
         return "unrecorded"
+    return None
+
+
+def _remote_state(latest, recorded):
+    """'current'/'outdated' comparing `recorded` with what latest() reports
+    is published, or 'unknown' when that can't be read. 'unknown' is never
+    work for Automatic Setup: reinstalling over an unreachable GitHub fails."""
     try:
-        latest = _get_melonloader_latest_tag()
+        published = latest()
     except Exception:
         return "unknown"
-    if not latest:
+    if not published:
         return "unknown"
-    return "current" if latest == installed_tag else "outdated"
+    return "current" if published == recorded else "outdated"
+
+
+def _melonloader_local_state(game_dir):
+    meta = _load_mod_meta(game_dir)
+    return meta, _local_state(
+        _melonloader_installed(game_dir), os.path.join(game_dir, "version.dll"), meta,
+        "melonloader_version_sha256", ("melonloader_tag", "melonloader_version_sha256"))
+
+
+def _tavernlib_local_state(game_dir):
+    meta = _load_mod_meta(game_dir)
+    return meta, _local_state(
+        _tavernlib_installed(game_dir), os.path.join(game_dir, "Plugins", TAVERNLIB_FILENAME),
+        meta, "tavernlib_sha256",
+        ("tavernlib_sha256", "tavernlib_fingerprint", "tavernlib_tag"))
+
+
+def _melonloader_status(game_dir):
+    """'missing', 'damaged', 'unrecorded', then the release tag against
+    GitHub's latest: 'current', 'outdated' or 'unknown'."""
+    meta, state = _melonloader_local_state(game_dir)
+    return state or _remote_state(_get_melonloader_latest_tag, meta["melonloader_tag"])
 
 
 def _tavernlib_status(game_dir):
-    """Same six states as _melonloader_status, and 'damaged' matters here for
-    the same reason: tavernlib_fingerprint is GitHub's ETag for the published
-    file, so it answers "is a newer one out?" and is completely blind to the
-    installed copy being truncated, quarantined or replaced. A full record is
-    all three of hash (drift detection), fingerprint (update check) and tag
-    (version display) — any of them absent is 'unrecorded', one reinstall
-    away from all three working."""
-    if not _tavernlib_installed(game_dir):
-        return "missing"
-    meta = _load_mod_meta(game_dir)
-    if _file_matches_recorded(os.path.join(game_dir, "Plugins", TAVERNLIB_FILENAME),
-                              meta.get("tavernlib_sha256")) is False:
-        return "damaged"
-    installed_fp = meta.get("tavernlib_fingerprint")
-    if not (installed_fp and meta.get("tavernlib_sha256")
-            and meta.get("tavernlib_tag")):
-        return "unrecorded"
-    try:
-        latest_fp = _fetch_remote_fingerprint(TAVERNLIB_DOWNLOAD_URL)
-    except Exception:
-        return "unknown"
-    if not latest_fp:
-        return "unknown"
-    return "current" if latest_fp == installed_fp else "outdated"
+    """Same states as _melonloader_status, compared by the published file's
+    ETag fingerprint rather than its tag (the fingerprint also catches a
+    re-upload under an unchanged tag)."""
+    meta, state = _tavernlib_local_state(game_dir)
+    return state or _remote_state(
+        lambda: _fetch_remote_fingerprint(TAVERNLIB_DOWNLOAD_URL), meta["tavernlib_fingerprint"])
 
 
 NEEDS_ATTENTION = ("missing", "outdated", "damaged")
