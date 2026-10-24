@@ -562,6 +562,23 @@ class ClientLauncher(tk.Tk):
         # Update check runs a couple seconds after startup, off the UI
         # thread, so it never delays the window actually appearing.
         self.after(2000, self._check_for_launcher_update)
+        self.after(1200, self._report_partial_update)
+
+    def _report_partial_update(self):
+        """Shows the report the updater's staging process left behind when it
+        couldn't replace every file (see updater.read_partial_update_marker)."""
+        if _updater is None:
+            return
+        marker = _updater.read_partial_update_marker()
+        if not marker:
+            return
+        _updater.clear_partial_update_marker()
+        files = marker.get("files", [])
+        self._print(f"Update warning: {len(files)} file(s) could not be replaced.", "warn")
+        for f in files:
+            self._print(f"  · {f}", "warn")
+        messagebox.showwarning("Update didn't fully apply",
+                               _updater.partial_update_message(files), parent=self)
 
     def _check_for_launcher_update(self):
         if _updater is None:
