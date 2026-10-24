@@ -1,6 +1,7 @@
 """The wire shapes: a repository.json summary row (ModSummary), a full
 per-version manifest (ModManifest), and a library dependency."""
 import os
+import re
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -140,6 +141,18 @@ class ModSummary:
         return _major(self.highest())
 
 
+_SHA256 = re.compile(r"[0-9a-fA-F]{64}")
+
+
+def _sha256_field(d, where):
+    """d["sha256"] lowercased, refusing anything but 64 hex characters.
+    Same rule and message as TavernLib's ModDataModel.Sha256Field."""
+    value = d.get("sha256")
+    if not (isinstance(value, str) and _SHA256.fullmatch(value)):
+        raise ModManagerError(f"{where} has an invalid sha256 (expected 64 hex characters).")
+    return value.lower()
+
+
 def _library_from_dict(d):
     for k in ("name", "download_url", "sha256", "filename"):
         if k not in d:
@@ -147,7 +160,7 @@ def _library_from_dict(d):
     return LibraryDependency(
         name=str(d["name"]),
         download_url=str(d["download_url"]),
-        sha256=str(d["sha256"]).lower(),
+        sha256=_sha256_field(d, "library_dependencies entry"),
         filename=str(d["filename"]),
     )
 
@@ -186,7 +199,7 @@ def _manifest_from_dict(d, source_repo):
             dependencies=dict(d.get("dependencies", {}) or {}),
             library_dependencies=libs,
             download_url=str(d["download_url"]),
-            sha256=str(d["sha256"]).lower(),
+            sha256=_sha256_field(d, "manifest"),
             source_repo=source_repo,
             package=package,
             parity_required=parity_required(d),
