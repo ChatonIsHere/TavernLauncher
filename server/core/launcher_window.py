@@ -41,6 +41,7 @@ from server.core.server_backup import backup_due, create_backup, prune_backups
 from tavern_shared.flashing import start_flashing_button
 from server.core.auth_service import (
     start_auth_service, AUTH_PORT, build_console_token, build_server_tokens,
+    invalidate_mods_snapshot,
 )
 from server.core.console_window import ConsoleWindow
 from server.core.tickets_window import TicketsWindow
@@ -81,6 +82,7 @@ class ServerLauncher(LauncherCommon, tk.Tk):
         self._sett_win = None
         self._console_win = None
         self._tickets_win = None
+        self._served_game_dir = None   # read by the auth service's threads
         self._init_launcher_common()
         self._build_ui()
         self._load()
@@ -505,6 +507,7 @@ class ServerLauncher(LauncherCommon, tk.Tk):
         check) reads Mods/ live, but the running session loaded its mods at
         startup, so joining clients get matched against a set it isn't
         running. Nothing here can restart the game safely, so it says so."""
+        invalidate_mods_snapshot()
         if game_is_running(self._proc):
             self._print("Mods changed while the server is running: the changes "
                         "take effect after a server restart. Until then, joining "
@@ -668,8 +671,9 @@ class ServerLauncher(LauncherCommon, tk.Tk):
             with open(CONSOLE_TOKEN_FILE,"w") as f:
                 f.write(console_token)
         except: pass
+        self._served_game_dir = os.path.dirname(exe)
         if not self._auth_on:
-            start_auth_service(self._print, os.path.dirname(exe))
+            start_auth_service(self._print, lambda: self._served_game_dir)
             self._auth_on = True
         args = [exe, "/force_offline",
                 "/access_token", access, "/refresh_token", refresh,
