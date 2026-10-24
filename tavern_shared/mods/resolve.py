@@ -184,7 +184,8 @@ def _repo_order(repo_bases, prefer_repo):
     return order
 
 
-def _fetch_manifest_leaf(repo_bases, mod_id, leaf, prefer_repo=None, what=None):
+def _fetch_manifest_leaf(repo_bases, mod_id, leaf, prefer_repo=None, what=None,
+                         expect_version=None):
     """Fetches one manifest file (leaf, e.g. "1.0.4.json" or "latest.1.json") from
     manifests/<author>/<repo>/ across the configured repos in preference order,
     returning the first that parses. <author>/<repo> is mod_id split on the first
@@ -203,8 +204,16 @@ def _fetch_manifest_leaf(repo_bases, mod_id, leaf, prefer_repo=None, what=None):
             last_err = e
             continue
         m = _manifest_from_dict(data, _norm(base))
-        if m is not None:
-            return m
+        if m is None:
+            continue
+        if expect_version is not None and (m.id, m.version) != (mod_id, expect_version):
+            # A repo serving another mod's manifest at this path is a failure
+            # for that repo, never an install of whatever it named.
+            last_err = ModManagerError(
+                f"{url} serves '{m.id}' {m.version}, not the requested "
+                f"'{mod_id}' {expect_version}.")
+            continue
+        return m
     raise ModManagerError(
         f"Couldn't find {what or mod_id} in any configured repository."
         + (f" Last error: {last_err}" if last_err else ""))
@@ -216,7 +225,7 @@ def _fetch_manifest(repo_bases, mod_id, version, prefer_repo=None):
     chosen. Immutable per-version file, so it's safe to cache within a resolve."""
     return _fetch_manifest_leaf(
         repo_bases, mod_id, f"{version}.json", prefer_repo,
-        what=f"mod '{mod_id}' version {version}")
+        what=f"mod '{mod_id}' version {version}", expect_version=version)
 
 
 def resolve_mod_by_id(repo_bases, mod_id, prefer_repo=None, major=None):
