@@ -386,6 +386,9 @@ def _download_with_progress(url, dest_path, on_progress,
                 "Without the expected size, a cut-off download would be "
                 "undetectable, so nothing was downloaded.")
         downloaded = 0
+        # Each call is a Tk event on the caller's side: report when the whole
+        # percentage moves, or every ~1 MB when there's no length to divide by.
+        last_pct, last_reported = -1, 0
         try:
             with resp, open(dest_path, "wb") as out:
                 while True:
@@ -425,8 +428,11 @@ def _download_with_progress(url, dest_path, on_progress,
                     downloaded += len(chunk)
                     if total:
                         pct = int(downloaded * 100 / max(1, total))
-                        on_progress(f"Downloading… {pct}%  ({downloaded//1024:,} / {total//1024:,} KB)")
-                    else:
+                        if pct != last_pct:
+                            last_pct = pct
+                            on_progress(f"Downloading… {pct}%  ({downloaded//1024:,} / {total//1024:,} KB)")
+                    elif downloaded - last_reported >= 1 << 20:
+                        last_reported = downloaded
                         on_progress(f"Downloading… {downloaded//1024:,} KB")
                 if total is not None and downloaded != total:
                     raise DownloadError(_short_read_message(url, downloaded, total))
