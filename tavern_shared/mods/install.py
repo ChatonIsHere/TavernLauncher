@@ -188,6 +188,16 @@ def _invalidate_verify_memo(game_dir=None, mod_id=None):
     _verify_memo.pop(_mod_dir_path(game_dir, mod_id), None)
 
 
+def _files_intact(base, files):
+    """Whether every {relative path: sha256} in `files` is present under base
+    at that hash. Returns the first bad path, or None when all match."""
+    for rel, expected in files.items():
+        path = os.path.join(base, rel.replace("/", os.sep))
+        if not os.path.isfile(path) or _sha256_file(path).lower() != str(expected).lower():
+            return rel
+    return None
+
+
 def verify_mod_files(game_dir, mod_id):
     """Whether an installed mod's files still match what install_mod recorded
     putting there - the community-mod counterpart of the core components'
@@ -213,12 +223,7 @@ def verify_mod_files(game_dir, mod_id):
     memo = _verify_memo.get(mod_dir)
     if memo and memo[0] == rec.get("version"):
         return memo[1]
-    ok = True
-    for rel, expected in files.items():
-        path = os.path.join(mod_dir, rel.replace("/", os.sep))
-        if not os.path.isfile(path) or _sha256_file(path).lower() != str(expected).lower():
-            ok = False
-            break
+    ok = _files_intact(mod_dir, files) is None
     _verify_memo[mod_dir] = (rec.get("version"), ok)
     return ok
 
