@@ -448,11 +448,14 @@ def _remove_library(game_dir, filename):
 
 
 def _read_sidecar(path):
+    """The file's top-level JSON object, or None if it's missing, unreadable
+    or not an object (as TavernLib's ModRecord.ParseObject)."""
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except Exception:
         return None
+    return data if isinstance(data, dict) else None
 
 
 def _library_present(game_dir, filename, sha256):
@@ -485,10 +488,15 @@ def _folder_record(folder, warn=False):
     ours, else None: the enabled record, else the disabled one, with an id
     and a readable parity_required. This is the "is this folder ours"
     predicate; TavernLib's ModRecord.Read is the same test."""
+    def has_id(r):
+        # A non-empty string, as ModRecord.Read requires: anything else can't
+        # sort into the handshake alongside real ids.
+        return r is not None and isinstance(r.get("id"), str) and r["id"] != ""
+
     rec, enabled = _read_sidecar(os.path.join(folder, RECORD_NAME)), True
-    if not (rec and rec.get("id")):
+    if not has_id(rec):
         rec, enabled = _read_sidecar(os.path.join(folder, DISABLED_RECORD_NAME)), False
-    if not (rec and rec.get("id")):
+    if not has_id(rec):
         return None
     try:
         parity_required(rec)
