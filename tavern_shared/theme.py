@@ -212,3 +212,43 @@ def _mk_tree(parent, cols, widths, height=8, hscroll=False):
         tree.config(xscrollcommand=hsb.set)
     return tree
 
+
+def _window_header(parent, title, subtitle=None):
+    """The 44px title strip across the top of a dialog. Returns the strip so
+    a caller can pack its own buttons on the right."""
+    h = tk.Frame(parent, bg=SURF, height=44)
+    h.pack(fill="x"); h.pack_propagate(False)
+    tk.Label(h, text=title, bg=SURF, fg=AMBER,
+             font=("Georgia",12,"bold")).pack(side="left", padx=16, pady=8)
+    if subtitle:
+        tk.Label(h, text=subtitle, bg=SURF, fg=MUTED,
+                 font=("Segoe UI",9)).pack(side="left", pady=8)
+    tk.Frame(parent, bg=BORDER, height=1).pack(fill="x")
+    return h
+
+
+def _scroll_stack(parent):
+    """A vertically scrolling stack of row frames, for lists a Treeview can't
+    draw (a control or several lines per row). Returns (canvas, inner); pack
+    rows into inner."""
+    frame = tk.Frame(parent, bg=BG)
+    frame.pack(fill="both", expand=True)
+    canvas = tk.Canvas(frame, bg=BG, highlightthickness=0)
+    vsb = _mk_scrollbar(frame, canvas.yview)
+    vsb.pack(side="right", fill="y")
+    canvas.config(yscrollcommand=vsb.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    inner = tk.Frame(canvas, bg=BG)
+    window = canvas.create_window((0, 0), window=inner, anchor="nw")
+    inner.bind("<Configure>",
+               lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.bind("<Configure>", lambda e: canvas.itemconfig(window, width=e.width))
+    def _mousewheel(event):
+        # yview_scroll doesn't check the content height itself, so a short
+        # list would scroll off into empty space.
+        if inner.winfo_height() <= canvas.winfo_height():
+            return
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    canvas.bind("<MouseWheel>", _mousewheel)
+    inner.bind("<MouseWheel>", _mousewheel)
+    return canvas, inner
