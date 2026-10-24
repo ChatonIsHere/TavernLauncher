@@ -11,6 +11,7 @@ from tavern_shared.mods.errors import ModManagerError
 # launcher a different version set (and a different highest()/major) than the
 # host resolving the same index. ASCII digits only is the intersection.
 _SEGMENT = re.compile(r"[0-9]+")
+_SEGMENT_MAX = 2147483647
 
 
 def _parse_version(v):
@@ -33,7 +34,13 @@ def _parse_version(v):
     if not all(_SEGMENT.fullmatch(p) for p in parts):
         raise ModManagerError(
             f"Version {v!r} has a non-numeric segment; only digits are allowed.")
-    return tuple(int(p) for p in parts)
+    out = tuple(int(p) for p in parts)
+    # TavernLib parses segments as Int32; anything wider would order here and
+    # be skipped there.
+    if any(n > _SEGMENT_MAX for n in out):
+        raise ModManagerError(
+            f"Version {v!r} has a segment larger than 2147483647.")
+    return out
 
 
 def _major(v):
