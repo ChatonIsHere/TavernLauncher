@@ -1487,29 +1487,15 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         self._action_btn.config(state="disabled")
         self._print("Recovering the missing mods…", "warn")
 
-        def worker():
-            try:
-                cfg = load_cfg()
-                repo_bases = mods.list_repos(cfg)
-                index = mods.fetch_indexes(repo_bases)
-                roots, dependencies = mods.resolve_missing_mods(missing, index, repo_bases)
-                libraries = mods.collect_library_dependencies(roots + dependencies)
-                for mod in roots + dependencies:
-                    mods.install_mod(
-                        game_dir, mod,
-                        lambda m, _i=mod: self.after(0, lambda: self._print(
-                            f"{_i.id}: {m}", "dim")))
-                for lib in libraries:
-                    mods.install_library_dependency(
-                        game_dir, lib,
-                        lambda m, _l=lib: self.after(0, lambda: self._print(
-                            f"{_l.filename}: {m}", "dim")))
-            except Exception as e:
-                self.after(0, lambda e=e: self._recovery_failed(e))
-                return
-            self.after(0, lambda: self._recovery_done(relaunch))
+        def recover():
+            repo_bases = mods.list_repos(load_cfg())
+            index = mods.fetch_indexes(repo_bases)
+            roots, dependencies = mods.resolve_missing_mods(missing, index, repo_bases)
+            mods.install_mod_set(game_dir, dependencies + roots,
+                                 lambda m: self._print(m, "dim"))
 
-        threading.Thread(target=worker, daemon=True).start()
+        run_bg(self, recover, lambda _r: self._recovery_done(relaunch),
+               self._recovery_failed)
 
     def _recovery_failed(self, err):
         self._action_btn.config(state="normal")
