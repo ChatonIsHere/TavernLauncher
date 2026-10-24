@@ -1,33 +1,9 @@
-"""The offline copies of the Setup payloads shipped in Patch/, and the rule
-deciding when one may stand in for a download that won't complete.
-
-The history here matters, because this is the second attempt. The original
-fallback took whatever file happened to be sitting in Patch/ the moment a
-download failed, installed it, and reported plain success -- so a stale
-loader went in silently, and the recorded version described a release that
-had never been fetched. That was removed rather than fixed.
-
-What makes this version safe is three rules it did not have:
-
-  * Nothing is used unverified. Every payload's sha256 and byte count are
-    recorded in Patch/bundled.json at the moment it was fetched, and a copy
-    that doesn't match is treated as absent -- a half-synced update or a
-    file antivirus has been at is not a fallback, it's a different file.
-
-  * Nothing is used blindly. A shipped copy is a snapshot from whenever the
-    build was cut, so it stands in only when it would actually leave the
-    install better off: when there is no working install to protect, or
-    when the snapshot is genuinely newer than what's already there. It
-    never downgrades a working install just because GitHub was unreachable
-    for a moment, and when it has nothing to offer the caller raises and
-    the Setup window opens manual-install instructions instead.
-
-  * Nothing is reported as something it isn't. The real release tag travels
-    with the payload, so an offline install records the version it actually
-    installed and says on the Setup row that it came from the shipped copy.
-    See _install_tavernlib for the "bundled:<tag>" fingerprint that makes
-    the next online check pull the real thing.
-"""
+"""The offline copies of the Setup payloads shipped in Patch/, and the rule for
+when one may stand in for a download that won't complete. A shipped copy is
+used only if it matches the sha256 and size recorded in Patch/bundled.json,
+only when it would leave the install better off (nothing worth protecting,
+or a genuinely newer release), and is recorded under its real release tag
+and marked as bundled."""
 import json
 import os
 import sys
@@ -38,13 +14,8 @@ BUNDLED_MANIFEST_NAME = "bundled.json"
 
 
 def bundled_dir():
-    """The Patch/ folder that ships next to the executable.
-
-    Deliberately not paths._app_dir(): that returns the folder holding
-    tavern_shared/ when running from source, so it resolves to
-    tavern_shared/Patch and every lookup here silently misses in dev --
-    which is how the first fallback went untested outside a frozen build.
-    Same convention addon_loader.addons_dir() already uses for addons/."""
+    """The Patch/ folder next to the executable, or next to tavern_shared/ when
+    running from source (paths._app_dir would point inside tavern_shared/)."""
     if getattr(sys, "frozen", False):
         base = os.path.dirname(sys.executable)
     else:
@@ -53,11 +24,8 @@ def bundled_dir():
 
 
 def load_manifest():
-    """Patch/bundled.json as a dict, or {} if it's absent or unreadable.
-
-    Absent is a normal state, not an error: a build that ships no offline
-    copies is exactly the download-only behaviour this replaced, and every
-    caller already has to handle "no usable payload" anyway."""
+    """Patch/bundled.json as a dict, or {} if absent or unreadable; a build may
+    ship no offline copies at all."""
     try:
         with open(os.path.join(bundled_dir(), BUNDLED_MANIFEST_NAME),
                   "r", encoding="utf-8") as f:
@@ -68,12 +36,8 @@ def load_manifest():
 
 
 def verified_payload(component):
-    """The path to the shipped copy of `component`, or None.
-
-    None covers every way it could be unusable -- no manifest entry, no
-    file, wrong size, wrong hash -- because the caller does the same thing
-    in all of them. The size check is redundant against the hash and runs
-    first anyway: it rejects a truncated 20MB zip without reading it."""
+    """The path to the shipped copy of `component`, or None if it has no entry,
+    is missing, or fails its recorded size or sha256."""
     entry = load_manifest().get(component)
     if not isinstance(entry, dict):
         return None
@@ -96,18 +60,9 @@ def bundled_tag(component):
 
 
 def _tag_order(tag):
-    """A release tag as a comparable tuple, or None if it isn't orderable.
-
-    GitHub tags carry a leading 'v' that _parse_version rejects, and the
-    launcher's own version grammar is deliberately strict (exactly three
-    numeric segments, no pre-release suffixes). Anything outside that is
-    None rather than a guess -- callers treat "can't order these" as "don't
-    substitute", which is the safe direction.
-
-    Imported here rather than at module scope to break a cycle: mod_install
-    imports this module, and tavern_shared.mods (the package _parse_version
-    lives in) imports mod_install on the way through mods.install. By the
-    time anything calls this, both are fully loaded."""
+    """A release tag ("v1.2.3") as a comparable tuple, or None when it isn't
+    three numeric segments; callers treat None as "don't substitute". Imports
+    lazily: tavern_shared.mods imports mod_install, which imports this."""
     if not isinstance(tag, str):
         return None
     from tavern_shared.mods.errors import ModManagerError
@@ -119,20 +74,11 @@ def _tag_order(tag):
 
 
 def usable_payload(component, install_broken, installed_tag):
-    """The shipped copy of `component` if installing it now would leave this
-    machine better off than it is, else None.
-
-    install_broken is the caller's local, network-free reading of "there is
-    nothing here worth protecting" -- missing, failing its recorded hash, or
-    installed without a complete record. Any verified copy beats those, so
-    it wins outright.
-
-    Otherwise there IS a working install and the only reason to overwrite it
-    is a genuinely newer snapshot. Equal tags are refused as well as older
-    ones: reinstalling the same release fixes nothing and would relabel a
-    real online install as an offline one. If either tag can't be ordered,
-    that's a refusal too -- the caller falls through to raising, and the
-    user gets manual-install instructions rather than a silent downgrade."""
+    """The shipped copy of `component` if installing it now improves things,
+    else None. install_broken is the caller's network-free "nothing here worth
+    protecting" reading, and any verified copy beats that. Otherwise only a
+    strictly newer tag than installed_tag qualifies; equal or unorderable tags
+    refuse, so a working install is never downgraded or relabelled offline."""
     path = verified_payload(component)
     if not path:
         return None
