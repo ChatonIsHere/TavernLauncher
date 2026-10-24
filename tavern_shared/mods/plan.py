@@ -9,7 +9,8 @@ from tavern_shared.mods.cache import (
 )
 from tavern_shared.mods.errors import ModManagerError, _warn
 from tavern_shared.mods.install import (
-    _read_mod_record, collect_library_dependencies, disable_mod, enable_mod,
+    _check_folder_libraries, _read_mod_record, _record_libraries,
+    collect_library_dependencies, disable_mod, enable_mod, has_target,
     install_mod, list_installed_mods, verify_mod_files,
 )
 from tavern_shared.mods.layout import (
@@ -22,6 +23,24 @@ from tavern_shared.mods.resolve import (
     _fetch_manifest, _index_source, resolve_dependencies,
 )
 from tavern_shared.mods.version import _parse_version
+
+
+# Joins only run in the client launcher, which installs pc builds whatever the
+# server runs and whichever scene it's in.
+CLIENT_TARGET = "pc"
+
+
+def _offers_client(server_entry):
+    """Whether a handshake entry has a pc build: the only ones a joining
+    client acts on. One without (server-only, or quest-only) is left alone."""
+    targets = server_entry.get("targets")
+    return isinstance(targets, list) and CLIENT_TARGET in targets
+
+
+def _client_records(game_dir):
+    """{id: record} of the mods installed here for pc. A mod installed only
+    for the server in the same folder isn't the client's to plan around."""
+    return {r["id"]: r for r in list_installed_mods(game_dir) if has_target(r, CLIENT_TARGET)}
 
 
 @dataclass
@@ -68,7 +87,8 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
     (server, not declined) + their dependency closure + pinned, diffed against
     disk and cache. The plan, not the render.
 
-    server_mods: the handshake's mods list; only client_side entries matter.
+    server_mods: the handshake's mods list; only entries whose targets
+    include pc matter.
     parity_required true goes in and blocks if unresolvable; false goes in by
     default but can be declined, and is never deactivated for that.
     index / repo_bases: the client's merged index and its own repos, the only
@@ -80,7 +100,7 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
     pinned = pinned or []
     declined = set(declined or [])
 
-    client_mods = [m for m in server_mods if m.get("client_side")]
+    client_mods = [m for m in server_mods if _offers_client(m)]
     required = {m["id"]: m["version"] for m in client_mods
                 if parity_required(m)}
     recommended = {m["id"]: m["version"] for m in client_mods
@@ -103,6 +123,10 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
         try:
             manifest = _fetch_manifest(repo_bases, mod_id, version,
                                        _index_source(index, mod_id, repo_bases, version))
+            # The server says it has one; a manifest saying otherwise can't
+            # be installed here either way.
+            if manifest.artifact_for(CLIENT_TARGET) is None:
+                raise ModManagerError(f"{mod_id} {version} has no pc build.")
         except ModManagerError:
             if tag == "pinned":
                 unresolved_pins.append((mod_id, version))
@@ -164,22 +188,23 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
     def fetch_manifest(mod_id, version, source_repo):
         return _fetch_manifest(repo_bases, mod_id, version, prefer_repo=source_repo)
 
-    # Always "client": joins only run in the client launcher.
-    dependencies = resolve_dependencies(roots, index, fetch_manifest, "client") if roots else []
+    dependencies = (resolve_dependencies(roots, index, fetch_manifest, CLIENT_TARGET)
+                    if roots else [])
     for dep in dependencies:
         reason.setdefault(dep.id, "dependency")
 
     all_mods = roots + dependencies
-    installed = {rec["id"]: rec for rec in list_installed_mods(game_dir)}
+    installed = _client_records(game_dir)
 
     entries = []
     for mod in all_mods:
-        cached = os.path.isdir(_cache_mod_dir(mod.id, mod.version))
+        cached = os.path.isdir(_cache_mod_dir(mod.id, mod.version,
+                                              mod.artifact_for(CLIENT_TARGET).sha256))
         rec = installed.get(mod.id)
         # A damaged copy at the right version isn't a match: the join has to
         # repair it or the game launches broken.
         active = bool(rec and rec.get("enabled") and rec.get("version") == mod.version
-                      and verify_mod_files(game_dir, mod.id) is not False)
+                      and verify_mod_files(game_dir, mod.id, CLIENT_TARGET) is not False)
         entries.append(PlanEntry(mod_id=mod.id, version=mod.version, source_repo=mod.source_repo,
                                   reason=reason.get(mod.id, "required"), cached=cached, active=active,
                                   manifest=mod))
@@ -190,7 +215,12 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
                       if rec.get("enabled") and mod_id not in active_ids
                       and mod_id not in declined]
 
-    libraries = collect_library_dependencies(all_mods) if all_mods else []
+    libraries = collect_library_dependencies(all_mods, CLIENT_TARGET) if all_mods else []
+    # Against what stays enabled after the render: the join prunes the
+    # libraries of anything it disables, the host's server-only mods included
+    # in what it keeps.
+    _check_folder_libraries(game_dir, all_mods, CLIENT_TARGET, libraries,
+                            enabled_only=True, ignore=set(to_deactivate))
 
     return JoinPlan(entries=entries, to_deactivate=to_deactivate, libraries=libraries,
                     missing=missing, needs_repo=needs_repo, pin_conflicts=pin_conflicts,
@@ -265,8 +295,8 @@ def build_mod_diff(game_dir, server_mods, plan):
     """One DiffRow per mod on either side of a JoinPlan, problems first then by
     display name. Only deactivations and recommendations are optional: the
     server's parity check can't fail over either."""
-    installed = {r["id"]: r for r in list_installed_mods(game_dir)}
-    required = {m["id"]: m.get("version", "") for m in server_mods if m.get("client_side")}
+    installed = _client_records(game_dir)
+    required = {m["id"]: m.get("version", "") for m in server_mods if _offers_client(m)}
     conflicts = {mid: (pv, sv) for mid, pv, sv in plan.pin_conflicts}
 
     rows = []
@@ -275,7 +305,7 @@ def build_mod_diff(game_dir, server_mods, plan):
         cv = rec.get("version", "") if rec else ""
         enabled = bool(rec.get("enabled")) if rec else False
         damaged = (not e.active and cv == e.version
-                   and verify_mod_files(game_dir, e.mod_id) is False)
+                   and verify_mod_files(game_dir, e.mod_id, CLIENT_TARGET) is False)
         if e.active:
             action = ACTION_MATCH
         elif rec is None or damaged:
@@ -336,11 +366,12 @@ def build_mod_diff(game_dir, server_mods, plan):
             reason="recommended", optional=True,
             note="you've chosen not to install this one for this server")
     for m in server_mods:
-        if not m.get("client_side"):
+        if not _offers_client(m):
             add(m["id"], server_version=m.get("version", ""), client_version="",
                 client_enabled=False, action=ACTION_SERVER_ONLY, reason="",
                 optional=False, source_repo=m.get("source_repo", ""),
-                note="runs on the server only", name=m.get("name", m["id"]))
+                note="it has no PC build, so the server runs it without you",
+                name=m.get("name", m["id"]))
     for mod_id, version in plan.missing:
         add(mod_id, server_version=version, action=ACTION_MISSING, reason="required",
             optional=False, source_repo="", note="not in any source you've added")
@@ -365,12 +396,13 @@ def build_mod_diff(game_dir, server_mods, plan):
 
 def _prune_orphaned_libraries(game_dir):
     """Removes (after caching) every UserLibs/ library no ENABLED mod's record
-    pins. Enabled-only is safe here because enabling again runs a library
-    pass; uninstall_mod has no such pass and keeps disabled mods' libraries."""
+    pins, for any target: a host's server-only mods keep theirs. Enabled-only
+    is safe here because enabling again runs a library pass; uninstall_mod
+    has no such pass and keeps disabled mods' libraries."""
     still_needed = set()
     for rec in list_installed_mods(game_dir):
         if rec.get("enabled"):
-            still_needed.update(rec.get("libraries", []))
+            still_needed |= _record_libraries(rec)
 
     libs_dir = _userlibs_dir(game_dir)
     for name in os.listdir(libs_dir):
@@ -418,25 +450,28 @@ def render_active_set(game_dir, plan, on_progress=None, on_step=None):
         step(entry.mod_id, "start")
         rec = _read_mod_record(game_dir, entry.mod_id)
         disabled_here = (bool(rec) and rec.get("version") == entry.version
+                         and has_target(rec, CLIENT_TARGET)
                          and os.path.isfile(_disabled_record_path(game_dir, entry.mod_id))
-                         and verify_mod_files(game_dir, entry.mod_id) is not False)
+                         and verify_mod_files(game_dir, entry.mod_id, CLIENT_TARGET) is not False)
         if disabled_here:
             progress(f"Enabling {entry.mod_id} {entry.version}")
             enable_mod(game_dir, entry.mod_id)
         elif entry.cached:
             progress(f"Installing {entry.mod_id} {entry.version} (cached)")
             try:
-                cache_restore_mod(game_dir, entry.mod_id, entry.version)
+                cache_restore_mod(game_dir, entry.mod_id, entry.version,
+                                  entry.manifest.artifact_for(CLIENT_TARGET).sha256,
+                                  CLIENT_TARGET)
             except ModManagerError as e:
                 # Vanished or failed its check (and was discarded) since
                 # planning: download it instead.
                 progress(f"Cache copy unusable ({e}) - downloading instead")
-                install_mod(game_dir, entry.manifest, progress)
-                cache_store_mod(game_dir, entry.mod_id)
+                install_mod(game_dir, entry.manifest, CLIENT_TARGET, progress)
+                cache_store_mod(game_dir, entry.mod_id, CLIENT_TARGET)
         else:
             progress(f"Downloading {entry.mod_id} {entry.version}")
-            install_mod(game_dir, entry.manifest, progress)
-            cache_store_mod(game_dir, entry.mod_id)
+            install_mod(game_dir, entry.manifest, CLIENT_TARGET, progress)
+            cache_store_mod(game_dir, entry.mod_id, CLIENT_TARGET)
         step(entry.mod_id, "done")
 
     for lib in plan.libraries:
@@ -449,7 +484,7 @@ def render_active_set(game_dir, plan, on_progress=None, on_step=None):
         step(mod_id, "start")
         progress(f"Deactivating {mod_id}")
         # Disabled, not uninstalled: it comes back with a rename.
-        cache_store_mod(game_dir, mod_id)
+        cache_store_mod(game_dir, mod_id, CLIENT_TARGET)
         disable_mod(game_dir, mod_id)
         step(mod_id, "done")
 
@@ -466,9 +501,15 @@ def resolve_missing_mods(missing, index, repo_bases):
     for entry in missing:
         mod_id, version = entry["id"], entry["version"]
         try:
-            roots.append(_fetch_manifest(repo_bases, mod_id, version,
-                                         _index_source(index, mod_id, repo_bases, version)))
+            root = _fetch_manifest(repo_bases, mod_id, version,
+                                   _index_source(index, mod_id, repo_bases, version))
         except ModManagerError:
+            root = None
+        if root is not None and root.artifact_for(CLIENT_TARGET) is None:
+            unresolved.append(f"{mod_id} {version} (it has no PC build)")
+        elif root is not None:
+            roots.append(root)
+        else:
             hint = entry.get("source_repo")
             if hint and _norm(hint) not in [_norm(b) for b in repo_bases]:
                 unresolved.append(f"{mod_id} {version} (available from {hint}, "
@@ -483,5 +524,6 @@ def resolve_missing_mods(missing, index, repo_bases):
     def fetch_manifest(mod_id, version, source_repo):
         return _fetch_manifest(repo_bases, mod_id, version, prefer_repo=source_repo)
 
-    dependencies = resolve_dependencies(roots, index, fetch_manifest, "client") if roots else []
+    dependencies = (resolve_dependencies(roots, index, fetch_manifest, CLIENT_TARGET)
+                    if roots else [])
     return roots, dependencies

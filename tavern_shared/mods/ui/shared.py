@@ -1,7 +1,7 @@
 """What the Mod Manager and Community Mods windows both need. The two are one
 browse-and-install surface split across two Toplevels, so the pieces that must
 behave identically from either - the Install action, the busy/refresh cycle,
-side filtering, source naming - live here once instead of drifting apart as
+target filtering, source naming - live here once instead of drifting apart as
 two copies."""
 import tkinter as tk
 from tkinter import messagebox
@@ -12,14 +12,30 @@ from tavern_shared.mod_install import (
     _melonloader_installed, _tavernlib_installed,
 )
 from tavern_shared.mods.hostcfg import load_cfg
-from tavern_shared.mods.install import install_mod_closure, mod_status
+from tavern_shared.mods.install import (
+    _is_pre_v2, has_target, install_mod_closure, mod_status,
+)
 from tavern_shared.mods.manifest import runs_in_scene
 from tavern_shared.mods.repos import _is_default, _source_display, list_repos
 
 
-def meta_matches_side(meta, side):
-    key = "client_side" if side == "client" else "server_side"
-    return meta.get(key, True)
+def record_matches_target(rec, target):
+    """Whether the launcher installing `target` lists this record: it holds
+    that target, or predates manifest v2 (listed as damaged, so a reinstall
+    moves it to the per-target layout)."""
+    return has_target(rec, target) or _is_pre_v2(rec)
+
+
+_TARGET_NAMES = {"pc": "PC", "server": "Server", "quest": "Quest"}
+
+
+def target_label(targets):
+    """"PC + Server", "Server only", ... for a mod's targets."""
+    names = [_TARGET_NAMES.get(t, t) for t in sorted(targets, key=list(_TARGET_NAMES).index)
+             if t in _TARGET_NAMES]
+    if not names:
+        return "-"
+    return names[0] + " only" if len(names) == 1 else " + ".join(names)
 
 
 def source_label(source_repo):
@@ -51,12 +67,12 @@ class ModListWindow(tk.Toplevel):
         ids = self._state_ids()
         if not ids:
             return
-        index, game_dir = self._index, self._game_dir
+        index, game_dir, target = self._index, self._game_dir, self._target
         def check():
             states = {}
             for mod_id in ids:
                 try:
-                    states[mod_id] = mod_status(game_dir, mod_id, index)
+                    states[mod_id] = mod_status(game_dir, mod_id, index, target)
                 except Exception:
                     states[mod_id] = "unknown"
             return states
@@ -78,7 +94,7 @@ def install_mod_flow(win, mod, version=None):
     """The Install action behind both windows' buttons: installs `mod`'s
     closure, at `version` if given, else mod.highest(). `win` is either
     window - both carry the ModListWindow machinery and the
-    _game_dir/_side/_is_game_running attributes this drives.
+    _game_dir/_target/_is_game_running attributes this drives.
 
     The cheap prerequisite checks come first, the game-running guard last,
     immediately before the worker: the guard exists for the write it precedes,
@@ -112,11 +128,11 @@ def install_mod_flow(win, mod, version=None):
         return
     label = f"{mod.name} {version}" if version else mod.name
     win._set_busy(True, f"Installing {label}...")
-    index, game_dir, side = win._index, win._game_dir, win._side
+    index, game_dir, target = win._index, win._game_dir, win._target
     def install():
         install_mod_closure(game_dir, mod, index, list_repos(load_cfg()),
                             lambda m: post(win, win._status.set, m),
-                            side, version=version)
+                            target, version=version)
     run_bg(win, install,
            on_ok=lambda _: win._finish(f"{label} installed."),
            on_err=lambda e: win._finish(f"Install failed: {e}"))

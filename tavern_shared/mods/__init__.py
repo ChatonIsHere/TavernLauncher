@@ -12,8 +12,9 @@ from tavern_shared.mods.manifest import (
 )
 from tavern_shared.mods.repos import fetch_indexes, list_repos
 from tavern_shared.mods.install import (
-    collect_library_dependencies, handshake_snapshot, install_library_dependency,
-    install_mod, install_mod_set, list_installed_mods, mod_status,
+    collect_library_dependencies, handshake_snapshot, has_target,
+    install_library_dependency, install_mod, install_mod_set, installed_targets,
+    list_installed_mods, mod_status,
 )
 from tavern_shared.mods.cache import adopt_installed_mods
 from tavern_shared.mods.pins import add_pin, list_declined, list_pinned, set_declined

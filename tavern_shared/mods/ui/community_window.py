@@ -16,7 +16,8 @@ from tavern_shared.mods.install import list_installed_mods, list_mods
 from tavern_shared.mods.repos import fetch_indexes, list_repos
 from tavern_shared.mods.resolve import resolve_mod_by_id
 from tavern_shared.mods.ui.shared import (
-    ModListWindow, install_mod_flow, meta_matches_side, source_label,
+    ModListWindow, install_mod_flow, record_matches_target, source_label,
+    target_label,
 )
 from tavern_shared.mods.ui.sources_window import ModSourcesWindow
 
@@ -29,8 +30,8 @@ _DEPS_CACHE = {}
 
 class CommunityModsWindow(ModListWindow):
     """Card-based browser for community mods pulled from the configured sources.
-    Lists every available mod - description, dependencies, client/server/parity
-    info and all - with a per-card install/update/reinstall button, plus a
+    Lists every mod with a build for this launcher's target - description,
+    dependencies, targets/parity info and all - with a per-card install/update/reinstall button, plus a
     search box over name/author/id/description. A way of ADDING mods. Managing
     what's already installed (uninstall, enable/disable, keep-enabled, change
     version, import/export) lives one level up in ModManagerWindow, which this
@@ -57,14 +58,7 @@ class CommunityModsWindow(ModListWindow):
         "current":  "Reinstall",
         "unknown":  "Reinstall",
     }
-    _SIDE_LABEL = {
-        (True, True):   "Client + Server",
-        (True, False):  "Client Only",
-        (False, True):  "Server Only",
-        (False, False): "-",
-    }
-
-    def __init__(self, parent, game_dir, side="client", on_change=None,
+    def __init__(self, parent, game_dir, target="pc", on_change=None,
                  is_game_running=None, server_scene=None):
         super().__init__(parent)
         self.title("Community Mods")
@@ -72,7 +66,7 @@ class CommunityModsWindow(ModListWindow):
         self.geometry("860x580")
         self.minsize(760, 440)
         self._game_dir  = game_dir
-        self._side      = side
+        self._target    = target
         self._on_change = on_change
         # Handed down from the Mod Manager, so an install from here asks the
         # same questions as one from there.
@@ -133,7 +127,7 @@ class CommunityModsWindow(ModListWindow):
         self._refresh_btn = _btn(bar, "Refresh", lambda: self._load(force=True),
                                  style="dim", font=("Segoe UI",9), pady=5, padx=12)
         self._refresh_btn.pack(side="right")
-        if self._side == "client":
+        if self._target == "pc":
             self._clear_cache_btn = _btn(bar, "Clear Mod Cache", self._on_clear_cache,
                                          style="dim", font=("Segoe UI",9), pady=5, padx=12)
             self._clear_cache_btn.pack(side="right", padx=(0,8))
@@ -147,11 +141,11 @@ class CommunityModsWindow(ModListWindow):
 
     def _load(self, force=False):
         self._set_busy(True, "Loading community mods...")
-        game_dir, side = self._game_dir, self._side
+        game_dir, target = self._game_dir, self._target
         def load():
             repos = list_repos(load_cfg())
             index = fetch_indexes(repos, force=force)
-            return repos, index, list_mods(index, side), list_installed_mods(game_dir)
+            return repos, index, list_mods(index, target), list_installed_mods(game_dir)
         run_bg(self, load, on_ok=lambda r: self._render(*r),
                on_err=lambda e: self._set_busy(False, f"Couldn't load community mods: {e}"))
 
@@ -171,7 +165,7 @@ class CommunityModsWindow(ModListWindow):
             rows[s.id] = {
                 "id": s.id, "name": s.name, "author": s.author or "",
                 "description": s.description or "",
-                "client_side": s.client_side, "server_side": s.server_side,
+                "targets": s.targets,
                 "parity_required": s.parity_required,
                 "scenes": s.scenes,
                 "latest": s.highest(), "source": source_label(s.source_repo),
@@ -182,7 +176,7 @@ class CommunityModsWindow(ModListWindow):
 
     def _installed_versions(self, installed):
         return {m["id"]: m.get("version", "?") for m in installed
-                if m.get("id") and meta_matches_side(m, self._side)}
+                if m.get("id") and record_matches_target(m, self._target)}
 
     # -- card rendering --
 
@@ -263,9 +257,8 @@ class CommunityModsWindow(ModListWindow):
                   style="primary", font=("Segoe UI",9), pady=4, padx=10, width=11)
         btn.pack(side="right", padx=(6,10))
 
-        side_text = self._SIDE_LABEL[(r["client_side"], r["server_side"])]
         parity_text = "Exact version required" if r["parity_required"] else "Any compatible version"
-        tag_text = f"{side_text}  ·  {parity_text}"
+        tag_text = f"{target_label(r['targets'])}  ·  {parity_text}"
         if r.get("scenes"):
             # Shown only when a mod narrows it down; no segment means every scene.
             tag_text += "  ·  " + ", ".join(s.capitalize() for s in r["scenes"]) + " scene" \

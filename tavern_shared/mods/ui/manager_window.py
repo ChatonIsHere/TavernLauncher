@@ -18,8 +18,8 @@ from tavern_shared.mods.errors import ModManagerError
 from tavern_shared.mods.hostcfg import load_cfg
 from tavern_shared.mods.install import (
     _invalidate_verify_memo, disable_mod, disable_untracked_dll, enable_mod,
-    enable_untracked_dll, list_installed_mods, list_untracked_mods,
-    uninstall_mod,
+    enable_untracked_dll, installed_targets, list_installed_mods,
+    list_untracked_mods, uninstall_mod,
 )
 from tavern_shared.mods.modlist import (
     apply_import, export_modlist, import_modlist, modlist_import_disables,
@@ -30,7 +30,8 @@ from tavern_shared.mods.pins import (
 from tavern_shared.mods.repos import fetch_indexes, list_repos
 from tavern_shared.mods.ui.community_window import CommunityModsWindow
 from tavern_shared.mods.ui.shared import (
-    ModListWindow, install_mod_flow, meta_matches_side, source_label,
+    ModListWindow, install_mod_flow, record_matches_target, source_label,
+    target_label,
 )
 from tavern_shared.mods.ui.version_window import ModVersionWindow
 from tavern_shared.mods.version import _parse_version
@@ -58,7 +59,7 @@ class ModManagerWindow(ModListWindow):
         "unknown":  "Installed",
     }
 
-    def __init__(self, parent, game_dir, side="client", on_change=None,
+    def __init__(self, parent, game_dir, target="pc", on_change=None,
                  is_game_running=None, server_scene=None):
         super().__init__(parent)
         self.title("Mod Manager")
@@ -66,7 +67,7 @@ class ModManagerWindow(ModListWindow):
         self.geometry("800x480")
         self.minsize(680, 380)
         self._game_dir  = game_dir
-        self._side      = side
+        self._target    = target
         self._on_change = on_change
         # Optional "is the game up?" check (see tavern_shared.game_guard),
         # asked by the actions that write into Mods/.
@@ -92,9 +93,9 @@ class ModManagerWindow(ModListWindow):
         h = _window_header(self, "Mod Manager")
         _btn(h, "Community Mods", self._open_community, style="dim",
              font=("Segoe UI",9), pady=4, padx=10).pack(side="right", padx=12)
-        # Modlist import/export applies to both sides - a client's Mods/ and
-        # a launcher-run server's Mods/ are both real installed sets that can
-        # be exported, and either can import one (the same file a headless
+        # Modlist import/export applies to both targets - a client's pc set
+        # and a launcher-run server's server set are both real installed sets
+        # that can be exported, and either can import one (the same file a headless
         # server's /modlist can point at directly, with zero conversion -
         # see export_modlist/import_modlist).
         _btn(h, "Import Modlist", self._on_import_modlist, style="dim",
@@ -167,7 +168,7 @@ class ModManagerWindow(ModListWindow):
 
     def _render(self, index, on_disk):
         self._index = index
-        if self._side == "client":
+        if self._target == "pc":
             self._pinned_ids = {_parse_pin_entry(p)[0] for p in list_pinned(load_cfg())}
         self._apply_installed(on_disk)
         self._set_busy(False, "")
@@ -197,7 +198,7 @@ class ModManagerWindow(ModListWindow):
         rows = {}
         for meta in installed:
             mod_id = meta.get("id")
-            if not mod_id or not meta_matches_side(meta, self._side):
+            if not mod_id or not record_matches_target(meta, self._target):
                 continue
             s = summaries.get(mod_id)
             rows[f"m:{mod_id}"] = {
@@ -210,6 +211,7 @@ class ModManagerWindow(ModListWindow):
                 "source": source_label(s.source_repo) if s else "-",
                 "summary": s, "state": "unknown",
                 "enabled": meta.get("enabled", True),
+                "targets": installed_targets(meta),
             }
         for u in untracked:
             rows[f"u:{u['kind']}:{u['name']}"] = {
@@ -308,7 +310,7 @@ class ModManagerWindow(ModListWindow):
         menu.add_command(label="Enable" if not r["enabled"] else "Disable",
                          command=self._on_toggle)
 
-        if managed and self._side == "client":
+        if managed and self._target == "pc":
             menu.add_separator()
             # Kept alive on self so Tk's variable trace survives past this
             # call - a BooleanVar with no surviving Python reference can be
@@ -348,10 +350,15 @@ class ModManagerWindow(ModListWindow):
         r = self._rows.get(sel) if sel else None
         if not r or r["kind"] != "managed":
             return
+        # One folder holds every target, so on a machine that both plays and
+        # hosts, removing it here removes the other launcher's copy too.
+        others = [t for t in r["targets"] if t != self._target]
+        also = (f" It's also installed for {target_label(others).replace(' only', '')} "
+                f"in this game folder, which goes too." if others else "")
         if not messagebox.askyesno("Remove mod",
                 f"Remove {r['name']} from your game?\n\nThis deletes its folder from "
-                "Mods/. Libraries shared with other installed mods are left in place.",
-                parent=self):
+                f"Mods/.{also} Libraries shared with other installed mods are left "
+                f"in place.", parent=self):
             return
         # Asked after the confirm, right before the rmtree: the confirm only
         # blocks this window, so the player can hop to the main launcher and
@@ -421,7 +428,7 @@ class ModManagerWindow(ModListWindow):
         if self._community_win and self._community_win.winfo_exists():
             self._community_win.lift(); return
         self._community_win = CommunityModsWindow(
-            self, self._game_dir, side=self._side,
+            self, self._game_dir, target=self._target,
             on_change=self._community_changed,
             is_game_running=self._is_game_running,
             server_scene=self._server_scene)
@@ -447,7 +454,8 @@ class ModManagerWindow(ModListWindow):
             "No: each mod tracks whatever's latest when this file is later "
             "imported (a living modpack reference).", parent=self)
         try:
-            modlist = export_modlist(self._game_dir, load_cfg(), pin_versions=pin)
+            modlist = export_modlist(self._game_dir, load_cfg(), self._target,
+                                     pin_versions=pin)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(modlist, f, indent=2)
             # Untracked mods are counted separately, not folded into the total:
@@ -476,9 +484,9 @@ class ModManagerWindow(ModListWindow):
             return
 
         self._set_busy(True, "Resolving modlist...")
-        index, game_dir, side = self._index, self._game_dir, self._side
+        index, game_dir, target = self._index, self._game_dir, self._target
         def resolve():
-            plan = import_modlist(modlist, index, list_repos(load_cfg()), side)
+            plan = import_modlist(modlist, index, list_repos(load_cfg()), target, game_dir)
             return plan, modlist_import_disables(game_dir, plan)
         run_bg(self, resolve, on_ok=lambda r: self._confirm_import(*r),
                on_err=lambda e: self._set_busy(False, f"Import failed: {e}"))
@@ -498,6 +506,10 @@ class ModManagerWindow(ModListWindow):
             lines += [f"  • {mid}" + (f" {v}" if v else "") for mid, v in plan.unresolved]
             if plan.hinted_repos:
                 lines.append("This modlist expects sources: " + ", ".join(plan.hinted_repos))
+        if plan.no_build:
+            lines.append(f"Left out - no {target_label([plan.target]).replace(' only', '')} "
+                         f"build, so they can't run here:")
+            lines += [f"  • {mid} {v}" for mid, v in plan.no_build]
         # Listed last and phrased as a to-do, not a failure: nothing here blocks
         # the import, and there's nothing the launcher could do about it anyway.
         # Saying so beats an import that quietly reproduces less than the file
@@ -512,7 +524,7 @@ class ModManagerWindow(ModListWindow):
         if not all_mods and not to_disable:
             messagebox.showinfo("Nothing to import",
                 "\n".join(lines + ["", "There's nothing new to install or disable."])
-                if plan.untracked else
+                if plan.untracked or plan.no_build else
                 "This modlist has nothing new to install or disable.", parent=self)
             return
         if not messagebox.askyesno("Import modlist",

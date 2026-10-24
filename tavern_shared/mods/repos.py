@@ -23,7 +23,7 @@ CFG_REPOS_KEY = "mod_repos"
 
 # repository.json's own schema major, separate from the manifest's; any other
 # index is skipped whole.
-SUPPORTED_INDEX_MAJOR = 1
+SUPPORTED_INDEX_MAJOR = 2
 
 
 # In-memory index cache lifetime; callers pass force=True after a repo edit.
@@ -108,6 +108,11 @@ def add_repo(cfg, url):
             "That URL didn't serve a valid mod index (no 'mods' object in "
             "repository.json). Double-check it's the raw-content base URL of a "
             "correctly structured repo.")
+    if index.get("index_version") != SUPPORTED_INDEX_MAJOR:
+        raise ModManagerError(
+            f"That repository's index is schema v{index.get('index_version')}, and "
+            f"this launcher reads v{SUPPORTED_INDEX_MAJOR} only, so it would list "
+            f"nothing from it.")
 
     shorthand = _repo_shorthand(url)
     named = _named_repos(cfg)
