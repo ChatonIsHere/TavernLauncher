@@ -16,6 +16,7 @@ that an end user's install would use.
 import json
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -41,27 +42,43 @@ def _quiet(message):
 
 
 def refresh():
+    """Downloads every target to a temp file beside its destination, verifies
+    it, and only once all of them have succeeded swaps them in and rewrites
+    bundled.json. Any failure leaves Patch/ exactly as it was, still matching
+    the manifest that describes it."""
     dest_dir = bundled_dir()
     os.makedirs(dest_dir, exist_ok=True)
-    manifest = {}
-    for component, url, filename, kind, extra in TARGETS:
-        dest = os.path.join(dest_dir, filename)
-        tag = _get_latest_release_tag(url)
-        if not tag:
-            # Without a tag the payload can't be ordered against an installed
-            # version, so usable_payload would refuse to ever use it. Shipping
-            # it anyway would be dead weight that looks like a fallback.
-            raise RuntimeError(f"Couldn't resolve the release tag for {component} from {url}")
-        _download_with_retries(url, dest, _quiet, require_length=True)
-        _verify_payload_type(dest, url, kind)
-        manifest[component] = dict(
-            filename=filename, tag=tag, sha256=_sha256_file(dest),
-            size=os.path.getsize(dest), **extra)
-        print(f"  {component:12} {tag:10} {os.path.getsize(dest):>12,} bytes")
+    manifest, staged = {}, []
+    try:
+        for component, url, filename, kind, extra in TARGETS:
+            tag = _get_latest_release_tag(url)
+            if not tag:
+                # usable_payload can't order an untagged payload, so it would
+                # never be used: dead weight that looks like a fallback.
+                raise RuntimeError(f"Couldn't resolve the release tag for {component} from {url}")
+            fd, tmp = tempfile.mkstemp(prefix=f".{filename}.", suffix=".part", dir=dest_dir)
+            os.close(fd)
+            staged.append((tmp, os.path.join(dest_dir, filename)))
+            _download_with_retries(url, tmp, _quiet, require_length=True)
+            _verify_payload_type(tmp, url, kind)
+            manifest[component] = dict(
+                filename=filename, tag=tag, sha256=_sha256_file(tmp),
+                size=os.path.getsize(tmp), **extra)
 
-    with open(os.path.join(dest_dir, BUNDLED_MANIFEST_NAME), "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, sort_keys=True)
-        f.write("\n")
+        fd, manifest_tmp = tempfile.mkstemp(prefix=".bundled.", suffix=".part", dir=dest_dir)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, sort_keys=True)
+            f.write("\n")
+        staged.append((manifest_tmp, os.path.join(dest_dir, BUNDLED_MANIFEST_NAME)))
+        for tmp, dest in staged:
+            os.replace(tmp, dest)
+    finally:
+        for tmp, _dest in staged:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+    for component, entry in manifest.items():
+        print(f"  {component:12} {entry['tag']:10} {entry['size']:>12,} bytes")
     return manifest
 
 
