@@ -434,23 +434,13 @@ def install_library_dependency(game_dir, lib, on_progress):
 
 
 def install_mod_closure(game_dir, mod, index, repo_bases, on_progress, side, version=None):
-    """Installs a mod AND its full closure, the flow a single COMMUNITY MODS
-    click runs. `mod` is the ModSummary the user picked; its manifest is
-    fetched at `version` if given, else mod.highest() (the ordinary
-    install/update path; an explicit version is how Community Mods' right-click
-    "Change Version" installs an older/different release instead), then
-    resolve_dependencies walks the graph fetching each dependency's manifest,
-    and collect_library_dependencies gathers the pinned libraries. Every
-    cycle/depth/diamond/library conflict is surfaced (and every manifest
-    fetched) BEFORE anything touches disk. A mod with no dependencies is just
-    the degenerate case: empty closure, one install_mod.
-
-    `side` is this launcher's own ("client" or "server"), passed straight to
-    resolve_dependencies so a dependency that can't run here is left out rather
-    than installed into a process that would crash loading it.
-
-    Manifests fetched during a single closure are cached, so a diamond (two mods
-    needing the same dependency) fetches it once."""
+    """Installs a mod and its full closure: the flow one Community Mods click
+    runs. `mod` is the picked ModSummary, fetched at `version` if given (Change
+    Version), else mod.highest(). `side` ("client"/"server") is this
+    launcher's own, so a dependency that can't load here is left out. Every
+    cycle/depth/diamond/library conflict surfaces before anything touches
+    disk; then install_mod_set puts dependencies in before the root (as
+    TavernLib does), so a failure partway leaves a loadable set."""
     fetched = {}     # (id, version) -> ModManifest
 
     def fetch(mod_id, version, source_repo):
@@ -461,23 +451,50 @@ def install_mod_closure(game_dir, mod, index, repo_bases, on_progress, side, ver
 
     root = fetch(mod.id, version or mod.highest(), mod.source_repo)
     deps = resolve_dependencies([root], index, fetch, side)
-    all_mods = [root] + deps
-    libs = collect_library_dependencies(all_mods)     # raises on conflict before any download
+    install_mod_set(game_dir, deps + [root], on_progress)
 
-    total = len(all_mods) + len(libs)
-    step = {"n": 0}
 
-    def stepped(label):
-        def report(msg):
-            on_progress(f"[{step['n']}/{total}] {label}: {msg}")
-        return report
+def _already_installed(game_dir, mod):
+    """Mods/<id>/ is ours, enabled, at exactly mod.version, and not damaged."""
+    rec = _read_sidecar(_mod_record_path(game_dir, mod.id))
+    if not rec or rec.get("id") != mod.id or rec.get("version") != mod.version:
+        return False
+    try:
+        parity_required(rec)
+    except ModManagerError:
+        return False
+    return verify_mod_files(game_dir, mod.id) is not False
 
-    for m in all_mods:
-        step["n"] += 1
-        install_mod(game_dir, m, stepped(m.name))
-    for lib in libs:
-        step["n"] += 1
-        install_library_dependency(game_dir, lib, stepped(lib.name))
+
+def install_mod_set(game_dir, mods, on_progress=None):
+    """Installs an already-resolved set of mods (ModManifests, installed in the
+    order given) plus every library they pin. A mod already enabled at that
+    version with intact files, and a library already present at its pinned
+    hash, are skipped. A library conflict raises before anything is written.
+    Progress lines read "[n/total] <name>: <detail>", one step per mod and
+    library. Returns the ids of the mods actually (re)installed."""
+    progress = on_progress or (lambda *_a: None)
+    libs = collect_library_dependencies(mods)     # raises on conflict before any download
+    total = len(mods) + len(libs)
+
+    def stepped(n, label):
+        return lambda msg: progress(f"[{n}/{total}] {label}: {msg}")
+
+    installed = []
+    for n, m in enumerate(mods, 1):
+        report = stepped(n, m.name)
+        if _already_installed(game_dir, m):
+            report(f"{m.version} already installed")
+            continue
+        install_mod(game_dir, m, report)
+        installed.append(m.id)
+    for n, lib in enumerate(libs, len(mods) + 1):
+        report = stepped(n, lib.name)
+        if _library_present(game_dir, _safe_basename(lib.filename), lib.sha256):
+            report("already installed")
+            continue
+        install_library_dependency(game_dir, lib, report)
+    return installed
 
 
 def uninstall_mod(game_dir, mod_id):

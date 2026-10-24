@@ -42,7 +42,7 @@ from tavern_shared.mods.resolve import (
 from tavern_shared.mods.install import (
     collect_library_dependencies, disable_mod, disable_untracked_dll, enable_mod,
     enable_untracked_dll, handshake_snapshot, install_library_dependency,
-    install_mod, install_mod_closure, list_installed_mods, list_mods,
+    install_mod, install_mod_closure, install_mod_set, list_installed_mods, list_mods,
     list_untracked_mods, mod_status, uninstall_mod, verify_mod_files,
 )
 from tavern_shared.mods.cache import (
@@ -74,7 +74,7 @@ __all__ = [
     "DEFAULT_REPO", "CFG_REPOS_KEY", "SUPPORTED_INDEX_MAJOR", "list_repos",
     "list_repos_named", "add_repo", "remove_repo", "fetch_indexes",
     "MAX_DEPENDENCY_DEPTH", "resolve_dependencies", "resolve_mod_by_id",
-    "install_mod", "install_mod_closure", "uninstall_mod", "disable_mod",
+    "install_mod", "install_mod_closure", "install_mod_set", "uninstall_mod", "disable_mod",
     "enable_mod", "mod_status", "list_mods", "list_installed_mods",
     "list_untracked_mods", "disable_untracked_dll", "enable_untracked_dll",
     "handshake_snapshot", "collect_library_dependencies",
