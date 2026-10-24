@@ -31,7 +31,8 @@ except ImportError:
     pass
 from tavern_shared.log_tailer import GameLogTailer
 from tavern_shared.mod_install import (
-    _melonloader_installed, _mods_need_attention, _tavernlib_installed,
+    NEEDS_ATTENTION, _melonloader_installed, _mods_need_attention,
+    _tavernlib_installed,
 )
 from tavern_shared.patch import _patch_needs_attention
 from tavern_shared.paths import _delete_last_rejection_file, _last_rejection_path
@@ -466,7 +467,7 @@ class ClientLauncher(tk.Tk):
         except Exception: pass
         self._refresh_setup_alert()
 
-    def _refresh_setup_alert(self):
+    def _refresh_setup_alert(self, states=None):
         """One alert for the whole Setup sequence: any of the three
         components (patch, MelonLoader, TavernLib) missing, outdated or
         damaged. These used to be two separately flashing buttons for what
@@ -493,7 +494,10 @@ class ClientLauncher(tk.Tk):
                 # patch release flashes this alert instead of sitting
                 # invisible behind an applied-but-stale install, and a failed
                 # update check (network down) still never false-alarms.
-                need = _mods_need_attention(game_dir) or _patch_needs_attention(exe)
+                if states:
+                    need = any(s in NEEDS_ATTENTION for s in states.values())
+                else:
+                    need = _mods_need_attention(game_dir) or _patch_needs_attention(exe)
             except Exception:
                 need = False
             badge = self._count_mods_needing_attention(game_dir)

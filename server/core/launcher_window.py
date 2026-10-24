@@ -27,7 +27,9 @@ try:
 except ImportError:
     pass
 from tavern_shared.log_tailer import GameLogTailer
-from tavern_shared.mod_install import _melonloader_installed, _mods_need_attention
+from tavern_shared.mod_install import (
+    NEEDS_ATTENTION, _melonloader_installed, _mods_need_attention,
+)
 from tavern_shared.patch import _patch_needs_attention
 from tavern_shared.game_guard import game_is_running
 from tavern_shared.mods_window import SetupWindow
@@ -507,7 +509,9 @@ class ServerLauncher(tk.Tk):
             return
         if self._setup_win and self._setup_win.winfo_exists():
             self._setup_win.lift(); return
-        self._setup_win = SetupWindow(self, exe, on_status_change=self._on_mods_changed)
+        self._setup_win = SetupWindow(self, exe,
+                                      on_status_change=self._refresh_setup_alert,
+                                      on_installed=self._warn_if_running)
 
     def _open_mod_manager(self):
         exe = self.v_exe.get().strip()
@@ -563,6 +567,9 @@ class ServerLauncher(tk.Tk):
         safely on its own, so the honest move is to say so, every time it
         happens while the server is running."""
         self._refresh_setup_alert()
+        self._warn_if_running()
+
+    def _warn_if_running(self):
         if game_is_running(self._proc):
             self._print("Mods changed while the server is running: the changes "
                         "take effect after a server restart. Until then, joining "
@@ -602,7 +609,7 @@ class ServerLauncher(tk.Tk):
         except Exception: pass
         self._refresh_setup_alert()
 
-    def _refresh_setup_alert(self):
+    def _refresh_setup_alert(self, states=None):
         """One alert for the whole Setup sequence: a required mod missing or
         outdated or damaged — the patch included, on the same rule. These
         used to be two separately flashing buttons for what is really one
@@ -624,7 +631,10 @@ class ServerLauncher(tk.Tk):
                 # patch release flashes this alert instead of sitting
                 # invisible behind an applied-but-stale install, and a failed
                 # update check (network down) still never false-alarms.
-                need = _mods_need_attention(game_dir) or _patch_needs_attention(exe)
+                if states:
+                    need = any(s in NEEDS_ATTENTION for s in states.values())
+                else:
+                    need = _mods_need_attention(game_dir) or _patch_needs_attention(exe)
             except Exception:
                 need = False
             badge = self._count_mods_needing_attention(game_dir)
