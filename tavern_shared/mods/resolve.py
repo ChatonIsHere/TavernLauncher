@@ -24,6 +24,16 @@ MAX_DEPENDENCY_DEPTH = 5
 SIDES = ("client", "server")
 
 
+# Per-version manifests are immutable by contract, so a fetched one is kept
+# for the life of the process: (normalized repo base, id, version) -> manifest.
+# Successes only; the latest*.json pointers move and are never memoized.
+_manifest_memo = {}
+
+
+def _clear_manifest_memo():
+    _manifest_memo.clear()
+
+
 def _runs_on(manifest, side):
     """Whether this mod can load at all in a `side` process, straight off its own
     manifest's client_side/server_side. Read from the per-version MANIFEST, never
@@ -85,7 +95,9 @@ def resolve_dependencies(roots, summary_index, fetch_manifest, side):
         summ[(s.id, s.major)] = s
 
     root_ids = {r.id for r in roots}
-    chosen = {}          # id -> ModManifest currently selected
+    # Seeded with the roots, so a root another root depends on at the same
+    # version isn't fetched and walked a second time.
+    chosen = {r.id: r for r in roots}   # id -> ModManifest currently selected
     req_major = {}       # id -> locked major
     req_min = {}         # id -> highest min-version tuple required so far
     req_by = {}          # id -> (mod name, constraint str) of first requirer, for messages
@@ -197,6 +209,9 @@ def _fetch_manifest_leaf(repo_bases, mod_id, leaf, prefer_repo=None, what=None,
     author, repo = mod_id.split(".", 1)
     last_err = None
     for base in _repo_order(repo_bases, prefer_repo):
+        key = (_norm(base), mod_id, expect_version)
+        if expect_version is not None and key in _manifest_memo:
+            return _manifest_memo[key]
         url = f"{_norm(base)}/manifests/{author}/{repo}/{leaf}"
         try:
             data = repos._get_json(url)
@@ -213,6 +228,8 @@ def _fetch_manifest_leaf(repo_bases, mod_id, leaf, prefer_repo=None, what=None,
                 f"{url} serves '{m.id}' {m.version}, not the requested "
                 f"'{mod_id}' {expect_version}.")
             continue
+        if expect_version is not None:
+            _manifest_memo[key] = m
         return m
     raise ModManagerError(
         f"Couldn't find {what or mod_id} in any configured repository."
