@@ -129,13 +129,33 @@ def _recv_framed(s, timeout):
     return bytes(body)
 
 
+def _server_mod_entry(entry):
+    """One mods_list entry, checked for the manifest-v2 shape: a non-empty
+    string id and a `targets` list of strings (unknown names kept, for the
+    planner to ignore). A missing or malformed target_sha256 is advisory, so
+    it becomes {}. Raises otherwise: an entry without targets comes from a
+    server on the older format, and guessing would skip mods it requires."""
+    if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not entry["id"]:
+        raise Exception("The server's mod list has an entry without an id.")
+    targets = entry.get("targets")
+    if not isinstance(targets, list) or not all(isinstance(t, str) for t in targets):
+        raise Exception(
+            f"The server's mod list doesn't say which builds {entry['id']} has; "
+            f"the server runs an older mod manager than this launcher reads.")
+    shas = entry.get("target_sha256")
+    if not (isinstance(shas, dict) and all(isinstance(v, str) for v in shas.values())):
+        entry = dict(entry, target_sha256={})
+    return entry
+
+
 def fetch_server_mods(host, timeout=10):
     """Fetches the server's full mod list. Returns (mods, untracked):
-    - mods: every currently-enabled MANAGED mod as {"id", "version",
-      "client_side", "server_side", "parity_required", "source_repo",
-      "sha256"} (plus "scenes" when set) -- the same fields handshake_snapshot
-      builds and TavernLib's ModHandshake.Entry serialises, so both kinds of
-      server answer this identically. This is what plan_join resolves
+    - mods: every mod the server runs (enabled, installed for `server`) as
+      {"id", "version", "parity_required", "source_repo", "targets",
+      "target_sha256"} (plus "scenes" when set) -- the same fields
+      handshake_snapshot builds and TavernLib's ModHandshake.Entry
+      serialises, so both kinds of server answer this identically, each
+      checked by _server_mod_entry. This is what plan_join resolves
       against. parity_required decides whether a client must match a mod or
       may decline it, and source_repo is a hint only (never resolved into a
       pull on its own); omitting either from a caller's expectations turns a
@@ -165,7 +185,7 @@ def fetch_server_mods(host, timeout=10):
     if resp.get("status") != "ok":
         raise Exception(resp.get("message", "Server rejected the mods list request."))
     untracked = [u for u in (resp.get("untracked") or []) if u.get("name")]
-    return resp.get("mods", []), untracked
+    return [_server_mod_entry(m) for m in resp.get("mods", [])], untracked
 
 
 def _b64url(b): return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
