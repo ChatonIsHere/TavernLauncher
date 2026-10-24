@@ -1,7 +1,7 @@
 """The client's always-on pin list and the per-server declined list. Both live
 in the host app's own config dict."""
 from tavern_shared.mods.errors import ModManagerError
-from tavern_shared.mods.hostcfg import require_save_cfg, save_cfg
+from tavern_shared.mods.hostcfg import save_cfg
 from tavern_shared.mods.version import _parse_version
 
 
@@ -49,12 +49,8 @@ def list_declined(cfg, host):
 def set_declined(cfg, host, mod_ids):
     """Records this server's declined set, replacing whatever was there - the
     window hands back the whole set each time, including choices taken back, so
-    it's a write not a merge. Saves via require_save_cfg, NOT the soft save_cfg
-    its siblings use: the window expects the whole set to stick, so an unwired
-    config is a hard error here rather than a silently lost write. A server
-    with nothing declined drops out entirely rather than leaving an empty list
-    behind."""
-    save = require_save_cfg()
+    it's a write not a merge. A server with nothing declined drops out
+    entirely rather than leaving an empty list behind."""
     table = dict(cfg.get(CFG_DECLINED_KEY) or {})
     ids = sorted(set(mod_ids or []))
     if ids:
@@ -62,7 +58,7 @@ def set_declined(cfg, host, mod_ids):
     else:
         table.pop(host, None)
     cfg[CFG_DECLINED_KEY] = table
-    save(cfg)
+    save_cfg(cfg)
     return ids
 
 
