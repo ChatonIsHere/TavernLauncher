@@ -89,10 +89,7 @@ class SetupWindow(tk.Toplevel):
                  font=("Segoe UI",9), wraplength=470, justify="left"
         ).pack(anchor="w", padx=20, pady=(10,10))
 
-        # Only shown after something actually fails. Offering "do it by hand"
-        # unprompted would suggest the automatic path is unreliable; offering
-        # it the moment the automatic path has demonstrably not worked is the
-        # one time it's the most useful thing on screen.
+        # Only shown once the automatic path has actually failed.
         self._manual_bar = tk.Frame(self, bg=BG)
         self._manual_btn = _btn(self._manual_bar, "📄 Manual Install…",
                                 self._open_manual, font=("Segoe UI",9), pady=6, padx=12)
@@ -112,10 +109,8 @@ class SetupWindow(tk.Toplevel):
         tk.Label(tf, text=title, bg=SURF, fg=PARCH, font=("Georgia",10,"bold")).pack(anchor="w")
         tk.Label(tf, text=subtitle, bg=SURF, fg=MUTED, font=("Segoe UI",8),
                  wraplength=280, justify="left").pack(anchor="w")
-        # Its own line, separate from the (static) description above, so
-        # "Up to date." / a version tag / a lock message doesn't get run
-        # into the description text — and this line is always reserved
-        # (even when empty) so a row doesn't change height when it appears.
+        # The status note: its own line, reserved even when empty so the row
+        # doesn't change height.
         notevar = tk.StringVar(value="")
         note = tk.Label(tf, textvariable=notevar, bg=SURF, fg=MUTED, font=("Segoe UI",8),
                         wraplength=280, justify="left")
@@ -209,16 +204,9 @@ class SetupWindow(tk.Toplevel):
         btn._dotlabel.config(fg=color)
         btn.config(text=text)
         note, note_color = self._STATE_NOTE[state]
-        # The installed release tag (recorded at install time from the
-        # download's redirect target, or from Patch/bundled.json when the
-        # shipped copy was used) is worth showing on every row so it's obvious
-        # exactly what's installed, not just that something is.
-        # "bundled:<hash>" markers are legacy: older launchers wrote one in
-        # place of the tag when falling back, so they name no release at all
-        # and are hidden rather than shown. Today's fallback records the real
-        # tag and says where it came from via `offline` instead. Skipped for
-        # 'missing': whatever tag was once recorded, it doesn't describe an
-        # install that isn't there.
+        # The installed release tag, so the row says what's installed. Legacy
+        # "bundled:<hash>" markers name no release and are hidden, and a
+        # 'missing' row has no install for a tag to describe.
         if tag and not tag.startswith("bundled:") and state != "missing":
             shown = f"{tag} · offline copy" if offline else tag
             note = f"{note}  ({shown})" if note else f"({shown})"
@@ -376,11 +364,8 @@ class SetupWindow(tk.Toplevel):
             self._show_manual_offer(component, msg)
             if auto_manual:
                 self._open_manual()
-        # Held across the refresh rather than blanked by it. On failure this is
-        # the only place the reason is ever shown -- there's no dialog and no
-        # log in this window -- and the reasons are the actionable ones
-        # (download stalled, antivirus locked the file, Controlled Folder
-        # Access silently blocked the write).
+        # Held across the refresh: on failure this line is the only place the
+        # reason is shown.
         self._refresh_states(keep_status=msg)
 
     # ── Manual install fallback ──────────────────────────────────────────────

@@ -134,13 +134,12 @@ def fetch_server_mods(host, timeout=10):
     - mods: every currently-enabled MANAGED mod as {"id", "version",
       "client_side", "server_side", "parity_required", "source_repo",
       "sha256"} (plus "scenes" when set) -- the same fields handshake_snapshot
-      builds and TavernLib's
-      ModHandshake.Entry serialises, so both kinds of server answer this
-      identically. This is what plan_join resolves against. parity_required
-      decides whether a client must match a mod or may decline it, and
-      source_repo is a hint only (never resolved into a pull on its own);
-      omitting either from a caller's expectations turns a "recommended" mod
-      into a hard join failure.
+      builds and TavernLib's ModHandshake.Entry serialises, so both kinds of
+      server answer this identically. This is what plan_join resolves
+      against. parity_required decides whether a client must match a mod or
+      may decline it, and source_repo is a hint only (never resolved into a
+      pull on its own); omitting either from a caller's expectations turns a
+      "recommended" mod into a hard join failure.
     - untracked: every enabled mod the server runs that its own manager didn't
       install, as {"name", "kind"}. Advisory only - there's no id or version to
       resolve, so it's shown and never acted on, and a server that doesn't send
@@ -218,20 +217,10 @@ def build_tokens(user_id, username, tavern_token="", mods_claim=""):
     against the server's own records closes that gap regardless of what
     else the presented JWT claims to be.
 
-    mods_claim is a JSON object string of {mod_id: version} for every
-    community mod currently enabled on this machine, the client's own side of
-    TavernLib's exact-version mod-parity check (PlayerJoinFilter /
-    ModParity.ValidateClient), read off the same "TavernMods" claim. Empty
-    string when there's nothing to report (no mods enabled, or the caller
-    didn't compute one); a server with no client_side-required mods ignores it
-    either way.
-
-    Both TavernToken and TavernMods go on the identity token as well as the
-    access token, because the identity one is what the game actually sends as
-    RequestJoinMessage.UserCredentials - the only token a server ever reads
-    these off. On the access token alone the claim never arrives, the server
-    sees a client with no mods, and every mod it requires of clients comes
-    back as a mismatch no matter what's installed."""
+    mods_claim is the "TavernMods" claim: a JSON {mod_id: version} of every
+    enabled community mod, for TavernLib's exact-version parity check, or ""
+    for none. Both claims also go on the identity token, the only one the
+    game sends a server (RequestJoinMessage.UserCredentials)."""
     exp, uid = 9999999999, str(user_id)
     a = _jwt({"UserId":uid,"Username":username,"role":"Access","is_verified":"True",
               "is_member":"True","Policy":["offline","play_offline","server_access_pre_alpha",

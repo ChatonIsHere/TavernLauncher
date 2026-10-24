@@ -441,13 +441,8 @@ def _download_to_file(url, dest_path, on_progress, max_total_seconds=180):
                                         f"({downloaded//1024//1024:,} / {total//1024//1024:,} MB)")
                         else:
                             on_progress(f"Downloading… {downloaded//1024:,} KB")
-            # A short read is a failure, not a success: read() returning b""
-            # means "no more data is coming", not "the file is complete", so a
-            # connection cut mid-transfer ends the loop identically to a
-            # finished one. This used to report a flat "100%" here without ever
-            # comparing the counter to Content-Length, so a truncated download
-            # announced itself as complete and then failed later as a corrupt
-            # zip -- or, worse, extracted far enough to look like it worked.
+            # read() returning b"" means "no more data", not "complete", so a
+            # connection cut mid-transfer ends the loop like a finished one.
             if total is not None and downloaded != total:
                 pct = int(downloaded * 100 / max(1, total))
                 raise RuntimeError(
@@ -606,17 +601,11 @@ def finish_update_if_requested():
     def _sync_folder(src_dir, dst_dir, label):
         """Copies every file from src_dir into dst_dir (preserving the
         relative structure), skipping any file whose destination copy is
-        already identical. Returns the list of "label/rel" paths that did NOT
-        end up matching the source, which is the whole point: these used to be
-        logged as "(non-fatal)" and then followed by an unconditional "Update
-        applied successfully", so a locked or Controlled-Folder-Access-blocked
-        Patch/ file meant the launcher updated, restarted, reported success,
-        and carried on running against the old file. That is exactly the
-        "update seemed to work but the file didn't change" symptom, and from
-        the outside it is indistinguishable from the update working.
-
-        Each copy is verified by reading it back, because shutil.copy2 raising
-        nothing does not establish that anything was written.
+        already identical. Returns the "label/rel" paths that did NOT end up
+        matching the source (a locked or Controlled-Folder-Access-blocked
+        file), so the update can be reported as partial rather than clean.
+        Each copy is verified by reading it back: shutil.copy2 raising nothing
+        doesn't establish that anything was written.
 
         Deliberately never deletes anything from dst_dir that isn't present in
         src_dir -- a user's own third-party addon sitting in addons/ (never
@@ -666,12 +655,8 @@ def finish_update_if_requested():
                            os.path.join(install_dir, "addons"), "addons")
 
     if failed:
-        # The exe itself did update (we got past _move_self_into_place), so
-        # this is a partial update, not a failed one -- saying "successfully"
-        # here would be a lie, and saying "failed" would be a different one.
-        # The marker file is what turns this into something the user actually
-        # sees: nothing else in this process has a UI to report through, and
-        # this log is not somewhere anyone looks unprompted.
+        # The exe did update, so this is partial, not failed. This process
+        # has no UI, so the marker is how the relaunched app gets to say so.
         _log_update_event(f"PARTIAL UPDATE — {len(failed)} file(s) not replaced: "
                           + ", ".join(failed))
         _write_partial_update_marker(install_dir, failed)
