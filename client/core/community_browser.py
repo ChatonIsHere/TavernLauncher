@@ -197,7 +197,7 @@ class CommunityBrowser(tk.Toplevel):
             self.after(0, self._populate)
             self._start_pings()
         except Exception as e:
-            self.after(0, lambda: self._status.set(
+            self.after(0, lambda e=e: self._status.set(
                 f"Could not reach community list — {e}"))
 
     def _start_pings(self):

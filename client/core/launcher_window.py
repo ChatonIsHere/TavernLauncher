@@ -587,7 +587,7 @@ class ClientLauncher(tk.Tk):
                 # on success — if we get here at all, something went wrong
                 # after the point of no return.
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Update failed",
+                self.after(0, lambda e=e: messagebox.showerror("Update failed",
                     f"Couldn't apply the update:\n{e}\n\n"
                     "The current version is unaffected — nothing was replaced.", parent=self))
         threading.Thread(target=worker, daemon=True).start()
@@ -843,7 +843,7 @@ class ClientLauncher(tk.Tk):
             else:
                 self.after(0, lambda: self._check_fail(f"Unexpected response from {host}"))
         except Exception as e:
-            self.after(0, lambda: self._check_fail(f"✘  Cannot reach server — {e}"))
+            self.after(0, lambda e=e: self._check_fail(f"✘  Cannot reach server — {e}"))
 
     def _check_ok(self, host, msg, game_port=None):
         self._server_ok    = True
