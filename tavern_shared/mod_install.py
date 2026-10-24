@@ -1,17 +1,7 @@
-"""
-Installing the two mods that are prerequisites rather than choices:
-MelonLoader, which has to load before anything else can, and TavernLib, which
-is what makes a server's mod support work at all. Shared by both apps, since
-both need Install/Update buttons for the same two.
-
-Nothing else belongs here. CircuitsVoiceChat used to, as an "optional mod"
-row, and its installer was a second bespoke copy of this file's
-download-verify-fallback machinery pinned to one hard-coded GitHub repo. It is
-a community mod now, installed through the Mod Manager like any other, which
-gets it version pinning, dependency resolution, a sha256 checked against a
-reviewed index, and the ability to be turned off per server -- none of which a
-hard-coded installer here could offer.
-"""
+"""Installing the two prerequisite mods both apps' Setup windows manage:
+MelonLoader, which has to load before anything else, and TavernLib, which
+makes a server's mod support work. Community mods go through
+tavern_shared.mods."""
 import os
 import time
 import json
@@ -47,13 +37,9 @@ MODS_META_FILENAME = ".tavern_mods_meta.json"
 
 
 class DownloadError(RuntimeError):
-    """A download that failed for reasons on the network's side of the line:
-    couldn't connect, was cut short, stalled, or handed back something that
-    isn't the requested file. Distinct from RuntimeError so the Setup window
-    can tell "the download itself keeps failing" (offer the manual-install
-    route: the user's browser usually works where this process is blocked)
-    apart from a local failure like a blocked write, where re-downloading
-    would change nothing."""
+    """A download that failed on the network's side: refused, cut short,
+    stalled, or not the requested file. Setup offers the manual-install route
+    for these; a local failure such as a blocked write gets no such offer."""
 
 
 def _mods_meta_path(game_dir):
@@ -69,17 +55,9 @@ def _load_mod_meta(game_dir):
 
 
 def _save_mod_meta(game_dir, meta):
-    """Replaces the whole record, atomically.
-
-    Written to a temp file in the same folder and swapped in with os.replace
-    rather than truncating the real one, because this file is deliberately
-    shared: it lives in game_dir so the client launcher and the server
-    launcher can see each other's installs (see _patch_status). A plain
-    open(w) leaves it empty for as long as the write takes, and anything that
-    reads it in that window gets a JSON error -- which _load_mod_meta turns
-    into {}, which reads as "nothing is installed", which makes Automatic
-    Setup reinstall all three components. The swap has no such window: a
-    reader sees either the old file or the new one."""
+    """Replaces the record atomically (temp file, then os.replace). Both
+    launchers read this file, and one catching it half-written would see {}:
+    "nothing installed", and Automatic Setup would reinstall everything."""
     path = _mods_meta_path(game_dir)
     tmp = f"{path}.{os.getpid()}.tmp"
     try:
@@ -92,16 +70,9 @@ def _save_mod_meta(game_dir, meta):
 
 
 def _update_mod_meta(game_dir, changes, drop=()):
-    """Applies field changes to the record, re-reading it immediately before
-    the write.
-
-    The read-modify-write the installers do spans a download and a file swap
-    -- seconds at least, minutes for MelonLoader. Two launchers pointed at one
-    game folder (installing TavernLib in one while applying the patch in the
-    other is the obvious way in) would each write back a copy of the record
-    they read at the start, and whoever finished last would erase the other's
-    fields entirely. Re-reading here narrows that to the width of one
-    os.replace, and the fields the two write never overlap."""
+    """Applies field changes to a freshly re-read record, so two launchers
+    installing different components into one game folder don't erase each
+    other's fields."""
     meta = _load_mod_meta(game_dir)
     meta.update(changes)
     for key in drop:
@@ -111,11 +82,8 @@ def _update_mod_meta(game_dir, changes, drop=()):
 
 
 def _record_source(changes, drop, component, from_bundle):
-    """Notes whether this install came from GitHub or from the copy shipped in
-    Patch/, so the Setup row can say so. Removed rather than set to "github"
-    on the normal path: absent already means "downloaded", and a launcher that
-    predates this field would otherwise be indistinguishable from an offline
-    install."""
+    """Records "<component>_source": "bundled" for an offline install and drops
+    it otherwise; absent means downloaded."""
     if from_bundle:
         changes[f"{component}_source"] = "bundled"
     else:
@@ -145,14 +113,9 @@ def _get_redirect_location(url, timeout=10):
 
 
 def _get_latest_release_tag(url):
-    """Reads the release tag a GitHub 'latest' download alias currently
-    resolves to (e.g. 'v1.5.1') out of the first redirect hop — no GitHub
-    API call, no rate limit, and no need to download the asset itself.
-    Recorded at install time purely so the Setup window can SHOW which
-    release is installed; it is never the update check. The DLLs carry no
-    usable PE version resource (TavernLib is stamped 1.0.0.0 forever, the
-    patch inherits the game's own 0.0.0.1), so the release tag is the only
-    human-readable version these components have."""
+    """The release tag a GitHub 'latest' download alias redirects to (e.g.
+    'v1.5.1'), read from the first hop without the API or the asset. Display
+    only for TavernLib and the patch, whose DLLs carry no usable version."""
     loc = _get_redirect_location(url)
     if not loc:
         return None
@@ -165,33 +128,23 @@ def _get_latest_release_tag(url):
 
 
 def _get_melonloader_latest_tag():
-    """The current MelonLoader release tag (e.g. 'v0.7.3'). Unlike the other
-    two components this one IS the update check, compared against the
-    recorded melonloader_tag."""
+    """The current MelonLoader release tag; for MelonLoader the tag IS the
+    update check."""
     return _get_latest_release_tag(MELONLOADER_ZIP_URLS["x64"])
 
 
 def _fetch_remote_fingerprint(url, timeout=10):
-    """A lightweight 'has this file changed' check — HEAD for ETag (falls
-    back to Last-Modified, then Content-Length), without downloading the
-    file. This stays the update check for TavernLib and the patch even
-    though their repos tag releases these days (the tags are recorded for
-    display, see _get_latest_release_tag): the ETag tracks the asset's
-    BYTES, so it also catches a release re-uploaded under an unchanged
-    tag, which tag comparison reads as 'current' forever."""
+    """'Has this file changed?' without downloading it: the ETag, else
+    Last-Modified, else the full size. The update check for TavernLib and the
+    patch, since an ETag also catches a re-upload under an unchanged tag."""
     def _read(resp):
         h = resp.headers
         fp = h.get("ETag") or h.get("Last-Modified")
         if fp:
             return fp
-        # Size fallback for a proxy that strips ETag/Last-Modified. On the
-        # ranged-GET path below, Content-Length describes the 1-byte slice
-        # (a constant "1" — useless as a fingerprint), so the full size has
-        # to come out of Content-Range ("bytes 0-0/12345" -> "12345"). That
-        # keeps every path here returning the same value the install-time
-        # GET records as its own fallback (its Content-Length IS the full
-        # size), so a fresh install on such a network converges to
-        # 'current' instead of mismatching forever.
+        # Size fallback for a proxy stripping both. The ranged GET's
+        # Content-Length is its 1-byte slice, so the full size comes from
+        # Content-Range: the same value an install records.
         content_range = h.get("Content-Range") or ""
         if "/" in content_range:
             total = content_range.rsplit("/", 1)[1].strip()
@@ -322,10 +275,7 @@ def _worth_trying(*tips):
 
 
 def _short_read_message(url, downloaded, total):
-    """The message for a download that ended before Content-Length said it
-    would. Worth being explicit that nothing was installed, because the
-    symptom users actually reported for this was the opposite -- an install
-    that looked like it completed, over a file that hadn't changed."""
+    """The message for a download that ended before its Content-Length."""
     pct = int(downloaded * 100 / max(1, total))
     return (
         f"The download from {urlparse(url).netloc} ended early — got "
@@ -349,23 +299,11 @@ def _download_with_progress(url, dest_path, on_progress,
     DownloadError with a specific, actionable message on failure, and never
     leaves a partially-downloaded file at dest_path.
 
-    A short read is a failure, not a success. read() returning b"" means
-    "no more data is coming", NOT "the file is complete" -- a connection cut
-    mid-transfer by a proxy, VPN or antivirus ends the loop exactly the same
-    way a finished download does. Without the Content-Length check below,
-    every caller then hashes the truncated file, gets a hash that of course
-    matches itself, records it as verified, and installs a broken DLL while
-    reporting success.
-
-    require_length=True refuses a response with no usable Content-Length at
-    all, BEFORE reading the body. The short-read check above is the only
-    truncation detection a bare-file download has (a .zip at least fails to
-    open; a .dll has no structure of its own to fail on), and it silently
-    stops existing the moment the header is missing -- which GitHub never
-    omits, but an intercepting proxy rewriting the response to chunked
-    encoding does. For a download whose caller can't verify the result
-    against an independent hash, no length means no truncation detection,
-    so it's treated as a failure rather than downloaded blind."""
+    Fewer bytes than Content-Length is a failure: a cut connection ends the
+    read loop exactly like a finished download, and the truncated file would
+    hash consistently and install as verified. require_length=True refuses a
+    response with no Content-Length before reading the body, since truncation
+    is then undetectable; callers with no independent hash ask for it."""
     start = time.time()
     req = urllib.request.Request(url, headers={"User-Agent": "TavernLauncher/1.0"})
     with _force_ipv4():
@@ -451,14 +389,9 @@ DOWNLOAD_ATTEMPTS = 3
 
 def _download_with_retries(url, dest_path, on_progress, attempts=DOWNLOAD_ATTEMPTS,
                            retry_delay=2.0, **kwargs):
-    """_download_with_progress, tried up to `attempts` times before giving up.
-    Only DownloadError is retried — that's the transient class (a dropped
-    connection often succeeds on the next try, which is also the first thing
-    _short_read_message tells the user to do manually). Anything else
-    (permissions, disk) fails immediately: it would fail identically again.
-    The exception that escapes after the last attempt says how many were made,
-    so the caller's failure UI can honestly present this as "we already
-    retried" rather than "try again"."""
+    """_download_with_progress, tried up to `attempts` times. Only DownloadError
+    (the transient kind) is retried; the final error says how many attempts
+    were made, so Setup can say it already retried."""
     last = None
     for attempt in range(1, attempts + 1):
         if attempt > 1:
@@ -473,25 +406,18 @@ def _download_with_retries(url, dest_path, on_progress, attempts=DOWNLOAD_ATTEMP
 
 
 _PAYLOAD_MAGIC = {
-    # (magic bytes, floor) — the floor only exists to reject something
-    # magic-prefixed but absurdly small, e.g. an error page that happens to
-    # start with the right two bytes; every real payload here is far larger.
+    # (magic bytes, size floor, description); the floor rejects a tiny error
+    # body that happens to start with the right bytes.
     "dll": (b"MZ", 4096, "a Windows DLL"),
     "zip": (b"PK", 4096, "a .zip archive"),
 }
 
 
 def _verify_payload_type(path, url, kind):
-    """Rejects a download whose CONTENT isn't the kind of file asked for —
-    the check that catches an intercepting proxy serving a complete,
-    correct-length block/login page instead of the file. Content-Length
-    can't catch that (the substituted body matches its own length), and for
-    a bare .dll neither can anything downstream: it gets hashed, installed,
-    and recorded as good. Two bytes of magic kill the realistic version of
-    that scenario, since a block page is HTML, not a PE image or zip.
-    Deliberately NOT authentication — a deliberately substituted valid DLL
-    still passes; only a pinned hash could catch that, and these downloads
-    track a moving 'latest' with nothing published to pin against."""
+    """Raises DownloadError unless the file starts with the magic bytes for
+    `kind` and clears its size floor. Catches a proxy serving a complete,
+    correct-length block page, which no length check can. Not authentication:
+    these track a moving 'latest' with no published hash to pin."""
     magic, floor, described = _PAYLOAD_MAGIC[kind]
     try:
         size = os.path.getsize(path)
@@ -534,19 +460,9 @@ def _open_zip_with_retry(path, retries=8, delay=1.0):
 
 
 def _verify_extracted(zf, dest_dir):
-    """Reads back every file extractall() was supposed to write and checks it
-    against the CRC32 the archive already carries for it. Returns the list of
-    entries that are missing or don't match — empty means the extraction
-    genuinely landed.
-
-    A presence check can't do this job. Controlled Folder Access and some
-    antivirus make extractall() appear to succeed while writing nothing, and
-    when MelonLoader is being *updated* rather than installed fresh, the
-    previous version's files are still sitting there — so "is version.dll
-    present?" passes, the new release tag gets recorded against the old files,
-    and every status check from then on reports 'current'. The update silently
-    never happened and nothing will ever notice. Comparing content against the
-    archive is the only check that distinguishes the two."""
+    """The archive members that are missing or fail their CRC on disk; empty
+    when the extraction landed. Presence isn't enough: a silently blocked
+    extractall() during an update leaves the old files in place."""
     bad = []
     for info in zf.infolist():
         if info.is_dir():
@@ -566,9 +482,8 @@ def _verify_extracted(zf, dest_dir):
 
 
 def _blocked_write_message(what, examples):
-    """Shared wording for "we wrote it, then read it back, and it isn't what
-    we wrote" — the signature of a silently-blocked write rather than a
-    failed one."""
+    """Wording for a write that succeeded but reads back wrong: a silently
+    blocked write, not a failed one."""
     return (
         f"{what} was written without any error, but reading it back afterward "
         f"shows it isn't what was just installed ({examples}).\n\n"
@@ -581,17 +496,11 @@ def _blocked_write_message(what, examples):
 
 
 def _install_melonloader(game_dir, arch, on_progress):
-    """Downloads and installs the latest official MelonLoader release, with
-    retries, falling back to the copy shipped in Patch/ only when that copy
-    is verified and would actually help (see tavern_shared.bundled). A
-    download that fails with nothing usable to fall back to raises
-    DownloadError, which the Setup window turns into manual-install
-    instructions — the user's own browser is the fallback of last resort.
-
-    The meta record (release tag + on-disk hash) is written only after the
-    extracted files have been read back and verified against the archive's
-    CRCs — a failed or blocked install must never update what we claim is
-    installed."""
+    """Installs the latest MelonLoader release for `arch`, falling back to the
+    verified copy in Patch/ when usable_payload allows, and raising
+    DownloadError when nothing usable is shipped (Setup offers manual install).
+    The meta record is written only after the extracted files pass their CRC
+    check."""
     url = MELONLOADER_ZIP_URLS.get(arch)
     if not url:
         raise RuntimeError(f"Unsupported or unrecognized game architecture ({arch}).")
@@ -604,16 +513,12 @@ def _install_melonloader(game_dir, arch, on_progress):
     try:
         try:
             _download_with_retries(url, tmp_zip, on_progress, require_length=True)
-            # A structurally-valid zip is a strong integrity check in itself (a
-            # truncated one loses its end-of-central-directory record and won't
-            # open) — but check the magic first anyway, so a substituted HTML page
-            # fails with "this isn't a zip, something intercepted the download"
-            # rather than eight seconds of open-retries and an antivirus hint.
+            # Magic first, so a substituted page fails as such rather than
+            # as eight seconds of zip-open retries.
             _verify_payload_type(tmp_zip, url, "zip")
             source_zip, from_bundle = tmp_zip, False
         except DownloadError:
-            # Only the x64 archive is shipped, and usable_payload's hash check
-            # means an x86 request can't be served the wrong one by accident.
+            # Only the x64 archive is shipped.
             source_zip = usable_payload(
                 "melonloader", _melonloader_local_state(game_dir)[1] is not None,
                 _load_mod_meta(game_dir).get("melonloader_tag")) if arch == "x64" else None
@@ -625,13 +530,10 @@ def _install_melonloader(game_dir, arch, on_progress):
         on_progress("Extracting MelonLoader…")
         with _open_zip_with_retry(source_zip) as zf:
             zf.extractall(game_dir)
-            # Verified against the archive itself, not just checked for presence
-            # -- see _verify_extracted for why presence is not enough here.
             on_progress("Verifying extracted files…")
             bad = _verify_extracted(zf, game_dir)
     finally:
-        # tmp_zip only — never source_zip, which on the fallback path is the
-        # shipped copy itself and has to survive for the next attempt.
+        # Never source_zip: on the fallback path it's the shipped copy.
         try: os.remove(tmp_zip)
         except Exception: pass
 
@@ -647,21 +549,12 @@ def _install_melonloader(game_dir, arch, on_progress):
     if tag:
         changes["melonloader_tag"] = tag
     else:
-        # The tag fetch failed, so which release this was is genuinely unknown
-        # — drop any old tag rather than leave it describing the previous
-        # install. Status then reports 'unknown' instead of a stale 'current'.
+        # Unknown release: drop the old tag rather than claim it.
         drop.append("melonloader_tag")
-    # Which release this is stays the honest answer either way, so unlike
-    # TavernLib and the patch this needs no fingerprint sentinel: MelonLoader's
-    # update check IS the tag comparison, and a shipped copy that happens to be
-    # the current release genuinely is current. The source is recorded only so
-    # the Setup row can say where the files came from.
+    # No bundled:<tag> sentinel needed: MelonLoader's update check is the tag
+    # itself, and a shipped copy of the current release is current.
     _record_source(changes, drop, "melonloader", from_bundle)
-    # The tag says which release we fetched; this says what is actually on
-    # disk right now, which is a different question and the only one that can
-    # answer "has something changed these files since we installed them?".
-    # version.dll is the shim the game itself loads, so if anything is going
-    # to get quarantined, rolled back or overwritten, it's this.
+    # version.dll is the shim the game loads, so it's what damage shows in.
     try:
         changes["melonloader_version_sha256"] = _sha256_file(
             os.path.join(game_dir, "version.dll"))
@@ -828,27 +721,16 @@ def _tavernlib_status(game_dir):
 NEEDS_ATTENTION = ("missing", "outdated", "damaged")
 
 
-# What Automatic Setup re-runs: everything alert-worthy, plus 'unrecorded' —
-# an incomplete install record is repaired by exactly the reinstall Automatic
-# Setup would do, and leaving it means no damage detection, no update checks
-# and no version display for that component. 'unknown' stays excluded from
-# both: it means the CHECK couldn't run, and reinstalling over an unreachable
-# GitHub turns "everything's installed" into guaranteed download failures.
+# What Automatic Setup re-runs: everything alert-worthy plus 'unrecorded',
+# which a reinstall repairs. Never 'unknown': the check couldn't run, and
+# reinstalling over an unreachable GitHub only fails.
 AUTO_SETUP_STATES = NEEDS_ATTENTION + ("unrecorded",)
 
 
 def _mods_need_attention(game_dir):
-    """True if either required mod (MelonLoader, TavernLib) is missing,
-    outdated or damaged — the trigger for flashing the main window's Setup
-    button (see
-    each launcher's _refresh_setup_alert, which also folds in the patch
-    check). Network failures during the update checks never trigger a false
-    alarm on their own — only a real missing install (a purely local,
-    always-reliable check) does that unconditionally.
-
-    CircuitsVoiceChat is deliberately not considered any more. It is a
-    community mod now, installed and updated through the Mod Manager like
-    any other, so it has no place in the fixed Setup sequence."""
+    """True if MelonLoader or TavernLib is missing, outdated or damaged: what
+    flashes the Setup button (each launcher also folds in the patch). A
+    failed update check never raises the alarm on its own."""
     return (_melonloader_status(game_dir) in NEEDS_ATTENTION or
             _tavernlib_status(game_dir)   in NEEDS_ATTENTION)
 
