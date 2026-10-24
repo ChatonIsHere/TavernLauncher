@@ -55,6 +55,8 @@ except ImportError:
     _updater = None
 
 class ServerLauncher(LauncherCommon, tk.Tk):
+    MOD_SIDE = "server"
+
     def __init__(self):
         super().__init__()
         _start_hidden(self)
@@ -461,8 +463,6 @@ class ServerLauncher(LauncherCommon, tk.Tk):
         if self._console_win and self._console_win.winfo_exists():
             self._console_win.lift(); return
         self._console_win = ConsoleWindow(self)
-
-    MOD_SIDE = "server"
 
     def _mod_manager_kwargs(self):
         return {"server_scene": self._server_scene}
