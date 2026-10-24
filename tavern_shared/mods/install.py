@@ -22,7 +22,6 @@ from tavern_shared.mods.layout import (
 from tavern_shared.mods.manifest import (
     INSTALL_TARGETS, _artifacts_from_list, parity_required,
 )
-from tavern_shared.mods.repos import _norm
 from tavern_shared.mods.resolve import _fetch_manifest, resolve_dependencies
 from tavern_shared.mods.version import _parse_version
 
@@ -408,8 +407,9 @@ def _disable_shadowed_loose_dlls(game_dir, mod_id, target_dir):
 
 def collect_library_dependencies(mods, target):
     """Every library the mods' `target` builds pin, deduplicated by filename
-    (libraries have no id). The same filename at a different sha256 or URL
-    raises, naming both mods: the library form of a diamond conflict."""
+    (libraries have no id). The same filename at a different sha256 raises,
+    naming both mods: the library form of a diamond conflict. The URL doesn't
+    matter, only the bytes (TavernLib compares the same way)."""
     by_filename = {}     # filename -> (LibraryDependency, owning mod name)
     for mod in mods:
         artifact = mod.artifact_for(target)
@@ -419,8 +419,7 @@ def collect_library_dependencies(mods, target):
                 by_filename[key] = (lib, mod.name)
                 continue
             existing, owner = by_filename[key]
-            if (existing.sha256.lower() != lib.sha256.lower()
-                    or _norm(existing.download_url) != _norm(lib.download_url)):
+            if existing.sha256.lower() != lib.sha256.lower():
                 raise ModManagerError(
                     f"Library conflict on '{lib.filename}': {owner} pins "
                     f"{existing.download_url} (sha {existing.sha256[:12]}...) but "
