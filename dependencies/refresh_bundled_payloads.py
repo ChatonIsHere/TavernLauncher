@@ -1,18 +1,10 @@
 """Re-cuts Patch/ from the current published release of each Setup payload,
 and rewrites Patch/bundled.json to describe exactly what it fetched.
 
-Run at build time (BUILD_EXECUTABLES.bat does), because a bundled payload is
-only worth shipping while it's current. The last time these files were
-committed by hand they drifted: the copy of themoddingtavern.dll in the repo
-was several hundred bytes off the published release, so every offline install
-would have applied a patch that was already superseded -- and nothing would
-have said so.
-
-Fetches through the launcher's own _download_with_retries /
-_get_latest_release_tag / _verify_payload_type, deliberately: what ships is
-then fetched by the same code, with the same length and payload-type checks,
-that an end user's install would use.
-"""
+Run at build time (BUILD_EXECUTABLES.bat does), so the offline fallback is as
+current as the build. Fetches through the launcher's own download, tag and
+payload-type helpers, so what ships passed the same checks a user's install
+would."""
 import json
 import os
 import sys
@@ -37,8 +29,7 @@ TARGETS = [
 
 
 def _quiet(message):
-    """Swallows the per-chunk progress lines; a build log doesn't want 300
-    percentage updates, and the failures all raise rather than report."""
+    """Swallows per-chunk progress; failures raise instead."""
 
 
 def refresh():
@@ -86,12 +77,8 @@ if __name__ == "__main__":
     try:
         refresh()
     except Exception as e:
-        # Non-fatal by design: a build on a machine that can't reach GitHub
-        # should still produce working executables, shipping whatever Patch/
-        # already holds. Those payloads are verified against the manifest that
-        # describes them, so an untouched Patch/ stays internally consistent --
-        # it just means the offline fallback is as old as the last successful
-        # refresh. The caller decides what to do with the exit code.
+        # Non-fatal: a failed refresh leaves Patch/ untouched and consistent
+        # with bundled.json, just older. The caller decides on the exit code.
         print(f"  [WARN] Couldn't refresh the bundled payloads: {e}")
         print("  [WARN] Building with whatever Patch/ already contains.")
         sys.exit(1)
