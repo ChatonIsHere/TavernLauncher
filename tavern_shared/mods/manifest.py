@@ -9,23 +9,16 @@ from tavern_shared.mods.layout import _safe_basename
 from tavern_shared.mods.version import _major, _parse_version
 
 
-# The manifest schema major this build understands. A per-version manifest whose
-# manifest_version has a *different* major is skipped rather than mis-parsed. This
-# is the forward-compat hook that lets the manifest schema grow later (multi-file
-# mods, new fields) without an old launcher guessing at a shape it doesn't get.
-# Bump this only alongside a real manifest schema change.
+# A manifest of any other schema major is skipped rather than mis-parsed.
 SUPPORTED_MANIFEST_MAJOR = 1
 
 
 @dataclass
 class LibraryDependency:
-    """A pinned, exact-version support assembly a mod links against, installed to
-    UserLibs/. Concentus.dll, the codec a voice-chat mod needs, is the motivating
-    case: a genuine third-party open-source project, not published by the mod
-    author and not in this ecosystem's index at all. No id, no version-range
-    resolution, no separate manifest, just "here's the exact file I tested
-    against." Distinct from `dependencies`, which is for depending on other
-    *mods*."""
+    """A pinned, exact file a mod links against, installed flat into UserLibs/
+    (native DLLs must be libraries: it's MelonLoader's only native search
+    path). No id and no version range; distinct from `dependencies`, which
+    name other mods."""
     name: str            # display label only, not a resolvable id
     download_url: str
     sha256: str
@@ -33,35 +26,14 @@ class LibraryDependency:
 
 
 def parity_required(d):
-    """Whether a client joining a server that runs this mod must match its exact
-    version. Read off a manifest, an install record, an index entry, or a
-    handshake entry - every shape the field travels in, so one place decides
-    what it means.
+    """Whether a client joining a server that runs this mod must match its
+    exact version (true), or may decline it (false). Read off a manifest,
+    record, index entry or handshake entry.
 
-    True is what the server enforces (TavernLib's ModParity.ValidateClient), for
-    mods whose two halves are one system: a voice codec, a network protocol,
-    anything where both sides exchange data they have to agree on. False means
-    the server won't block a join over it, so the client is offered the mod,
-    defaulted to installing, and may decline - for mods whose halves work
-    independently, like a client performance tweak that happens to ship a server
-    piece.
-
-    Mandatory, with no default, and it must be an actual boolean: every shape
-    that carries this field is written by tooling that knows about it, so a
-    missing or malformed one means the data predates the field or came from
-    something that doesn't implement it, and guessing on its behalf is exactly
-    what would let a required mod be silently treated as optional. Callers
-    decide what to do with the error - a manifest becomes unresolvable, an index
-    entry or an install record is skipped with a warning.
-
-    A present-but-malformed value (a string "false", a None, a 0) raises, on the
-    same terms as an absent one. It used to read as required, which was safe on
-    its own but put this out of step with TavernLib's ModParityField.Read, which
-    throws - so one hand-rolled third-party manifest installed through the
-    launcher and was unresolvable on a headless host, for the same bytes. Having
-    one answer on both sides matters more than which answer it is, and refusing
-    data nobody can interpret is the one that gets the manifest fixed rather
-    than quietly published broken."""
+    Mandatory and a real boolean: absent or malformed (including 0/1 or
+    "false") raises, never defaults, because guessing is what would let a
+    required mod pass as optional. TavernLib's ModParityField.Read throws on
+    the same bytes; one answer on both sides matters more than which answer."""
     if "parity_required" not in d:
         raise ModManagerError(
             f"'{d.get('id', '?')}' has no parity_required field. It's required: "
@@ -69,7 +41,6 @@ def parity_required(d):
             f"exact version, false if the server shouldn't block the join over "
             f"it. A mod installed before this field existed needs reinstalling.")
     value = d["parity_required"]
-    # isinstance(1, bool) is False in Python, so an int 0/1 is rejected too.
     if not isinstance(value, bool):
         raise ModManagerError(
             f"'{d.get('id', '?')}' has a parity_required of {value!r}, which "
@@ -84,18 +55,11 @@ SCENES = ("normal", "quest", "tutorial")
 
 
 def mod_scenes(d):
-    """Which scenes a mod works in, read off a manifest, an install record, an
-    index entry or a handshake entry. None - the field absent or null - means
-    every scene, which is what every mod published before the field existed
-    gets, so this one is optional where parity_required isn't. TavernLib's
-    ModScenesField.Read is the same rule.
-
-    A present value must be a non-empty list of strings, and raises otherwise:
-    an empty list or a stray string would otherwise read as "no scenes" or "all
-    scenes" depending on who's asking. Names this build doesn't know are kept,
-    not rejected, so a scene added later doesn't make an older launcher refuse
-    the whole manifest; the index's own validator is where unknown names are
-    stopped."""
+    """Which scenes a mod works in. None (absent or null) means every scene. A
+    present value must be a non-empty list of non-empty strings or this
+    raises; unknown names are kept, so a later scene doesn't make an older
+    launcher refuse the manifest. TavernLib's ModScenesField.Read is the same
+    rule."""
     value = d.get("scenes")
     if value is None:
         return None
@@ -109,15 +73,14 @@ def mod_scenes(d):
 
 
 def runs_in_scene(scenes, scene):
-    """Whether a mod with these scenes (from mod_scenes) works in `scene`. An
-    unknown scene - None, as on a path that never learned the server's - never
-    rules a mod out."""
+    """Whether a mod with these scenes works in `scene`. An unknown scene (None)
+    never rules a mod out."""
     return scenes is None or scene is None or scene in scenes
 
 
 def scene_from_arg(scene_arg):
-    """The scene name for the launch argument a server asks for at auth, the
-    same mapping TavernLib's SceneIndexPatches makes from its own arguments."""
+    """The scene for a server's launch argument, as TavernLib's
+    SceneIndexPatches maps it."""
     return {"/tutorialScene": "tutorial", "/questScene": "quest"}.get(scene_arg or "", "normal")
 
 
@@ -141,15 +104,9 @@ class ModManifest:
     scenes: list = None                     # see mod_scenes(); None = every scene
 
     def install_name(self):
-        """The basename this mod's single .dll lands under in Mods/<id>/. Nothing
-        ever looks the file up by name: every operation works on the Mods/<id>/
-        folder, so the file just keeps the name it was published under, taken from
-        download_url. Two guards still apply, because a manifest from an unreviewed
-        repo can't be trusted: _safe_basename rejects any traversal (a '..', a path
-        separator, an empty/'.'/'..' name), and the result must end in '.dll' or
-        MelonLoader won't load it; either failure falls back to f"{id}.dll" (id is
-        already a validated safe segment). Only meaningful for package="dll"; a zip
-        bundle names its own files."""
+        """The basename a package="dll" mod's file gets in Mods/<id>/: the name it
+        was published under (from download_url), unless that fails
+        _safe_basename or doesn't end in .dll, in which case f"{id}.dll"."""
         base = os.path.basename(urlparse(self.download_url).path)
         try:
             safe = _safe_basename(base)
@@ -160,13 +117,9 @@ class ModManifest:
 
 @dataclass
 class ModSummary:
-    """One (id, major) row from a repository.json index. This is ALL the index
-    carries now: enough to browse and to pick a version, but none of the
-    install-critical data. download_url/sha256/dependencies live only in the
-    per-version manifest (manifests/<author>/<repo>/<version>.json), which is
-    fetched on demand, so those facts have exactly one home and can't drift
-    between the index and the manifest. `versions` is every release in this major;
-    the highest is the default install and max(versions) drives resolution."""
+    """One (id, major) row of repository.json: enough to browse and pick a
+    version. Install-critical facts (download_url, sha256, dependencies) live
+    only in the per-version manifest, so the two can't drift."""
     id: str
     name: str
     author: str
@@ -200,10 +153,9 @@ def _library_from_dict(d):
 
 
 def _manifest_from_dict(d, source_repo):
-    """Builds a ModManifest from a parsed manifest object. Returns None (with a
-    warning) if manifest_version's major isn't one we support; the caller drops
-    it rather than mis-parsing a future shape. Raises ModManagerError only for a
-    manifest that claims a supported version but is structurally broken."""
+    """A ModManifest from a parsed manifest, or None (with a warning) for an
+    unsupported schema major or package type. Raises for a supported manifest
+    that is structurally broken."""
     mv = d.get("manifest_version")
     if not isinstance(mv, int):
         _warn(f"manifest for {d.get('id', '?')} has no integer manifest_version, skipped.")
@@ -245,9 +197,9 @@ def _manifest_from_dict(d, source_repo):
 
 
 def _summary_from_dict(d, mod_id, source_repo):
-    """Builds a ModSummary from one repository.json (id, major) entry. Returns
-    None (with a warning) if it has no usable versions; the index is discovery
-    data, so a broken entry is skipped, not fatal."""
+    """A ModSummary from one repository.json (id, major) entry, or None (with a
+    warning) when it has no usable versions or parity_required. The index is
+    discovery data, so a bad entry is skipped, not fatal."""
     raw = d.get("versions")
     if not isinstance(raw, list):
         _warn(f"index entry for {mod_id} in {source_repo} has no versions list, skipped.")
@@ -264,15 +216,13 @@ def _summary_from_dict(d, mod_id, source_repo):
     try:
         required = parity_required(d)
     except ModManagerError as e:
-        # One malformed entry shouldn't cost the whole index. Skipped rather
-        # than guessed at, same as an entry with no usable versions.
         _warn(f"index entry for {mod_id} has no usable parity_required "
               f"({e}), skipped.")
         return None
     try:
         scenes = mod_scenes(d)
     except ModManagerError as e:
-        # Display-only here (installs read the manifest's own), so a bad value
+        # Display-only here (installs read the manifest's), so a bad value
         # costs the tag, not the mod.
         _warn(f"index entry for {mod_id}: {e} Shown as working in every scene.")
         scenes = None
