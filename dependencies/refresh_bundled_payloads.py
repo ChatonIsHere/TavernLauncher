@@ -1,21 +1,14 @@
 """Re-cuts Patch/ from the current published release of each Setup payload,
 and rewrites Patch/bundled.json to describe exactly what it fetched.
 
-Run at build time (BUILD_EXECUTABLES.bat does), because a bundled payload is
-only worth shipping while it's current. The last time these files were
-committed by hand they drifted: the copy of themoddingtavern.dll in the repo
-was several hundred bytes off the published release, so every offline install
-would have applied a patch that was already superseded -- and nothing would
-have said so.
-
-Fetches through the launcher's own _download_with_retries /
-_get_latest_release_tag / _verify_payload_type, deliberately: what ships is
-then fetched by the same code, with the same length and payload-type checks,
-that an end user's install would use.
-"""
+Run at build time (BUILD_EXECUTABLES.bat does), so the offline fallback is as
+current as the build. Fetches through the launcher's own download, tag and
+payload-type helpers, so what ships passed the same checks a user's install
+would."""
 import json
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -36,32 +29,47 @@ TARGETS = [
 
 
 def _quiet(message):
-    """Swallows the per-chunk progress lines; a build log doesn't want 300
-    percentage updates, and the failures all raise rather than report."""
+    """Swallows per-chunk progress; failures raise instead."""
 
 
 def refresh():
+    """Downloads every target to a temp file beside its destination, verifies
+    it, and only once all of them have succeeded swaps them in and rewrites
+    bundled.json. Any failure leaves Patch/ exactly as it was, still matching
+    the manifest that describes it."""
     dest_dir = bundled_dir()
     os.makedirs(dest_dir, exist_ok=True)
-    manifest = {}
-    for component, url, filename, kind, extra in TARGETS:
-        dest = os.path.join(dest_dir, filename)
-        tag = _get_latest_release_tag(url)
-        if not tag:
-            # Without a tag the payload can't be ordered against an installed
-            # version, so usable_payload would refuse to ever use it. Shipping
-            # it anyway would be dead weight that looks like a fallback.
-            raise RuntimeError(f"Couldn't resolve the release tag for {component} from {url}")
-        _download_with_retries(url, dest, _quiet, require_length=True)
-        _verify_payload_type(dest, url, kind)
-        manifest[component] = dict(
-            filename=filename, tag=tag, sha256=_sha256_file(dest),
-            size=os.path.getsize(dest), **extra)
-        print(f"  {component:12} {tag:10} {os.path.getsize(dest):>12,} bytes")
+    manifest, staged = {}, []
+    try:
+        for component, url, filename, kind, extra in TARGETS:
+            tag = _get_latest_release_tag(url)
+            if not tag:
+                # usable_payload can't order an untagged payload, so it would
+                # never be used: dead weight that looks like a fallback.
+                raise RuntimeError(f"Couldn't resolve the release tag for {component} from {url}")
+            fd, tmp = tempfile.mkstemp(prefix=f".{filename}.", suffix=".part", dir=dest_dir)
+            os.close(fd)
+            staged.append((tmp, os.path.join(dest_dir, filename)))
+            _download_with_retries(url, tmp, _quiet, require_length=True)
+            _verify_payload_type(tmp, url, kind)
+            manifest[component] = dict(
+                filename=filename, tag=tag, sha256=_sha256_file(tmp),
+                size=os.path.getsize(tmp), **extra)
 
-    with open(os.path.join(dest_dir, BUNDLED_MANIFEST_NAME), "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, sort_keys=True)
-        f.write("\n")
+        fd, manifest_tmp = tempfile.mkstemp(prefix=".bundled.", suffix=".part", dir=dest_dir)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, sort_keys=True)
+            f.write("\n")
+        staged.append((manifest_tmp, os.path.join(dest_dir, BUNDLED_MANIFEST_NAME)))
+        for tmp, dest in staged:
+            os.replace(tmp, dest)
+    finally:
+        for tmp, _dest in staged:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+    for component, entry in manifest.items():
+        print(f"  {component:12} {entry['tag']:10} {entry['size']:>12,} bytes")
     return manifest
 
 
@@ -69,12 +77,8 @@ if __name__ == "__main__":
     try:
         refresh()
     except Exception as e:
-        # Non-fatal by design: a build on a machine that can't reach GitHub
-        # should still produce working executables, shipping whatever Patch/
-        # already holds. Those payloads are verified against the manifest that
-        # describes them, so an untouched Patch/ stays internally consistent --
-        # it just means the offline fallback is as old as the last successful
-        # refresh. The caller decides what to do with the exit code.
+        # Non-fatal: a failed refresh leaves Patch/ untouched and consistent
+        # with bundled.json, just older. The caller decides on the exit code.
         print(f"  [WARN] Couldn't refresh the bundled payloads: {e}")
         print("  [WARN] Building with whatever Patch/ already contains.")
         sys.exit(1)
