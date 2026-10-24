@@ -1,7 +1,7 @@
 """Turning a server's mod list into an active set: what to install, update,
 enable, or deactivate for this join, and rendering that plan onto disk."""
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from tavern_shared.mods.cache import (
     _cache_mod_dir, _ensure_library, cache_restore_mod, cache_store_library,
@@ -50,11 +50,12 @@ class JoinPlan:
     pin_conflicts: list      # [(mod_id, pinned_version, server_version)] - a pinned mod's
                              # exact version disagrees with what the server runs; the
                              # user decides whether to unpin or accept the server's version
-    declined: list = None    # [(mod_id, version)] mods this server runs and doesn't require
+    declined: list = field(default_factory=list)
+                             # [(mod_id, version)] mods this server runs and doesn't require
                              # that the user has already said no to. Not in the active set
                              # and not touched on disk; carried so the comparison can show
                              # them and let the choice be taken back
-    unresolved_pins: list = None
+    unresolved_pins: list = field(default_factory=list)
                              # [(mod_id, version_or_"latest")] the user's OWN always-on pins
                              # that resolve from nowhere - a typo'd id, or a version its
                              # author has since unpublished. Kept strictly apart from
@@ -64,12 +65,6 @@ class JoinPlan:
                              # and no server ever asked for it. Folding them together (as
                              # this once did) meant one bad pin blocked EVERY join, on every
                              # server, reported as though the server had demanded it.
-
-    def __post_init__(self):
-        if self.declined is None:
-            self.declined = []
-        if self.unresolved_pins is None:
-            self.unresolved_pins = []
 
     @property
     def blocking(self):
@@ -278,37 +273,16 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
 # What will happen to each mod. The first six change the client; the rest are
 # informational or blocking.
 ACTION_INSTALL     = "install"      # not here at all, needs downloading
-
-
 ACTION_ACTIVATE    = "activate"     # in the local cache at this version, a file move
-
-
 ACTION_UPDATE      = "update"       # installed at a lower version
-
-
 ACTION_DOWNGRADE   = "downgrade"    # installed higher; the server pins an exact version
-
-
 ACTION_ENABLE      = "enable"       # installed at the right version, currently disabled
-
-
 ACTION_DEACTIVATE  = "deactivate"   # active here, not part of this server's set
-
-
 ACTION_MATCH       = "match"        # already correct, nothing to do
-
-
 ACTION_SKIPPED     = "skipped"      # recommended, and the user has said no to it here
-
-
 ACTION_SERVER_ONLY = "server-only"  # the server runs it, clients never need it
-
-
 ACTION_MISSING     = "missing"      # required, and no configured repo has it
-
-
 ACTION_NEEDS_REPO  = "needs-repo"   # resolvable, but only from a repo not added here
-
 
 # Sort weight: problems first, then real changes, then the quiet rows.
 _ACTION_ORDER = {
@@ -419,83 +393,56 @@ def build_mod_diff(game_dir, server_mods, plan):
             source_repo=e.source_repo, note=note, cached=e.cached,
             name=e.manifest.name))
 
-    for mod_id in plan.to_deactivate:
+    seen = {r.mod_id for r in rows}
+
+    def add(mod_id, **row):
+        """One row per mod: the first list to mention a mod owns its row.
+        Client-side columns come from the install record unless given."""
+        if mod_id in seen:
+            return
+        seen.add(mod_id)
         rec = installed.get(mod_id, {})
-        rows.append(DiffRow(
-            mod_id=mod_id, server_version="", client_version=rec.get("version", ""),
-            client_enabled=True, action=ACTION_DEACTIVATE, reason="", optional=True,
-            source_repo=rec.get("source_repo", ""),
+        row.setdefault("client_version", rec.get("version", ""))
+        row.setdefault("client_enabled", bool(rec.get("enabled")))
+        row.setdefault("source_repo", rec.get("source_repo", ""))
+        row.setdefault("name", rec.get("name", mod_id))
+        rows.append(DiffRow(mod_id=mod_id, **row))
+
+    for mod_id in plan.to_deactivate:
+        add(mod_id, server_version="", client_enabled=True, action=ACTION_DEACTIVATE,
+            reason="", optional=True,
             note=("this server doesn't run it; keeping it on won't block your "
                   "join. Pin keeps it enabled on every server, so it stops "
                   "being offered for deactivation at all (same as Mod "
-                  "Manager's Keep Enabled)."),
-            name=rec.get("name", mod_id)))
-
-    seen = {r.mod_id for r in rows}
+                  "Manager's Keep Enabled)."))
     for mod_id, version in plan.declined:
-        if mod_id in seen:
-            continue
-        rec = installed.get(mod_id, {})
-        rows.append(DiffRow(
-            mod_id=mod_id, server_version=version,
-            client_version=rec.get("version", ""),
-            client_enabled=bool(rec.get("enabled")), action=ACTION_SKIPPED,
+        add(mod_id, server_version=version, action=ACTION_SKIPPED,
             reason="recommended", optional=True,
-            source_repo=rec.get("source_repo", ""),
-            note="you've chosen not to install this one for this server",
-            name=rec.get("name", mod_id)))
-        seen.add(mod_id)
-
+            note="you've chosen not to install this one for this server")
     for m in server_mods:
-        if m["id"] in seen or m.get("client_side"):
-            continue
-        rows.append(DiffRow(
-            mod_id=m["id"], server_version=m.get("version", ""), client_version="",
-            client_enabled=False, action=ACTION_SERVER_ONLY, reason="",
-            optional=False, source_repo=m.get("source_repo", ""),
-            note="runs on the server only", name=m.get("name", m["id"])))
-        seen.add(m["id"])
-
+        if not m.get("client_side"):
+            add(m["id"], server_version=m.get("version", ""), client_version="",
+                client_enabled=False, action=ACTION_SERVER_ONLY, reason="",
+                optional=False, source_repo=m.get("source_repo", ""),
+                note="runs on the server only", name=m.get("name", m["id"]))
     for mod_id, version in plan.missing:
-        if mod_id in seen:
-            continue
-        rec = installed.get(mod_id, {})
-        rows.append(DiffRow(
-            mod_id=mod_id, server_version=version, client_version=rec.get("version", ""),
-            client_enabled=bool(rec.get("enabled")), action=ACTION_MISSING,
-            reason="required", optional=False, source_repo="",
-            note="not in any source you've added", name=rec.get("name", mod_id)))
-        seen.add(mod_id)
-
+        add(mod_id, server_version=version, action=ACTION_MISSING, reason="required",
+            optional=False, source_repo="", note="not in any source you've added")
     for mod_id, version, repo in plan.needs_repo:
-        if mod_id in seen:
-            continue
-        rec = installed.get(mod_id, {})
-        rows.append(DiffRow(
-            mod_id=mod_id, server_version=version, client_version="",
-            client_enabled=False, action=ACTION_NEEDS_REPO, reason="required",
-            optional=False, source_repo=repo,
-            note=f"add {_repo_shorthand(repo)} as a source, then check again",
-            name=rec.get("name", mod_id)))
-        seen.add(mod_id)
-
+        add(mod_id, server_version=version, client_version="", client_enabled=False,
+            action=ACTION_NEEDS_REPO, reason="required", optional=False,
+            source_repo=repo,
+            note=f"add {_repo_shorthand(repo)} as a source, then check again")
     # server_version stays empty: this server never asked for it, which is
-    # exactly what distinguishes these rows from plan.missing above. reason
-    # "pinned" is what keeps DiffRow.blocking false, so an unfixable pin can
-    # be seen without disabling Apply.
+    # what tells these rows apart from plan.missing. reason "pinned" keeps
+    # DiffRow.blocking false, so an unfixable pin is visible without
+    # disabling Apply.
     for mod_id, version in plan.unresolved_pins:
-        if mod_id in seen:
-            continue
-        rec = installed.get(mod_id, {})
-        rows.append(DiffRow(
-            mod_id=mod_id, server_version="", client_version=rec.get("version", ""),
-            client_enabled=bool(rec.get("enabled")), action=ACTION_MISSING,
-            reason="pinned", optional=False, source_repo="",
+        add(mod_id, server_version="", action=ACTION_MISSING, reason="pinned",
+            optional=False, source_repo="",
             note=f"you pinned this ({version}), but no source you've added has "
                  f"it. This server doesn't run it either, so it won't stop you "
-                 f"joining - remove the pin in Mod Manager to clear this.",
-            name=rec.get("name", mod_id)))
-        seen.add(mod_id)
+                 f"joining - remove the pin in Mod Manager to clear this.")
 
     # Sorted by display name, not id, so the on-screen order matches what's
     # actually shown - a mod_id-sorted list would look shuffled once the
