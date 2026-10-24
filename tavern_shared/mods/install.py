@@ -96,18 +96,18 @@ def _safe_extract_zip(zip_path, dest_dir):
             raise ModManagerError(
                 f"This mod archive has {len(infos)} entries, over the "
                 f"{_ZIP_MAX_ENTRIES} limit; refusing to extract it.")
+        # A root-level manifest.json is a natural thing for a mod to ship (it's
+        # MelonLoader's folder marker too), but the install record is written
+        # under that name AFTER the tree is hashed, so extracting it would
+        # record bytes the record then overwrites: a permanent "damaged"
+        # verdict. Matched on the resolved path, case-insensitively, so
+        # "Manifest.json" and "./manifest.json" are caught too (NTFS treats
+        # them as the same file). TavernLib's SafeExtractZip skips the same set.
+        record_paths = {os.path.normcase(os.path.join(dest_root, n))
+                        for n in (RECORD_NAME, DISABLED_RECORD_NAME)}
         written = 0
         for info in infos:
             name = info.filename
-            # A root-level manifest.json is a natural thing for a mod to ship
-            # (it's MelonLoader's folder marker too), but the install record is
-            # written under exactly that name AFTER the extracted tree is
-            # hashed - so extracting it would record the archive's bytes and
-            # then overwrite them, a permanent "damaged" verdict that reinstalls
-            # the mod on every headless boot. TavernLib's SafeExtractZip skips
-            # the same names.
-            if name in (RECORD_NAME, DISABLED_RECORD_NAME):
-                continue
             # Absolute paths never belong in a mod archive, and a colon
             # anywhere is refused rather than just a drive letter in position
             # 1: on NTFS "mod.dll:payload" writes an alternate data stream
@@ -131,6 +131,8 @@ def _safe_extract_zip(zip_path, dest_dir):
             if target != dest_root and not target.startswith(dest_root + os.sep):
                 raise ModManagerError(
                     f"Unsafe archive entry {name!r}: escapes the mod folder.")
+            if os.path.normcase(target) in record_paths:
+                continue
             if info.is_dir():
                 os.makedirs(target, exist_ok=True)
                 continue
