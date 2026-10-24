@@ -18,7 +18,9 @@ from tavern_shared.mods.layout import (
 from tavern_shared.mods.manifest import parity_required, runs_in_scene
 from tavern_shared.mods.pins import _parse_pin_entry
 from tavern_shared.mods.repos import _norm, _repo_shorthand
-from tavern_shared.mods.resolve import _fetch_manifest, resolve_dependencies
+from tavern_shared.mods.resolve import (
+    _fetch_manifest, _index_source, resolve_dependencies,
+)
 from tavern_shared.mods.version import _parse_version
 
 
@@ -148,7 +150,8 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
         tags have genuinely different consequences and must not share a bucket:
         only something the server requires can make a join impossible."""
         try:
-            manifest = _fetch_manifest(repo_bases, mod_id, version)
+            manifest = _fetch_manifest(repo_bases, mod_id, version,
+                                       _index_source(index, mod_id, repo_bases, version))
         except ModManagerError:
             if tag == "pinned":
                 # The user's own always-on pin, which this server never asked
@@ -640,7 +643,8 @@ def resolve_missing_mods(missing, index, repo_bases):
     for entry in missing:
         mod_id, version = entry["id"], entry["version"]
         try:
-            roots.append(_fetch_manifest(repo_bases, mod_id, version))
+            roots.append(_fetch_manifest(repo_bases, mod_id, version,
+                                         _index_source(index, mod_id, repo_bases, version)))
         except ModManagerError:
             hint = entry.get("source_repo")
             if hint and _norm(hint) not in [_norm(b) for b in repo_bases]:

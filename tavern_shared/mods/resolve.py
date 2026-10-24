@@ -196,6 +196,18 @@ def _repo_order(repo_bases, prefer_repo):
     return order
 
 
+def _index_source(index, mod_id, repo_bases, version=None):
+    """The repo the merged index found mod_id in (preferring the entry that
+    lists `version`), so a fetch can try it first instead of 404ing through
+    the default repo. Only ever one of repo_bases: a hint can't add a source."""
+    trusted = {_norm(b) for b in repo_bases}
+    hits = [s for s in index if s.id == mod_id and _norm(s.source_repo) in trusted]
+    for s in hits:
+        if version is None or version in s.versions:
+            return s.source_repo
+    return hits[0].source_repo if hits else None
+
+
 def _fetch_manifest_leaf(repo_bases, mod_id, leaf, prefer_repo=None, what=None,
                          expect_version=None):
     """Fetches one manifest file (leaf, e.g. "1.0.4.json" or "latest.1.json") from

@@ -19,7 +19,7 @@ from tavern_shared.mods.install import (
 from tavern_shared.mods.pins import _parse_pin_entry
 from tavern_shared.mods.repos import list_repos_named
 from tavern_shared.mods.resolve import (
-    _fetch_manifest, resolve_dependencies, resolve_mod_by_id,
+    _fetch_manifest, _index_source, resolve_dependencies, resolve_mod_by_id,
 )
 
 
@@ -104,9 +104,10 @@ def import_modlist(modlist, index, repo_bases, side):
     unresolved = []
     for entry in modlist.get("mods", []):
         mod_id, version = _parse_pin_entry(entry)
+        prefer = _index_source(index, mod_id, repo_bases, version)
         try:
-            roots.append(_fetch_manifest(repo_bases, mod_id, version) if version
-                        else resolve_mod_by_id(repo_bases, mod_id))
+            roots.append(_fetch_manifest(repo_bases, mod_id, version, prefer) if version
+                         else resolve_mod_by_id(repo_bases, mod_id, prefer))
         except ModManagerError:
             unresolved.append((mod_id, version))
 
