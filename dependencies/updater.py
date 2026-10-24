@@ -92,6 +92,7 @@ process was actually launched to finish an update.
 
 import sys
 import os
+import json
 import time
 import threading
 import subprocess
@@ -292,6 +293,103 @@ def _open_zip_with_retry(path, retries=8, delay=1.0):
         "again in a few seconds, or temporarily disable real-time scanning and retry.")
 
 
+PARTIAL_UPDATE_MARKER = "partial_update.json"
+
+
+def _marker_path():
+    """Deliberately in AppData, not next to the exe. The marker exists to
+    report that writing next to the exe was blocked, so writing the report
+    itself into that same folder is the one place it is most likely to fail.
+
+    Duplicates tavern_shared.paths._tavern_data_dir rather than importing it:
+    this module is stdlib-only on purpose, because finish_update_if_requested
+    runs from the staging folder before the rest of the app is in place."""
+    base = os.environ.get("APPDATA", os.path.join(os.path.expanduser("~"), "AppData", "Roaming"))
+    return os.path.join(base, "TheModdingTavern", PARTIAL_UPDATE_MARKER)
+
+
+def _same_install(a, b):
+    """Whether two install-dir paths name the same folder. One marker path
+    serves both launchers (see _marker_path), so the install_dir recorded
+    inside it is the only thing keeping the client from consuming a report
+    that belongs to the server install, or vice versa. realpath+normcase so
+    a case-only or 8.3-short-name difference in how the two processes
+    spelled the same folder doesn't read as foreign."""
+    try:
+        return (os.path.normcase(os.path.realpath(a)) ==
+                os.path.normcase(os.path.realpath(b)))
+    except (TypeError, ValueError, OSError):
+        return False
+
+
+def _write_partial_update_marker(install_dir, failed):
+    try:
+        path = _marker_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"when": time.strftime("%Y-%m-%d %H:%M:%S"),
+                       "install_dir": install_dir,
+                       "files": failed}, f)
+    except Exception:
+        pass
+
+
+def read_partial_update_marker():
+    """What the app calls on startup to find out whether the update it just
+    applied actually replaced everything. Returns the marker dict, or None if
+    the last update was clean. Clearing it is the caller's job (see
+    clear_partial_update_marker) so it survives until it has been shown.
+
+    The marker file is shared by both launchers, so one recorded for a
+    different install dir is the OTHER launcher's still-unshown report:
+    answered with None, and deliberately not cleared, so the launcher it
+    belongs to still finds it on its own next start."""
+    try:
+        with open(_marker_path(), "r", encoding="utf-8") as f:
+            marker = json.load(f)
+    except Exception:
+        return None
+    if not _same_install(marker.get("install_dir"),
+                         os.path.dirname(sys.executable)):
+        return None
+    return marker
+
+
+def clear_partial_update_marker(install_dir=None):
+    """Removes the marker — but only if it belongs to install_dir (default:
+    this process's own install). The path is shared by both launchers, so an
+    unconditional remove would eat the other launcher's still-unshown report;
+    an unreadable marker is removed regardless, since it can't be shown to
+    anyone. finish_update_if_requested passes install_dir explicitly because
+    its own sys.executable still points into the staging folder."""
+    if install_dir is None:
+        install_dir = os.path.dirname(sys.executable)
+    try:
+        with open(_marker_path(), "r", encoding="utf-8") as f:
+            if not _same_install(json.load(f).get("install_dir"), install_dir):
+                return
+    except OSError:
+        return  # nothing there to clear
+    except Exception:
+        pass
+    try:
+        os.remove(_marker_path())
+    except OSError:
+        pass
+
+
+def partial_update_message(files):
+    """The dialog text for a marker's files, shown by the relaunched app."""
+    return (f"The launcher itself updated, but {len(files)} file(s) couldn't be "
+            "replaced:\n\n" + "\n".join(f"  • {f}" for f in files[:10])
+            + ("\n  • …" if len(files) > 10 else "")
+            + "\n\nThey were most likely locked by antivirus, or blocked by "
+              "Windows' Controlled Folder Access. The launcher is running the new "
+              "version, but these files are still the old ones.\n\n"
+              "Re-running the update usually fixes it. If it doesn't, add an "
+              "exclusion for the launcher's folder in Windows Security first.")
+
+
 def _log_update_event(msg):
     """A plain append-only log file, separate from the in-app progress
     label — the whole point of a persistent, on-disk log is that it's
@@ -343,6 +441,20 @@ def _download_to_file(url, dest_path, on_progress, max_total_seconds=180):
                                         f"({downloaded//1024//1024:,} / {total//1024//1024:,} MB)")
                         else:
                             on_progress(f"Downloading… {downloaded//1024:,} KB")
+            # read() returning b"" means "no more data", not "complete", so a
+            # connection cut mid-transfer ends the loop like a finished one.
+            if total is not None and downloaded != total:
+                pct = int(downloaded * 100 / max(1, total))
+                raise RuntimeError(
+                    f"The update download ended early — got {downloaded:,} of "
+                    f"{total:,} bytes ({pct}%).\n\n"
+                    "The connection was cut part-way through rather than refused "
+                    "outright, which is usually antivirus, a VPN, or a proxy "
+                    "interrupting the transfer. Nothing was installed — this "
+                    "failed before anything was touched, so the current version "
+                    "is genuinely unaffected.\n\n"
+                    "Try again, or download the release manually from:\n"
+                    f"https://github.com/{REPO}/releases/latest")
             if total:
                 on_progress(f"Downloading… 100%  ({total//1024//1024:,} / {total//1024//1024:,} MB)")
         except Exception:
@@ -489,13 +601,19 @@ def finish_update_if_requested():
     def _sync_folder(src_dir, dst_dir, label):
         """Copies every file from src_dir into dst_dir (preserving the
         relative structure), skipping any file whose destination copy is
-        already identical. Deliberately never deletes anything from
-        dst_dir that isn't present in src_dir -- a user's own third-party
-        addon sitting in addons/ (never part of any official release)
-        must never be touched by this, same reasoning as why this has
-        never deleted anything from Patch/ either."""
+        already identical. Returns the "label/rel" paths that did NOT end up
+        matching the source (a locked or Controlled-Folder-Access-blocked
+        file), so the update can be reported as partial rather than clean.
+        Each copy is verified by reading it back: shutil.copy2 raising nothing
+        doesn't establish that anything was written.
+
+        Deliberately never deletes anything from dst_dir that isn't present in
+        src_dir -- a user's own third-party addon sitting in addons/ (never
+        part of any official release) must never be touched by this, same
+        reasoning as why this has never deleted anything from Patch/ either."""
+        failed = []
         if not os.path.isdir(src_dir):
-            return
+            return failed
         for root, _dirs, files in os.walk(src_dir):
             for fn in files:
                 src_file = os.path.join(root, fn)
@@ -509,13 +627,23 @@ def finish_update_if_requested():
                 try:
                     _retry_on_lock(_copy_one, what=f"updating {label}/{rel}")
                 except RuntimeError as e:
-                    _log_update_event(f"(non-fatal) {e}")
+                    _log_update_event(f"FAILED: {e}")
+                    failed.append(f"{label}/{rel}")
+                    continue
+                if _files_differ(src_file, dst_file):
+                    _log_update_event(
+                        f"FAILED: {label}/{rel} copied without error but still "
+                        "doesn't match the new version — the write was silently "
+                        "blocked (Controlled Folder Access / antivirus).")
+                    failed.append(f"{label}/{rel}")
+        return failed
 
     install_dir = os.path.dirname(old_exe)
 
     # Patch/ files ship alongside the new exe the same way a code update
     # does — copy over whatever changed.
-    _sync_folder(os.path.join(staging_dir, "Patch"), os.path.join(install_dir, "Patch"), "Patch")
+    failed = _sync_folder(os.path.join(staging_dir, "Patch"),
+                          os.path.join(install_dir, "Patch"), "Patch")
 
     # addons/ similarly -- an addon author's release gets picked up here
     # automatically on the next update, same as any other code change,
@@ -523,9 +651,18 @@ def finish_update_if_requested():
     # Requires the release zip to actually include an addons/ folder
     # alongside the .exe and Patch/ -- see BUILD_EXECUTABLES.bat / the
     # release packaging notes for what each release zip should contain.
-    _sync_folder(os.path.join(staging_dir, "addons"), os.path.join(install_dir, "addons"), "addons")
+    failed += _sync_folder(os.path.join(staging_dir, "addons"),
+                           os.path.join(install_dir, "addons"), "addons")
 
-    _log_update_event("Update applied successfully, relaunching.")
+    if failed:
+        # The exe did update, so this is partial, not failed. This process
+        # has no UI, so the marker is how the relaunched app gets to say so.
+        _log_update_event(f"PARTIAL UPDATE — {len(failed)} file(s) not replaced: "
+                          + ", ".join(failed))
+        _write_partial_update_marker(install_dir, failed)
+    else:
+        clear_partial_update_marker(install_dir)
+        _log_update_event("Update applied successfully, relaunching.")
     try:
         subprocess.Popen([old_exe])
     except Exception as e:
