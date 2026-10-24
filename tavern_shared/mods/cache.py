@@ -1,5 +1,6 @@
-"""The client mod cache: keeping a copy of what was installed so a later join
-can restore it without re-downloading."""
+"""The client mod cache: %AppData%/TheModdingTavern/mod_cache/<id>/<version>/
+and _libraries/<filename>/<sha256>/, so switching servers is a file move
+rather than a download."""
 import os
 import shutil
 import time
@@ -35,11 +36,9 @@ def _cache_library_dir(filename, sha256):
     return os.path.join(_cache_base(), "_libraries", _safe_basename(filename), sha256)
 
 
-# How many cached versions of one mod are kept: the server's current version,
-# the previous one, and one the user pinned. Pruned oldest-stored-first by the
-# entry directory's mtime, which cache_store_mod stamps when the entry lands
-# (copytree would otherwise carry over the install's mtime), never touching
-# the version just stored.
+# Cached versions kept per mod: the server's current, the previous, and one
+# pinned. Pruned oldest-stored-first by the entry's mtime, which
+# cache_store_mod stamps on landing (copytree carries over the install's).
 _CACHE_KEEP_VERSIONS = 3
 
 
@@ -59,12 +58,9 @@ def _prune_mod_cache(mod_id, keep_version):
 
 
 def cache_store_mod(game_dir, mod_id):
-    """Copies a mod currently on disk (Mods/<id>/, enabled or disabled) into
-    the cache under its recorded version, if not already there. Returns the
-    version stored, or None if the mod isn't actually installed. Safe to call
-    repeatedly - a version already in the cache is left untouched. A new store
-    also prunes that mod's oldest cached versions past _CACHE_KEEP_VERSIONS,
-    so the cache stays bounded without a manual clear."""
+    """Copies Mods/<id>/ (enabled or disabled) into the cache under its recorded
+    version unless already cached, then prunes that mod's older entries.
+    Returns the version, or None if it isn't installed or is damaged."""
     rec = _read_mod_record(game_dir, mod_id)
     if not rec or not rec.get("version"):
         return None
@@ -80,8 +76,7 @@ def cache_store_mod(game_dir, mod_id):
     if os.path.isdir(staging):
         shutil.rmtree(staging, ignore_errors=True)
     shutil.copytree(src, staging)
-    # The cache doesn't track enabled/disabled (that's a Mods/-only concept) -
-    # normalize to the plain record name so cache_restore_mod always finds it.
+    # The cache has no disabled state; restore always looks for RECORD_NAME.
     disabled = os.path.join(staging, DISABLED_RECORD_NAME)
     if os.path.isfile(disabled):
         os.replace(disabled, os.path.join(staging, RECORD_NAME))
@@ -94,9 +89,8 @@ def cache_store_mod(game_dir, mod_id):
 
 
 def cache_store_library(game_dir, filename):
-    """Copies a UserLibs/ library currently on disk into the cache under its
-    recorded sha256, if not already there. Returns the sha256 stored, or None
-    if the library or its sidecar isn't actually present."""
+    """Copies an intact UserLibs/ library into the cache under its sha256 unless
+    already cached. Returns the sha256, or None if it isn't present intact."""
     src = os.path.join(_userlibs_dir(game_dir), filename)
     sidecar = _library_sidecar_path(game_dir, filename)
     meta = _read_sidecar(sidecar)
@@ -121,33 +115,18 @@ def cache_store_library(game_dir, filename):
 
 
 def clear_mod_cache():
-    """Deletes the entire client mod cache (every cached mod version and
-    library). Mods/ itself is untouched - this only resets the
-    switch-servers-without-redownloading optimization, forcing the next
-    install or join to fetch fresh from source instead of reusing a local
-    copy. The fix for a cache entry that's gone stale, e.g. one written
-    before a manifest field parity_required() now requires existed - since
-    the cache is keyed on id+version alone, a version bump upstream is the
-    only thing that normally invalidates an entry."""
+    """Deletes the whole mod cache; Mods/ is untouched. Entries are keyed on
+    id+version alone, so this is the fix for one that has gone stale."""
     base = _cache_base()
     if os.path.isdir(base):
         shutil.rmtree(base)
 
 
 def adopt_installed_mods(game_dir):
-    """Copies everything currently installed in Mods/ (and the UserLibs/
-    libraries they pin) into the cache, without touching Mods/ itself.
-    Idempotent - already-cached versions are skipped - so it's safe to call on
-    every join; the client launcher calls it from _build_mod_plan, before any
-    plan is computed or applied.
-
-    Running it before a render is what makes the cache's "switching servers is
-    a file move, never a re-download" promise actually hold. Anything that
-    installed straight to Mods/ (the Community Mods window, or an older
-    launcher with no cache) is otherwise unknown to the cache, so rendering a
-    different version over it destroys the only copy of the version that was
-    there. Returns the list of mod ids newly adopted (already-cached ones don't
-    count)."""
+    """Caches everything in Mods/ (and the libraries it pins) without touching
+    Mods/. The client calls it before planning a join: a mod installed straight
+    into Mods/ is otherwise unknown to the cache, and rendering another version
+    over it would destroy the only copy. Returns the ids newly cached."""
     adopted = []
     for rec in list_installed_mods(game_dir):
         version = rec.get("version")
@@ -162,22 +141,12 @@ def adopt_installed_mods(game_dir):
 
 
 def cache_restore_mod(game_dir, mod_id, version):
-    """Copies a cached mod version into Mods/<id>/, enabled, replacing
-    whatever's currently there (assembled in staging, swapped in atomically -
-    same pattern install_mod uses). A folder we didn't install is displaced
-    rather than replaced, same as install_mod: this runs on every join that
-    switches versions, so it's the likeliest of the two to meet one. Raises if
-    that exact version isn't cached.
-
-    The staged copy is verified against the record's "files" map before the
-    swap, the same check downloads get via their sha256: the cache lives in
-    %AppData% for months and nothing else ever re-reads it, so silent
-    corruption (or tampering) there would otherwise be installed as-is. A
-    failed verify discards BOTH the staging and the cache entry itself and
-    raises - render_active_set catches that and falls back to a fresh
-    download, so a rotten cache entry costs a download, never a broken mod.
-    An entry with no files map (cached from a pre-"files" install) is
-    restored unchecked, same terms as verify_mod_files' None."""
+    """Copies a cached version into Mods/<id>/, enabled, through staging and an
+    atomic swap; a folder that isn't ours is displaced, as install_mod does.
+    The staged copy is checked against the record's `files` first: a failure
+    discards the cache entry and raises, and render_active_set falls back to a
+    download. An entry without `files` is restored unchecked. Raises if that
+    version isn't cached."""
     src = _cache_mod_dir(mod_id, version)
     if not os.path.isdir(src):
         raise ModManagerError(f"'{mod_id}' {version} isn't in the local cache.")
@@ -233,13 +202,10 @@ def cache_restore_library(game_dir, filename, sha256):
 
 
 def _ensure_library(game_dir, lib, progress, verb="Restoring"):
-    """Puts one pinned library into UserLibs/ at its exact hash, unless it's
-    already there: from the cache when that content is cached (a file move),
-    downloaded and then cached otherwise. Returns True when anything was
-    written, False when the library was already in place - callers decide
-    whether that counts as work done. `verb` only labels the cached-path
-    progress line: the enable repair says "Restoring" where a join render
-    says "Installing", and those strings are what the user sees."""
+    """Puts one pinned library into UserLibs/ at its hash unless it's already
+    there: from the cache when cached and intact, downloaded (and cached)
+    otherwise. Returns whether anything was written. `verb` labels the cached
+    path's progress line."""
     filename = _safe_basename(lib.filename)
     if _library_present(game_dir, filename, lib.sha256):
         return False
@@ -257,23 +223,11 @@ def _ensure_library(game_dir, lib, progress, verb="Restoring"):
 
 
 def ensure_mod_libraries(game_dir, mod_id, on_progress=None):
-    """Puts every library a mod's record pins back into UserLibs/ at its
-    pinned hash - from the cache when it's there, downloaded otherwise.
-    Returns the filenames it had to restore (empty when everything was
-    already in place).
-
-    This is what makes a bare re-enable safe. Enabling is just a record
-    rename, but the join flow's _prune_orphaned_libraries removes any library
-    no ENABLED mod pins - so a mod deactivated by one join and re-enabled
-    later from the Mod Manager would load without its libraries and fail at
-    runtime, with nothing on screen connecting the failure to the prune that
-    caused it. The join flow itself doesn't need this (render_active_set runs
-    a library pass over the whole active set); the manager window's Enable
-    does, and calls it right after enable_mod succeeds.
-
-    A record entry that doesn't parse as a library (a hand-edited record) is
-    skipped with a warning rather than failing the enable: the mod's own
-    files are already on disk and enabled either way."""
+    """Restores every library a mod's record pins (cache first, else download)
+    and returns the filenames it had to restore. The manager window calls this
+    after a bare enable: the join flow prunes libraries no enabled mod pins, so
+    a re-enabled mod would otherwise load without them. An unparseable record
+    entry is skipped with a warning."""
     progress = on_progress or (lambda *_a: None)
     rec = _read_mod_record(game_dir, mod_id)
     restored = []
