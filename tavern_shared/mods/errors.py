@@ -3,15 +3,12 @@ import sys
 
 
 class ModManagerError(Exception):
-    """One error type the UI can catch and show verbatim. Every raise below
-    carries a specific, actionable message (which mods, which versions, which
-    repo) rather than a generic failure."""
+    """The mod manager's one error type, raised with a message the UI can show
+    verbatim."""
 
 
 def _warn(msg):
-    """Non-fatal problems (a skipped unknown-major manifest, an unreachable
-    third-party repo) print to stderr rather than raising, so one bad source
-    doesn't break the others. Kept tiny on purpose."""
+    """Non-fatal problems go to stderr, so one bad source doesn't break the rest."""
     try:
         print(f"[modmanager] {msg}", file=sys.stderr)
     except Exception:

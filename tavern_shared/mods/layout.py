@@ -1,29 +1,21 @@
-"""The on-disk install layout: Mods/<id>/ and its record, UserLibs/ sidecars,
-staging paths. This shape is a contract any other installer of these mods
-must match byte-for-byte -- keep it stable."""
+"""The on-disk install layout: Mods/<id>/ and its record, UserLibs/
+sidecars, staging paths. TavernLib's ModPaths mirrors it; any other
+installer must match it byte-for-byte."""
 import os
 
 from tavern_shared.mods.errors import ModManagerError
 
 
 def _safe_basename(name):
-    """Last-line path-traversal guard, applied to mod.filename and every
-    library_dependencies.filename right before it touches disk. Raises if name
-    has any directory part, contains '/' or '\\' or ':', or is '.' / '..'.
-
-    Re-checked here at write time regardless of any upstream validation: a
-    manifest fetched from an unreviewed third-party repo can't be trusted to
-    carry a clean filename, so install_mod/install_library_dependency verify it
-    themselves."""
+    """Raises unless name is a bare, non-empty basename with no path separator
+    and no colon. Re-checked at write time for every mod id and filename,
+    since a manifest from an unreviewed repo can't be trusted to be clean."""
     if not name or name in (".", ".."):
         raise ModManagerError(f"Unsafe filename {name!r}.")
     if "/" in name or "\\" in name:
         raise ModManagerError(f"Filename {name!r} must not contain a path separator.")
-    # A colon is a drive separator ("C:evil.dll" writes to another directory
-    # entirely) and, on NTFS, the alternate-data-stream separator: "mod.dll:x"
-    # opens a hidden stream on mod.dll rather than a file of its own.
-    # os.path.basename doesn't treat either as a directory part, so neither
-    # check above catches it. No legal Windows filename contains one.
+    # A drive separator ("C:evil.dll") or an NTFS alternate data stream
+    # ("mod.dll:x"); os.path.basename sees neither as a directory part.
     if ":" in name:
         raise ModManagerError(f"Filename {name!r} must not contain a colon.")
     if os.path.basename(name) != name:
@@ -31,27 +23,18 @@ def _safe_basename(name):
     return name
 
 
-# Installation
-
-# The record filename inside each mod folder. MUST be exactly "manifest.json":
-# recent MelonLoader only recurses into a Mods/ subfolder that contains a file by
-# this name (existence check only, content unread), so this record is also the
-# marker that makes the folder load. See the module docstring.
+# MUST be "manifest.json": MelonLoader only loads a Mods/ subfolder holding a
+# file by this name (existence only), so the record doubles as that marker.
 RECORD_NAME = "manifest.json"
 
 
-# A disabled mod keeps its folder and files but has its record renamed to this,
-# so the folder no longer contains a "manifest.json" and MelonLoader stops
-# scanning it (a first-level Mods/ subfolder with no manifest.json isn't loaded),
-# while this module still finds the folder by <id> and reads the record. Enabling
-# renames it back. The folder is NOT renamed, so the by-id path stays stable and
-# the folder isn't hidden from listing the way a dot-prefixed one would be.
+# Disabling renames the record to this, so MelonLoader skips the folder while
+# it keeps its by-id path.
 DISABLED_RECORD_NAME = "manifest.disabled.json"
 
 
 def _mods_base(game_dir):
-    # The Mods/ path WITHOUT creating it, for building paths in read-only code
-    # (status/listing) that shouldn't have the side effect of making folders.
+    # Not created: read-only callers shouldn't make folders.
     return os.path.join(game_dir, "Mods")
 
 
@@ -62,39 +45,27 @@ def _userlibs_dir(game_dir):
 
 
 def _displaced_base(game_dir):
-    # Where a Mods/<name>/ folder we didn't install goes when a mod of the same
-    # id needs that path (see install._clear_install_path). Dot-prefixed, so
-    # nothing that scans Mods/ - MelonLoader, list_installed_mods,
-    # list_untracked_mods - sees what's parked in here. TavernLib's
-    # ModPaths.DisplacedBase is the same location.
+    # Dot-prefixed, so nothing that scans Mods/ sees it. Same as TavernLib's
+    # ModPaths.DisplacedBase.
     return os.path.join(_mods_base(game_dir), ".displaced")
 
 
 def _mod_dir_path(game_dir, mod_id):
-    # A mod's own folder: Mods/<id>/. mod_id is guarded as a single path segment
-    # (an id from an unreviewed repo can't be trusted to be path-safe).
     return os.path.join(_mods_base(game_dir), _safe_basename(mod_id))
 
 
 def _mod_record_path(game_dir, mod_id):
-    # The record + MelonLoader marker inside the mod's folder (enabled state).
     return os.path.join(_mod_dir_path(game_dir, mod_id), RECORD_NAME)
 
 
 def _disabled_record_path(game_dir, mod_id):
-    # Where the record lives while the mod is disabled (no manifest.json present,
-    # so MelonLoader skips the folder).
     return os.path.join(_mod_dir_path(game_dir, mod_id), DISABLED_RECORD_NAME)
 
 
 def _staging_path(game_dir, mod_id):
-    # Where a mod is assembled before being swapped into place atomically. Dot-
-    # prefixed so MelonLoader ignores it even if a crash leaves one behind.
+    # Dot-prefixed so nothing loads one a crash leaves behind.
     return os.path.join(_mods_base(game_dir), f".{_safe_basename(mod_id)}.installing")
 
 
 def _library_sidecar_path(game_dir, filename):
-    # A library's record sits in UserLibs/ beside its .dll, keyed by filename
-    # (libraries have no id). Kept next to the artifact it describes so each
-    # folder is self-contained.
     return os.path.join(_userlibs_dir(game_dir), f"{filename}.meta.json")
