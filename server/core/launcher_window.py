@@ -374,15 +374,9 @@ class ServerLauncher(LauncherCommon, tk.Tk):
             try:
                 _updater.download_and_apply_update(url, UPDATE_APP_FOLDER,
                     on_progress=lambda m: self.after(0, lambda: self._print(m, "warn")))
-                # download_and_apply_update relaunches and calls os._exit() on
-                # success, and those are its last two statements — so every
-                # path that raises does so before them, and everything it
-                # touched up to that point lives in a temp staging folder. The
-                # installed copy really is untouched here, which is why the
-                # message below can say so. (The install itself happens in the
-                # relaunched process; when that half goes wrong it reports via
-                # _report_partial_update instead, since this handler is long
-                # gone by then.)
+                # download_and_apply_update relaunches and calls os._exit()
+                # on success; anything it raises comes before the installed
+                # copy is touched.
             except Exception as e:
                 self.after(0, lambda e=e: messagebox.showerror("Update failed",
                     f"Couldn't apply the update:\n{e}\n\n"
