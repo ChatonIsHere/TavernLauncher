@@ -672,101 +672,85 @@ def _install_melonloader(game_dir, arch, on_progress):
     _update_mod_meta(game_dir, changes, drop)
 
 
-def _install_tavernlib(game_dir, on_progress):
-    """Downloads and installs the latest TavernLib.dll, with retries, falling
-    back to the verified copy shipped in Patch/ when the download fails and
-    that copy would help (see tavern_shared.bundled). Always swaps the result
-    in atomically, so a failed/interrupted attempt can never leave a corrupt
-    half-downloaded file in place. The meta record is written only after the
-    installed file has been read back and matches what was staged — a failed
-    install never updates the recorded hash."""
-    plugins_dir = os.path.join(game_dir, "Plugins")
-    os.makedirs(plugins_dir, exist_ok=True)
-    dest = os.path.join(plugins_dir, TAVERNLIB_FILENAME)
-    tmp_dest = dest + ".download"
+def _install_dll_component(game_dir, component, url, dest, what, on_progress,
+                           install_broken, skip_if_current=False):
+    """The pipeline behind TavernLib and the patch, recorded under
+    `component`_* keys in the game dir's meta file.
 
+    Downloads with retries (Content-Length required: a bare DLL has no
+    structure of its own to fail on when truncated) and checks it really is
+    a DLL, recording GitHub's ETag as the update fingerprint. If the download
+    keeps failing, the verified copy in Patch/ stands in when usable_payload
+    allows (install_broken() is the caller's network-free reading), recorded
+    with a "bundled:<tag>" fingerprint no real ETag can equal, so the first
+    check that reaches GitHub reads 'outdated' and pulls the real release.
+    Either way the file is staged beside dest, swapped in atomically and read
+    back before anything is recorded. With skip_if_current, a dest already
+    identical isn't rewritten (or rescanned by antivirus).
+
+    Returns False if dest was already current, True if it was written.
+    Raises DownloadError when nothing usable is shipped (Setup offers manual
+    install), RuntimeError on a silently blocked write."""
+    tmp_dest = dest + ".download"
     try:
         try:
-            headers = _download_with_retries(TAVERNLIB_DOWNLOAD_URL, tmp_dest, on_progress,
-                                             require_length=True)
-            _verify_payload_type(tmp_dest, TAVERNLIB_DOWNLOAD_URL, "dll")
+            headers = _download_with_retries(url, tmp_dest, on_progress, require_length=True)
+            _verify_payload_type(tmp_dest, url, "dll")
             from_bundle = False
-            # Content-Length as the last resort mirrors _fetch_remote_fingerprint
-            # exactly: on a network whose proxy strips ETag/Last-Modified, the
-            # remote check falls back to the file's size, so the install has to
-            # record that same size or the two can never agree — a fresh install
-            # would sit at 'unrecorded' (Automatic Setup reinstalling every run),
-            # an existing one at a stale fingerprint reading 'outdated' forever.
-            # require_length=True above guarantees a Content-Length exists, so
-            # something is always recorded and one install always converges.
+            # Content-Length last, the same fallback _fetch_remote_fingerprint
+            # uses, or a proxy stripping ETags means the two never agree.
             fingerprint = (headers.get("ETag") or headers.get("Last-Modified")
                            or headers.get("Content-Length") or "")
         except DownloadError:
-            source = usable_payload("tavernlib", _tavernlib_local_state(game_dir)[1] is not None,
-                                    _load_mod_meta(game_dir).get("tavernlib_tag"))
+            source = usable_payload(component, install_broken(),
+                                    _load_mod_meta(game_dir).get(f"{component}_tag"))
             if not source:
                 raise
             from_bundle = True
-            tag = bundled_tag("tavernlib")
-            on_progress(f"Couldn't reach GitHub — installing the {tag} copy shipped with this launcher…")
-            # Staged through tmp_dest like a download so the atomic swap and
-            # read-back verification below cover both paths identically.
+            on_progress(f"Couldn't reach GitHub — installing the {bundled_tag(component)} "
+                        f"copy of {what} shipped with this launcher…")
             shutil.copyfile(source, tmp_dest)
-            # Deliberately NOT a real fingerprint. GitHub's ETag is what the
-            # update check compares against, and we never spoke to GitHub — so
-            # this records a value that cannot match one, which means the first
-            # check that does reach GitHub reads 'outdated' and pulls the real
-            # release. Recording the shipped copy's own size here instead would
-            # read 'current' forever against a proxy that strips ETags.
-            fingerprint = f"bundled:{tag}"
+            fingerprint = f"bundled:{bundled_tag(component)}"
 
-        # Captured before the replace, since tmp_dest won't exist anymore
-        # afterward — os.replace renames it, it doesn't leave a copy behind.
-        expected_hash = _sha256_file(tmp_dest)
-        os.replace(tmp_dest, dest)  # atomic on Windows — always a full swap, never a partial one
-        if not os.path.isfile(dest) or _sha256_file(dest) != expected_hash:
-            # A silently-blocked write (Controlled Folder Access is a
-            # documented example) can leave os.replace appearing to succeed
-            # with the old file — or nothing at all — actually still there.
-            # Reading the result back and comparing is the only reliable way
-            # to tell a real success apart from that.
-            raise RuntimeError(_blocked_write_message(
-                "TavernLib.dll", "the installed file doesn't match what was downloaded"))
+        new_hash = _sha256_file(tmp_dest)
+        current = skip_if_current and os.path.isfile(dest) and _sha256_file(dest) == new_hash
+        if not current:
+            os.replace(tmp_dest, dest)
+            if not os.path.isfile(dest) or _sha256_file(dest) != new_hash:
+                raise RuntimeError(_blocked_write_message(
+                    what, "the installed file doesn't match what was downloaded"))
     finally:
         try:
             if os.path.isfile(tmp_dest):
                 os.remove(tmp_dest)
         except Exception:
             pass
-    changes, drop = {}, []
-    if fingerprint:
-        changes["tavernlib_fingerprint"] = fingerprint
-    else:
-        # No usable header at all (can't happen while require_length holds,
-        # but a stale fingerprint would read 'outdated' forever) — drop it,
-        # same reasoning as the tag below.
-        drop.append("tavernlib_fingerprint")
-    # The fingerprint is GitHub's ETag — it answers "is a newer one published?"
-    # and nothing else. This is the hash of the file we actually put on disk,
-    # which is what answers "is the file we installed still the file that's
-    # there?" — a question the ETag cannot address at all.
-    changes["tavernlib_sha256"] = expected_hash
-    # Display only (see _get_latest_release_tag) — dropped rather than left
-    # stale if the tag can't be read, same as the MelonLoader tag. On the
-    # fallback path the manifest already knows the tag, and asking GitHub for
-    # it would just fail again on the network that sent us here.
+
     if from_bundle:
-        tag = bundled_tag("tavernlib")
+        tag = bundled_tag(component)
     else:
         tag = None
-        try: tag = _get_latest_release_tag(TAVERNLIB_DOWNLOAD_URL)
+        try: tag = _get_latest_release_tag(url)
         except Exception: pass
-    if tag:
-        changes["tavernlib_tag"] = tag
-    else:
-        drop.append("tavernlib_tag")
-    _record_source(changes, drop, "tavernlib", from_bundle)
+    changes, drop = {f"{component}_sha256": new_hash}, []
+    for key, value in ((f"{component}_fingerprint", fingerprint), (f"{component}_tag", tag)):
+        if value:
+            changes[key] = value
+        else:
+            drop.append(key)    # dropped rather than left describing the last install
+    _record_source(changes, drop, component, from_bundle)
     _update_mod_meta(game_dir, changes, drop)
+    return not current
+
+
+def _install_tavernlib(game_dir, on_progress):
+    """Installs the latest TavernLib.dll into Plugins/ (_install_dll_component)."""
+    plugins_dir = os.path.join(game_dir, "Plugins")
+    os.makedirs(plugins_dir, exist_ok=True)
+    _install_dll_component(
+        game_dir, "tavernlib", TAVERNLIB_DOWNLOAD_URL,
+        os.path.join(plugins_dir, TAVERNLIB_FILENAME), TAVERNLIB_FILENAME, on_progress,
+        lambda: _tavernlib_local_state(game_dir)[1] is not None)
 
 
 def _file_matches_recorded(path, recorded):
