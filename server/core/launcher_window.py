@@ -83,6 +83,7 @@ class ServerLauncher(LauncherCommon, tk.Tk):
         self._console_win = None
         self._tickets_win = None
         self._served_game_dir = None   # read by the auth service's threads
+        self._starting = False         # between Open Server and the launch
         self._init_launcher_common()
         self._build_ui()
         self._load()
@@ -632,7 +633,7 @@ class ServerLauncher(LauncherCommon, tk.Tk):
         # seconds before the server is actually launched, so Start has to go
         # grey now - not when _set_running fires - or a second click in that
         # window launches a second server.
-        if getattr(self, "_starting", False):
+        if self._starting:
             return
         self._starting = True
         self._btn_start.config(state="disabled")
