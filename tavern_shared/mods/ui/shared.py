@@ -1,16 +1,18 @@
 """What the Mod Manager and Community Mods windows both need. The two are one
 browse-and-install surface split across two Toplevels, so the pieces that must
-behave identically from either - the Install action, side filtering, source
-naming - live here once instead of drifting apart as two copies."""
-import threading
+behave identically from either - the Install action, the busy/refresh cycle,
+side filtering, source naming - live here once instead of drifting apart as
+two copies."""
+import tkinter as tk
 from tkinter import messagebox
 
+from tavern_shared.bg import post, run_bg
 from tavern_shared.game_guard import confirm_while_game_running
 from tavern_shared.mod_install import (
     _melonloader_installed, _tavernlib_installed,
 )
 from tavern_shared.mods.hostcfg import load_cfg
-from tavern_shared.mods.install import install_mod_closure
+from tavern_shared.mods.install import install_mod_closure, mod_status
 from tavern_shared.mods.manifest import runs_in_scene
 from tavern_shared.mods.repos import _is_default, _source_display, list_repos
 
@@ -26,10 +28,56 @@ def source_label(source_repo):
     return _source_display(source_repo)
 
 
+class ModListWindow(tk.Toplevel):
+    """The busy/refresh cycle both mod windows share. A subclass sets _busy,
+    _status, _refresh_btn, _index, _game_dir and _on_change, and provides:
+      _state_ids()            ids whose mod_status to show
+      _apply_states(states)   paint {id: state}
+      _read_installed()       worker: what's on disk now
+      _apply_installed(data)  repaint from that
+      _busy_changed()         re-enable or disable per-row controls"""
+
+    def _busy_changed(self):
+        pass
+
+    def _set_busy(self, busy, msg=""):
+        self._busy = busy
+        self._refresh_btn.config(state="disabled" if busy else "normal")
+        if msg or not busy:
+            self._status.set(msg)
+        self._busy_changed()
+
+    def _refresh_states(self):
+        ids = self._state_ids()
+        if not ids:
+            return
+        index, game_dir = self._index, self._game_dir
+        def check():
+            states = {}
+            for mod_id in ids:
+                try:
+                    states[mod_id] = mod_status(game_dir, mod_id, index)
+                except Exception:
+                    states[mod_id] = "unknown"
+            return states
+        run_bg(self, check, on_ok=self._apply_states)
+
+    def _finish(self, msg):
+        """After an action that changed Mods/: re-reads what's installed (the
+        index can't have changed) and tells the owner."""
+        self._set_busy(False, msg)
+        def reread(data):
+            self._apply_installed(data)
+            self._refresh_states()
+        run_bg(self, self._read_installed, on_ok=reread, on_err=lambda e: None)
+        if self._on_change:
+            self._on_change()
+
+
 def install_mod_flow(win, mod, version=None):
     """The Install action behind both windows' buttons: installs `mod`'s
     closure, at `version` if given, else mod.highest(). `win` is either
-    window - both carry the _busy/_set_busy/_finish/_status machinery and the
+    window - both carry the ModListWindow machinery and the
     _game_dir/_side/_is_game_running attributes this drives.
 
     The cheap prerequisite checks come first, the game-running guard last,
@@ -64,15 +112,11 @@ def install_mod_flow(win, mod, version=None):
         return
     label = f"{mod.name} {version}" if version else mod.name
     win._set_busy(True, f"Installing {label}...")
-    index = win._index
-    def worker():
-        try:
-            repos = list_repos(load_cfg())
-            install_mod_closure(
-                win._game_dir, mod, index, repos,
-                lambda m: win.after(0, lambda: win._status.set(m)),
-                win._side, version=version)
-            win.after(0, lambda: win._finish(f"{label} installed."))
-        except Exception as e:
-            win.after(0, lambda e=e: win._finish(f"Install failed: {e}"))
-    threading.Thread(target=worker, daemon=True).start()
+    index, game_dir, side = win._index, win._game_dir, win._side
+    def install():
+        install_mod_closure(game_dir, mod, index, list_repos(load_cfg()),
+                            lambda m: post(win, win._status.set, m),
+                            side, version=version)
+    run_bg(win, install,
+           on_ok=lambda _: win._finish(f"{label} installed."),
+           on_err=lambda e: win._finish(f"Install failed: {e}"))

@@ -1,28 +1,33 @@
 """Browse the merged repo index and install something new."""
-import threading
 import tkinter as tk
 from tkinter import messagebox
 
+from tavern_shared.bg import post, run_bg
 from tavern_shared.theme import (
-    AMBER, BG, BORDER, CYAN, GREEN, MUTED, PARCH, RED, SURF, _btn, _mk_scrollbar,
+    AMBER, BG, BORDER, CYAN, GREEN, MUTED, PARCH, RED, SURF, _btn,
+    _scroll_stack, _window_header,
 )
 from tavern_shared.window_chrome import _enable_dark_titlebar
 
 from tavern_shared.mods.cache import clear_mod_cache
 from tavern_shared.mods.errors import ModManagerError
 from tavern_shared.mods.hostcfg import load_cfg
-from tavern_shared.mods.install import (
-    list_installed_mods, list_mods, mod_status,
-)
+from tavern_shared.mods.install import list_installed_mods, list_mods
 from tavern_shared.mods.repos import fetch_indexes, list_repos
 from tavern_shared.mods.resolve import resolve_mod_by_id
 from tavern_shared.mods.ui.shared import (
-    install_mod_flow, meta_matches_side, source_label,
+    ModListWindow, install_mod_flow, meta_matches_side, source_label,
 )
 from tavern_shared.mods.ui.sources_window import ModSourcesWindow
 
 
-class CommunityModsWindow(tk.Toplevel):
+# (id, version) -> "Requires: ..." text. Process-wide, so reopening the window
+# or reloading after an install doesn't refetch a manifest already seen;
+# keyed on version so a new release refetches.
+_DEPS_CACHE = {}
+
+
+class CommunityModsWindow(ModListWindow):
     """Card-based browser for community mods pulled from the configured sources.
     Lists every available mod - description, dependencies, client/server/parity
     info and all - with a per-card install/update/reinstall button, plus a
@@ -69,23 +74,17 @@ class CommunityModsWindow(tk.Toplevel):
         self._game_dir  = game_dir
         self._side      = side
         self._on_change = on_change
-        # Handed down from the Mod Manager that opened this window, so an
-        # install started from the browse list asks the same question one
-        # started from the installed table does (see tavern_shared.game_guard).
+        # Handed down from the Mod Manager, so an install from here asks the
+        # same questions as one from there.
         self._is_game_running = is_game_running
-        # Server only: a callable giving the scene the server is set to run,
-        # read at the moment of an install (see install_mod_flow). None on a
-        # client, which has no scene of its own.
         self._server_scene = server_scene
         self._index     = []      # list[ModSummary], the merged raw index
+        self._repos     = []      # the repo bases _index came from
         self._rows      = {}      # id -> row dict (see _rebuild_rows)
         self._visible_ids = []    # ids currently shown, filtered + sorted
         self._card_widgets = {}   # id -> widget refs for in-place updates
-        # (id, version) -> resolved "Requires: ..." text, so re-searching or
-        # reloading after an install doesn't re-fetch a manifest already seen
-        # this session; keyed on version so a bumped release refetches.
-        self._deps_cache   = {}
         self._deps_pending = set()
+        self._filter_job = None
         self._busy      = False
         self._sources_win = None
         self._build()
@@ -95,13 +94,9 @@ class CommunityModsWindow(tk.Toplevel):
         self._load(force=False)
 
     def _build(self):
-        h = tk.Frame(self, bg=SURF, height=44)
-        h.pack(fill="x"); h.pack_propagate(False)
-        tk.Label(h, text="Community Mods", bg=SURF, fg=AMBER,
-                 font=("Georgia",12,"bold")).pack(side="left", padx=16, pady=8)
+        h = _window_header(self, "Community Mods")
         _btn(h, "Manage Sources", self._open_sources, style="dim",
              font=("Segoe UI",9), pady=4, padx=10).pack(side="right", padx=12)
-        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
 
         desc = ("Mods available from your configured sources. Sources other than "
                 "Modding Tavern are not vetted; you install from them at your "
@@ -114,7 +109,7 @@ class CommunityModsWindow(tk.Toplevel):
         sf.pack(fill="x", padx=16, pady=(0,8))
         tk.Label(sf, text="🔍", bg=BG, fg=MUTED, font=("Segoe UI",10)).pack(side="left")
         self.v_search = tk.StringVar(value="")
-        self.v_search.trace_add("write", lambda *_: self._apply_filter())
+        self.v_search.trace_add("write", lambda *_: self._schedule_filter())
         tk.Entry(sf, textvariable=self.v_search, bg=SURF, fg=PARCH,
                  insertbackground=AMBER, relief="flat", font=("Consolas",10),
                  bd=6).pack(side="left", fill="x", expand=True, padx=(6,0))
@@ -129,29 +124,9 @@ class CommunityModsWindow(tk.Toplevel):
             cell.pack(side="left", fill="y"); cell.pack_propagate(False)
             tk.Label(cell, text=text, bg=SURF, fg=AMBER, font=("Segoe UI",8,"bold"),
                      anchor="w").pack(fill="both", padx=6)
-
-        # A Treeview can't host the description/dependency lines each card
-        # needs below its row of columns, so the list itself is a scrollable
-        # stack of card frames instead (same approach as ModDiffWindow).
-        canvas_frame = tk.Frame(list_wrap, bg=BG)
-        canvas_frame.pack(fill="both", expand=True)
-        canvas = tk.Canvas(canvas_frame, bg=BG, highlightthickness=0)
-        vsb = _mk_scrollbar(canvas_frame, canvas.yview)
-        vsb.pack(side="right", fill="y")
-        canvas.config(yscrollcommand=vsb.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        self._canvas = canvas
-        self._cards_frame = tk.Frame(canvas, bg=BG)
-        window = canvas.create_window((0, 0), window=self._cards_frame, anchor="nw")
-        self._cards_frame.bind("<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfig(window, width=e.width))
-        def _mousewheel(event):
-            if self._cards_frame.winfo_height() <= canvas.winfo_height():
-                return
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind("<MouseWheel>", _mousewheel)
-        self._cards_frame.bind("<MouseWheel>", _mousewheel)
+        # Cards rather than a Treeview: each needs description and dependency
+        # lines under its row of columns.
+        self._canvas, self._cards_frame = _scroll_stack(list_wrap)
 
         bar = tk.Frame(self, bg=BG)
         bar.pack(fill="x", padx=16, pady=(8,4))
@@ -172,38 +147,27 @@ class CommunityModsWindow(tk.Toplevel):
 
     def _load(self, force=False):
         self._set_busy(True, "Loading community mods...")
-        def worker():
-            try:
-                repos = list_repos(load_cfg())
-                index = fetch_indexes(repos, force=force)
-                available = list_mods(index, self._side)
-                installed = list_installed_mods(self._game_dir)
-                self.after(0, lambda: self._render(index, available, installed))
-            except Exception as e:
-                self.after(0, lambda e=e: self._load_failed(e))
-        threading.Thread(target=worker, daemon=True).start()
+        game_dir, side = self._game_dir, self._side
+        def load():
+            repos = list_repos(load_cfg())
+            index = fetch_indexes(repos, force=force)
+            return repos, index, list_mods(index, side), list_installed_mods(game_dir)
+        run_bg(self, load, on_ok=lambda r: self._render(*r),
+               on_err=lambda e: self._set_busy(False, f"Couldn't load community mods: {e}"))
 
-    def _load_failed(self, err):
-        self._set_busy(False, f"Couldn't load community mods: {err}")
-
-    def _render(self, index, available, installed):
-        self._index = index
+    def _render(self, repos, index, available, installed):
+        self._repos, self._index = repos, index
         self._rebuild_rows(available, installed)
         self._populate_cards()
         self._set_busy(False, "")
         self._refresh_states()
 
     def _rebuild_rows(self, available, installed):
-        # installed is cross-referenced only for the "Installed" column's
-        # display value - actually managing that install (uninstall,
-        # enable/disable, version) is ModManagerWindow's job, not this
-        # window's, so a mod that's dropped out of every index no longer
-        # gets a row here at all (it still has one there).
-        installed_by_id = {m["id"]: m for m in installed
-                           if m.get("id") and meta_matches_side(m, self._side)}
+        # installed only feeds the "Installed" column; managing an install is
+        # ModManagerWindow's job, so a mod no index lists has no row here.
+        installed_by_id = self._installed_versions(installed)
         rows = {}
         for s in available:
-            meta = installed_by_id.get(s.id)
             rows[s.id] = {
                 "id": s.id, "name": s.name, "author": s.author or "",
                 "description": s.description or "",
@@ -211,61 +175,60 @@ class CommunityModsWindow(tk.Toplevel):
                 "parity_required": s.parity_required,
                 "scenes": s.scenes,
                 "latest": s.highest(), "source": source_label(s.source_repo),
-                "summary": s, "installed": meta.get("version", "?") if meta else None,
+                "summary": s, "installed": installed_by_id.get(s.id),
                 "state": "missing",
             }
         self._rows = rows
 
+    def _installed_versions(self, installed):
+        return {m["id"]: m.get("version", "?") for m in installed
+                if m.get("id") and meta_matches_side(m, self._side)}
+
     # -- card rendering --
 
     def _populate_cards(self):
-        """Rebuilds every card from scratch - called when the underlying data
-        actually changes (a fresh load, or after an install/uninstall), never
-        on every keystroke. Typing in the search box only re-shows/hides
-        these same card widgets (see _apply_filter); destroying and
-        recreating them per keystroke was what made the buttons flicker."""
+        """Builds every card from scratch, on a fresh load only. Searching
+        re-packs these same widgets and an install updates them in place."""
         for child in self._cards_frame.winfo_children():
             child.destroy()
         self._card_widgets = {}
-        for mod_id in sorted(self._rows, key=lambda i: self._rows[i]["name"].lower()):
+        self._visible_ids = []
+        for mod_id in self._sorted_ids():
             self._mk_card(mod_id)
         self._apply_filter()
 
+    def _sorted_ids(self):
+        return sorted(self._rows, key=lambda i: self._rows[i]["name"].lower())
+
+    def _schedule_filter(self):
+        if self._filter_job:
+            self.after_cancel(self._filter_job)
+        self._filter_job = self.after(150, self._apply_filter)
+
     def _apply_filter(self):
-        """Shows/hides the already-built cards to match the search box,
-        without touching any widget's identity - pack_forget/pack only, so
-        nothing flickers. Order is re-asserted on every call (forgetting
-        every card, then re-packing only the visible ones in name order)
-        since a widget that's re-packed after being forgotten would
-        otherwise land at the end of the stack instead of back in its
-        alphabetical slot."""
+        """Shows the cards matching the search box, in name order. Only
+        re-packs when the visible set changes; a card re-packed after being
+        forgotten lands at the end, so all of them go and come back."""
+        self._filter_job = None
         query = self.v_search.get().strip().lower()
         def matches(mod_id):
-            if not query:
-                return True
             r = self._rows[mod_id]
-            hay = f"{r['name']} {r['author']} {r['id']} {r['description']}".lower()
-            return query in hay
-        all_ids = sorted(self._rows, key=lambda i: self._rows[i]["name"].lower())
-        self._visible_ids = [mid for mid in all_ids if matches(mid)]
+            return query in f"{r['name']} {r['author']} {r['id']} {r['description']}".lower()
+        visible = [mid for mid in self._sorted_ids() if not query or matches(mid)]
+        if visible != self._visible_ids:
+            for w in self._card_widgets.values():
+                w["card"].pack_forget()
+            for mod_id in visible:
+                self._card_widgets[mod_id]["card"].pack(fill="x", pady=(0,6))
+            self._visible_ids = visible
 
-        for mod_id in all_ids:
-            self._card_widgets[mod_id]["card"].pack_forget()
-        for mod_id in self._visible_ids:
-            self._card_widgets[mod_id]["card"].pack(fill="x", pady=(0,6))
-        self._cards_frame.update_idletasks()
-        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
-
-        total, shown = len(self._rows), len(self._visible_ids)
-        if query:
-            self._status.set(f"{shown} of {total} mod(s) match '{query}'."
-                             if total else self._status.get())
+        total = len(self._rows)
+        if query and total:
+            self._status.set(f"{len(visible)} of {total} mod(s) match '{query}'.")
         self._queue_dep_fetches()
 
     def _mk_card(self, mod_id):
-        # Not packed here - _apply_filter (called right after every card is
-        # built) is solely responsible for packing/unpacking cards, so there
-        # aren't two code paths fighting over each card's geometry.
+        # Not packed here: _apply_filter alone owns packing.
         r = self._rows[mod_id]
         card = tk.Frame(self._cards_frame, bg=SURF,
                         highlightbackground=BORDER, highlightthickness=1)
@@ -287,7 +250,8 @@ class CommunityModsWindow(tk.Toplevel):
                  font=("Segoe UI",9), anchor="w").pack(fill="both", padx=6)
         tk.Label(mod_cell, text=r["name"], bg=SURF, fg=PARCH,
                  font=("Segoe UI",9,"bold"), anchor="w").pack(fill="both", padx=6)
-        tk.Label(installed_cell, text=r["installed"] or "-", bg=SURF, fg=PARCH,
+        installed_var = tk.StringVar(value=r["installed"] or "-")
+        tk.Label(installed_cell, textvariable=installed_var, bg=SURF, fg=PARCH,
                  font=("Segoe UI",9), anchor="w").pack(fill="both", padx=6)
         tk.Label(latest_cell, text=r["latest"], bg=SURF, fg=PARCH,
                  font=("Segoe UI",9), anchor="w").pack(fill="both", padx=6)
@@ -322,7 +286,7 @@ class CommunityModsWindow(tk.Toplevel):
 
         self._card_widgets[mod_id] = {
             "card": card, "status_var": status_var, "status_lbl": status_lbl,
-            "btn": btn, "requires_var": requires_var,
+            "installed_var": installed_var, "btn": btn, "requires_var": requires_var,
         }
         self._apply_card_state(mod_id)
 
@@ -337,49 +301,51 @@ class CommunityModsWindow(tk.Toplevel):
         w["btn"].config(text=self._PRIMARY_LABEL.get(state, "Install"),
                         state="disabled" if (self._busy or r["summary"] is None) else "normal")
 
-    def _refresh_states(self):
-        if not self._rows:
-            return
-        ids, index, game_dir = list(self._rows), self._index, self._game_dir
-        def worker():
-            states = {}
-            for mod_id in ids:
-                try:
-                    states[mod_id] = mod_status(game_dir, mod_id, index)
-                except Exception:
-                    states[mod_id] = "unknown"
-            self.after(0, lambda: self._apply_states(states))
-        threading.Thread(target=worker, daemon=True).start()
+    # -- ModListWindow hooks --
+
+    def _busy_changed(self):
+        for mod_id in self._card_widgets:
+            self._apply_card_state(mod_id)
+
+    def _state_ids(self):
+        return list(self._rows)
 
     def _apply_states(self, states):
         for mod_id, st in states.items():
             if mod_id in self._rows:
                 self._rows[mod_id]["state"] = st
-        # All cards, not just the currently-visible ones, so a card hidden
-        # by the search filter is still up to date whenever it reappears.
-        for mod_id in self._card_widgets:
-            self._apply_card_state(mod_id)
+        # Hidden cards too, so one is current whenever the filter shows it.
+        self._busy_changed()
+
+    def _read_installed(self):
+        return list_installed_mods(self._game_dir)
+
+    def _apply_installed(self, installed):
+        versions = self._installed_versions(installed)
+        for mod_id, r in self._rows.items():
+            r["installed"] = versions.get(mod_id)
+            w = self._card_widgets.get(mod_id)
+            if w:
+                w["installed_var"].set(r["installed"] or "-")
 
     # -- dependencies (async, cached per id+version) --
 
     def _queue_dep_fetches(self):
-        repos = list_repos(load_cfg())
         to_fetch = []
         for mod_id in self._visible_ids:
             r = self._rows[mod_id]
             if r["summary"] is None:
                 continue
             key = (mod_id, r["latest"])
-            if key in self._deps_cache:
-                self._apply_deps_text(mod_id, self._deps_cache[key])
-                continue
-            if key in self._deps_pending:
-                continue
-            self._deps_pending.add(key)
-            to_fetch.append((mod_id, key, r["summary"]))
+            if key in _DEPS_CACHE:
+                self._apply_deps_text(mod_id, _DEPS_CACHE[key])
+            elif key not in self._deps_pending:
+                self._deps_pending.add(key)
+                to_fetch.append((mod_id, key, r["summary"]))
         if not to_fetch:
             return
-        def worker():
+        repos = self._repos
+        def fetch():
             for mod_id, key, summary in to_fetch:
                 try:
                     manifest = resolve_mod_by_id(repos, mod_id, prefer_repo=summary.source_repo)
@@ -388,10 +354,13 @@ class CommunityModsWindow(tk.Toplevel):
                            if deps else "No dependencies.")
                 except ModManagerError:
                     text = "Couldn't load dependency info."
-                self._deps_cache[key] = text
-                self._deps_pending.discard(key)
-                self.after(0, lambda mid=mod_id, t=text: self._apply_deps_text(mid, t))
-        threading.Thread(target=worker, daemon=True).start()
+                _DEPS_CACHE[key] = text
+                post(self, self._deps_fetched, key, mod_id, text)
+        run_bg(self, fetch)
+
+    def _deps_fetched(self, key, mod_id, text):
+        self._deps_pending.discard(key)
+        self._apply_deps_text(mod_id, text)
 
     def _apply_deps_text(self, mod_id, text):
         w = self._card_widgets.get(mod_id)
@@ -419,31 +388,9 @@ class CommunityModsWindow(tk.Toplevel):
                 parent=self):
             return
         self._set_busy(True, "Clearing mod cache...")
-        def worker():
-            try:
-                clear_mod_cache()
-                self.after(0, lambda: self._finish("Mod cache cleared."))
-            except Exception as e:
-                self.after(0, lambda e=e: self._finish(f"Clear cache failed: {e}"))
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _finish(self, msg):
-        self._set_busy(False, msg)
-        # The available set didn't change, only what's on disk, so re-scan
-        # installed state locally rather than re-fetching the index.
-        self._reconcile_installed()
-        self._refresh_states()
-        if self._on_change:
-            self._on_change()
-
-    def _reconcile_installed(self):
-        try:
-            available = list_mods(self._index, self._side)
-            installed = list_installed_mods(self._game_dir)
-        except Exception:
-            return
-        self._rebuild_rows(available, installed)
-        self._populate_cards()
+        run_bg(self, clear_mod_cache,
+               on_ok=lambda _: self._set_busy(False, "Mod cache cleared."),
+               on_err=lambda e: self._set_busy(False, f"Clear cache failed: {e}"))
 
     def _open_sources(self):
         if self._busy:
@@ -451,11 +398,3 @@ class CommunityModsWindow(tk.Toplevel):
         if self._sources_win and self._sources_win.winfo_exists():
             self._sources_win.lift(); return
         self._sources_win = ModSourcesWindow(self, on_change=lambda: self._load(force=True))
-
-    def _set_busy(self, busy, msg=""):
-        self._busy = busy
-        self._refresh_btn.config(state="disabled" if busy else "normal")
-        if msg or not busy:
-            self._status.set(msg)
-        for mod_id in self._card_widgets:
-            self._apply_card_state(mod_id)
