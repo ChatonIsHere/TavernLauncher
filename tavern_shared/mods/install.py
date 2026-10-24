@@ -580,26 +580,33 @@ def _read_mod_record(game_dir, mod_id):
     return None
 
 
-def _owned_mod_record(game_dir, mod_id):
-    """_read_mod_record, further requiring a usable parity_required - the full
-    "is this folder OURS?" test. It has to be the same predicate
-    list_installed_mods applies (id present, parity readable), so that a folder
-    can never read as installed to one caller and as foreign to another:
-    list_untracked_mods uses this to decide what's already claimed,
-    _clear_install_path uses it to decide delete-vs-displace, and mod_status
-    uses it so "installed" means the same thing in every window. TavernLib's
-    ModRecord.Read is the same test (its parity field is Required.Always AND
-    read through a strict boolean converter, so a record with a missing or
-    non-boolean parity reads as no record there too). Returns None for a folder
-    that isn't ours by that test."""
-    rec = _read_mod_record(game_dir, mod_id)
-    if rec is None:
+def _folder_record(folder, warn=False):
+    """(record, enabled) if a Mods/<name>/ folder holds a usable record of
+    ours, else None: the enabled record, else the disabled one, with an id
+    and a readable parity_required. This is the "is this folder ours"
+    predicate; TavernLib's ModRecord.Read is the same test."""
+    rec, enabled = _read_sidecar(os.path.join(folder, RECORD_NAME)), True
+    if not (rec and rec.get("id")):
+        rec, enabled = _read_sidecar(os.path.join(folder, DISABLED_RECORD_NAME)), False
+    if not (rec and rec.get("id")):
         return None
     try:
         parity_required(rec)
-    except ModManagerError:
+    except ModManagerError as e:
+        if warn:
+            _warn(f"installed mod {rec['id']} has an unusable record ({e}), "
+                  f"so it is being ignored; reinstall it to fix.")
         return None
-    return rec
+    return rec, enabled
+
+
+def _owned_mod_record(game_dir, mod_id):
+    """The record of Mods/<mod_id>/ if that folder is ours (_folder_record),
+    else None. Listing, delete-vs-displace and mod_status all use this one
+    predicate, so a folder can't read as installed to one and foreign to
+    another."""
+    found = _folder_record(_mod_dir_path(game_dir, mod_id))
+    return found[0] if found else None
 
 
 def disable_mod(game_dir, mod_id):
@@ -687,106 +694,52 @@ def list_mods(index, side):
     return sorted(best.values(), key=lambda s: s.name.lower())
 
 
-def list_installed_mods(game_dir):
-    """Every installed mod's record, in both enabled/disabled states: the per-mod
-    folders (enabled Mods/<id>/manifest.json or disabled
-    Mods/<id>/manifest.disabled.json). A record counts only if it carries an "id"
-    and a usable "parity_required", so a library sidecar, a bare marker, or a
-    record written before parity_required existed is ignored. Each returned record gains
-    an in-memory "enabled" value, not written to disk: True (loaded) or False
-    (disabled). Every installed mod's client_side/server_side flags are available
-    from these records, so this is the read side for both the UI's status refresh
-    and whatever assembles the server's mod list for the pre-join check.
-    uninstall_mod also uses it to see which libraries the remaining mods still
-    pin.
-
-    A record whose parity_required is absent OR unreadable is skipped rather
-    than assumed required, because assuming is what would let a mod the server
-    actually requires be reported as something a client may decline. Skipping is
-    recoverable: the mod reads as not installed, so the next plan reinstalls it
-    and the new record carries a usable field."""
-    out = {}     # id -> record
+def _scan_mods(game_dir):
+    """One pass over Mods/: (installed records, untracked entries), the
+    results of list_installed_mods and list_untracked_mods."""
+    installed, untracked = {}, []
     mods_dir = _mods_base(game_dir)
     if not os.path.isdir(mods_dir):
-        return []
+        return [], []
     for name in os.listdir(mods_dir):
-        full = os.path.join(mods_dir, name)
-        if not os.path.isdir(full):
-            continue
-        # Skip our own staging/ignore folders (dot/tilde).
         if name.startswith((".", "~")):
             continue
-        rec = _read_sidecar(os.path.join(full, RECORD_NAME))
-        enabled = True
-        if not (rec and rec.get("id")):
-            rec = _read_sidecar(os.path.join(full, DISABLED_RECORD_NAME))
-            enabled = False
-        if rec and rec.get("id"):
-            # Asked through parity_required rather than a bare key check, so a
-            # record carrying an unusable value is skipped on the same terms as
-            # one missing the field entirely - both mean nothing here can say
-            # whether a joining client has to match this mod, and both are
-            # fixed the same way. Also keeps handshake_snapshot below, which
-            # re-reads the field on these same records, unable to raise.
-            try:
-                parity_required(rec)
-            except ModManagerError as e:
-                _warn(f"installed mod {rec['id']} has an unusable record ({e}), "
-                      f"so it is being ignored; reinstall it to fix.")
-                continue
-            rec["enabled"] = enabled       # in-memory only; not on disk
-            out[rec["id"]] = rec
-    return list(out.values())
-
-
-def list_untracked_mods(game_dir):
-    """Everything sitting in Mods/ that MelonLoader can load but this manager
-    doesn't own (docs/mod-manager-design.md "Untracked mods"): a loose root
-    Mods/*.dll (the classic drag-a-dll-in manual install, invisible to
-    list_installed_mods since it never looks at files, only subfolders), or a
-    first-level Mods/<name>/ folder that doesn't hold a usable record of ours -
-    a foreign manifest.json, or one of ours gone unusable (see the
-    skip-with-warning above). Each entry is {"name", "kind" ("file"/"folder"),
-    "enabled"}. Deliberately surfacing-and-toggling only, per the design doc:
-    there's no manifest we trust to reconcile a version/update against, so
-    this never appears anywhere near install/update, only enable/disable.
-    TavernLib's ListUntrackedMods is the same listing for headless servers,
-    and the two have to report the same set for the same folder.
-
-    A folder counts on a record file EXISTING, not on it parsing: MelonLoader's
-    folder marker is an existence check with the content unread, so a folder
-    whose manifest.json is unparseable junk still loads and still has to be
-    reported."""
-    out = []
-    mods_dir = _mods_base(game_dir)
-    if not os.path.isdir(mods_dir):
-        return out
-    for name in os.listdir(mods_dir):
         full = os.path.join(mods_dir, name)
-        if name.startswith((".", "~")):
-            continue
         if os.path.isfile(full):
             lower = name.lower()
             if lower.endswith(".dll"):
-                out.append({"name": name, "kind": "file", "enabled": True})
+                untracked.append({"name": name, "kind": "file", "enabled": True})
             elif lower.endswith(".dll.disabled"):
-                out.append({"name": name[:-len(".disabled")], "kind": "file", "enabled": False})
+                untracked.append({"name": name[:-len(".disabled")], "kind": "file",
+                                  "enabled": False})
         elif os.path.isdir(full):
-            # "Claimed" is tested per folder with the exact predicate
-            # list_installed_mods uses, rather than against the set of record
-            # ids it returned: that lister keys its result by the id INSIDE the
-            # record, so a folder whose name and record id disagree would miss
-            # an id-set lookup and be reported as untracked as well as
-            # installed. Same input, same question, one answer.
-            if _owned_mod_record(game_dir, name) is not None:
-                continue
-            if os.path.isfile(os.path.join(full, RECORD_NAME)):
-                out.append({"name": name, "kind": "folder", "enabled": True})
+            found = _folder_record(full, warn=True)
+            if found is not None:
+                rec, enabled = found
+                rec["enabled"] = enabled        # in-memory only
+                installed[rec["id"]] = rec
+            elif os.path.isfile(os.path.join(full, RECORD_NAME)):
+                untracked.append({"name": name, "kind": "folder", "enabled": True})
             elif os.path.isfile(os.path.join(full, DISABLED_RECORD_NAME)):
-                out.append({"name": name, "kind": "folder", "enabled": False})
-            # Neither present: an empty or junk folder MelonLoader wouldn't
-            # load either, so there's nothing to report.
-    return out
+                untracked.append({"name": name, "kind": "folder", "enabled": False})
+    return list(installed.values()), untracked
+
+
+def list_installed_mods(game_dir):
+    """Every installed mod's record, enabled or disabled, each with an
+    in-memory "enabled" flag. A folder counts only with a usable record of
+    ours (an id and a readable parity_required); one without is skipped with
+    a warning rather than assumed required, and reads as untracked."""
+    return _scan_mods(game_dir)[0]
+
+
+def list_untracked_mods(game_dir):
+    """Everything in Mods/ MelonLoader can load that this manager doesn't own,
+    as {"name", "kind" ("file"/"folder"), "enabled"}: a loose root *.dll, or a
+    first-level folder without a usable record of ours. A folder counts on a
+    record file EXISTING, not parsing, because MelonLoader's marker is an
+    existence check. TavernLib's ListUntrackedMods must report the same set."""
+    return _scan_mods(game_dir)[1]
 
 
 def disable_untracked_dll(game_dir, filename):
@@ -896,9 +849,9 @@ def handshake_snapshot(game_dir):
     list against this hash, so leaving them out would let an operator drop a new
     DLL into Mods/ and have every already-connected client keep reporting the
     old set until something else happened to move the hash."""
-    mods = sorted((m for m in list_installed_mods(game_dir) if m.get("enabled")),
-                  key=lambda m: m["id"])
-    untracked = sorted((u for u in list_untracked_mods(game_dir) if u["enabled"]),
+    installed, untracked = _scan_mods(game_dir)
+    mods = sorted((m for m in installed if m.get("enabled")), key=lambda m: m["id"])
+    untracked = sorted((u for u in untracked if u["enabled"]),
                        key=lambda u: u["name"].lower())
     # parity_required is part of the fingerprint, not just the list. A server
     # can flip a mod between required and recommended without its version
