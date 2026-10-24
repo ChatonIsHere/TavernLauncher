@@ -309,6 +309,18 @@ def _urlopen_hard_timeout(req, connect_timeout=20, socket_timeout=20):
     return result["resp"]
 
 
+_TIP_RETRY = "Try again — this often succeeds on a second attempt"
+_TIP_NETWORK = "Try a different network (a phone hotspot is a quick test)"
+_TIP_AV = "Temporarily disable antivirus/VPN and retry"
+_TIP_ADMIN = "Run the launcher as Administrator"
+_TIP_MANUAL = "Use Manual Install to download it in your browser instead"
+
+
+def _worth_trying(*tips):
+    """The bulleted "Worth trying:" block the download failures end with."""
+    return "Worth trying:\n" + "\n".join(f"  • {tip}" for tip in tips)
+
+
 def _short_read_message(url, downloaded, total):
     """The message for a download that ended before Content-Length said it
     would. Worth being explicit that nothing was installed, because the
@@ -322,11 +334,7 @@ def _short_read_message(url, downloaded, total):
         "which is usually antivirus, a VPN, or a school/corporate proxy "
         "interrupting the transfer. Nothing was installed and nothing was "
         "changed — the existing files are untouched.\n\n"
-        "Worth trying:\n"
-        "  • Try again — this often succeeds on a second attempt\n"
-        "  • Try a different network (a phone hotspot is a quick test)\n"
-        "  • Temporarily disable antivirus/VPN and retry\n"
-        "  • Use Manual Install to download it in your browser instead")
+        + _worth_trying(_TIP_RETRY, _TIP_NETWORK, _TIP_AV, _TIP_MANUAL))
 
 
 def _download_with_progress(url, dest_path, on_progress,
@@ -369,10 +377,9 @@ def _download_with_progress(url, dest_path, on_progress,
             raise DownloadError(
                 f"Couldn't connect to {urlparse(url).netloc} — {getattr(e,'reason',e)}\n\n"
                 "This is usually a network/firewall/antivirus issue on this machine, "
-                "not something wrong with the launcher itself. Worth trying:\n"
-                "  • Run the launcher as Administrator\n"
-                "  • Temporarily disable antivirus/VPN and retry\n"
-                "  • Check whether a firewall is blocking outbound HTTPS for this app")
+                "not something wrong with the launcher itself. "
+                + _worth_trying(_TIP_ADMIN, _TIP_AV,
+                                "Check whether a firewall is blocking outbound HTTPS for this app"))
 
         total = resp.headers.get("Content-Length")
         total = int(total) if total and total.isdigit() else None
@@ -417,11 +424,7 @@ def _download_with_progress(url, dest_path, on_progress,
                             "This is usually antivirus, a VPN, or a proxy "
                             "interrupting the transfer rather than refusing it. "
                             "Nothing was installed and nothing was changed.\n\n"
-                            "Worth trying:\n"
-                            "  • Try again — this often succeeds on a second attempt\n"
-                            "  • Try a different network (a phone hotspot is a quick test)\n"
-                            "  • Temporarily disable antivirus/VPN and retry\n"
-                            "  • Use Manual Install to download it in your browser instead")
+                            + _worth_trying(_TIP_RETRY, _TIP_NETWORK, _TIP_AV, _TIP_MANUAL))
                     if not chunk:
                         break
                     out.write(chunk)
@@ -504,10 +507,7 @@ def _verify_payload_type(path, url, kind):
             "Something between this machine and GitHub answered with a different "
             "file — usually a proxy, captive portal, or security software serving "
             "an error/login page instead of the real download. Nothing was "
-            "installed.\n\nWorth trying:\n"
-            "  • A different network (a phone hotspot is a quick test)\n"
-            "  • Temporarily disable antivirus/VPN and retry\n"
-            "  • Use Manual Install to download it in your browser instead")
+            "installed.\n\n" + _worth_trying(_TIP_NETWORK, _TIP_AV, _TIP_MANUAL))
 
 
 def _open_zip_with_retry(path, retries=8, delay=1.0):
@@ -575,11 +575,9 @@ def _blocked_write_message(what, examples):
         "This means something on this PC silently blocked the write instead of "
         "refusing it — most commonly Windows' Controlled Folder Access, or "
         "antivirus real-time protection.\n\n"
-        "Worth trying:\n"
-        "  • Add an exclusion for the game's install folder in Windows Security\n"
-        "  • Temporarily turn off Controlled Folder Access, then retry\n"
-        "  • Run the launcher as Administrator\n"
-        "  • Use Manual Install to place the files yourself")
+        + _worth_trying("Add an exclusion for the game's install folder in Windows Security",
+                        "Temporarily turn off Controlled Folder Access, then retry",
+                        _TIP_ADMIN, "Use Manual Install to place the files yourself"))
 
 
 def _install_melonloader(game_dir, arch, on_progress):
