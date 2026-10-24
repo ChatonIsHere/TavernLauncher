@@ -3,8 +3,8 @@ server never joins anything."""
 import tkinter as tk
 
 from tavern_shared.theme import (
-    AMBER, AMBERDIM, BG, BORDER, CYAN, GREEN, MUTED, RED, SURF, _btn,
-    _mk_scrollbar,
+    AMBER, AMBERDIM, BG, CYAN, GREEN, MUTED, RED, SURF, _btn,
+    _scroll_stack, _window_header,
 )
 from tavern_shared.window_chrome import _enable_dark_titlebar
 
@@ -27,10 +27,8 @@ class ModDiffWindow(tk.Toplevel):
     a bar underneath - and the window stays up until the work is done. The
     outcome is reported in the window rather than a popup: with
     close_on_success it disappears and the caller carries on (the join case),
-    otherwise it stays with the result on screen (the sync case).
-
-    Without an apply_action it's a plain confirm dialog: the caller waits, then
-    reads `.result` (True to apply).
+    otherwise it stays with the result on screen (the sync case). Without an
+    apply_action it's read-only.
 
     The plan is edited to match the screen before anything is rendered, so what
     gets applied is what was shown: a deactivation the user keeps is dropped from
@@ -94,12 +92,12 @@ class ModDiffWindow(tk.Toplevel):
         self._pin    = set()
         self._skip   = {r.mod_id for r in rows if r.action == ACTION_SKIPPED}
         self.pinned_keeps = []
-        self.result  = False
 
         self._apply_action     = apply_action
         self._close_on_success = close_on_success
         self._on_cancel_cb     = on_cancel
         self._applying   = False
+        self._succeeded  = False
         self._closed     = False
         self.apply_attempted = False   # Apply was pressed; a close isn't a decline
         self.declined = list(self._skip)   # kept current on every apply
@@ -119,13 +117,7 @@ class ModDiffWindow(tk.Toplevel):
         self.grab_set()
 
     def _build(self):
-        h = tk.Frame(self, bg=SURF, height=44)
-        h.pack(fill="x"); h.pack_propagate(False)
-        tk.Label(h, text="Mod Comparison", bg=SURF, fg=AMBER,
-                 font=("Georgia",12,"bold")).pack(side="left", padx=16, pady=8)
-        tk.Label(h, text=self._label, bg=SURF, fg=MUTED,
-                 font=("Segoe UI",9)).pack(side="left", pady=8)
-        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
+        _window_header(self, "Mod Comparison", subtitle=self._label)
 
         tk.Label(self,
             text="Server / You / Action: what this server runs, what's installed here, and "
@@ -151,33 +143,9 @@ class ModDiffWindow(tk.Toplevel):
             tk.Label(cell, text=text, bg=SURF, fg=AMBER, font=("Segoe UI",9,"bold"),
                      anchor="w").pack(fill="both", padx=6)
 
-        # A Treeview can't host a live control per row, so the table itself is
-        # a scrollable stack of row frames instead - each optional row gets
-        # its own two-way toggle rather than a shared button whose meaning
-        # changes depending what's selected.
-        canvas_frame = tk.Frame(table_wrap, bg=BG)
-        canvas_frame.pack(fill="both", expand=True)
-        canvas = tk.Canvas(canvas_frame, bg=BG, highlightthickness=0)
-        vsb = _mk_scrollbar(canvas_frame, canvas.yview)
-        vsb.pack(side="right", fill="y")
-        canvas.config(yscrollcommand=vsb.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        self._canvas = canvas
-        self._rows_frame = tk.Frame(canvas, bg=BG)
-        window = canvas.create_window((0, 0), window=self._rows_frame, anchor="nw")
-        self._rows_frame.bind("<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfig(window, width=e.width))
-        def _mousewheel(event):
-            # Without this guard the canvas will still happily scroll a
-            # screenful of nothing - scrollregion can end up briefly stale
-            # (e.g. mid-rebuild), and yview_scroll doesn't check content
-            # height on its own before moving the view.
-            if self._rows_frame.winfo_height() <= canvas.winfo_height():
-                return
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind("<MouseWheel>", _mousewheel)
-        self._rows_frame.bind("<MouseWheel>", _mousewheel)
+        # A stack of row frames rather than a Treeview, so each optional row
+        # can carry its own toggle.
+        self._canvas, self._rows_frame = _scroll_stack(table_wrap)
 
         # Progress line and bar. Built now so they keep their place in the
         # layout, packed only once an apply starts (see _begin_apply).
@@ -220,11 +188,15 @@ class ModDiffWindow(tk.Toplevel):
             return "Skip"
         if r.action == ACTION_SKIPPED:
             return "Install"          # was skipped, user has just turned it back on
+        return self._proposed_verb(r)
+
+    def _proposed_verb(self, r):
+        """What applying does to the row. Says which rows are just a file move
+        out of the cache: the difference between a moment and a wait."""
         verb = self._VERB.get(r.action, r.action)
-        # Say which rows cost a download and which are just a file move out
-        # of the cache: it's the difference between a moment and a wait.
-        if r.action in (ACTION_INSTALL, ACTION_ACTIVATE, ACTION_UPDATE, ACTION_DOWNGRADE):
-            verb += "" if r.downloads else " (cached)"
+        if (r.action in (ACTION_INSTALL, ACTION_ACTIVATE, ACTION_UPDATE, ACTION_DOWNGRADE)
+                and not r.downloads):
+            verb += " (cached)"
         return verb
 
     def _row_tag(self, mod_id):
@@ -255,13 +227,7 @@ class ModDiffWindow(tk.Toplevel):
         Enabled)."""
         r = self._rows[mod_id]
         if r.recommended:
-            if r.action == ACTION_SKIPPED:
-                included = "Install"
-            else:
-                included = self._VERB.get(r.action, r.action)
-                if r.action in (ACTION_INSTALL, ACTION_ACTIVATE,
-                                ACTION_UPDATE, ACTION_DOWNGRADE):
-                    included += "" if r.downloads else " (cached)"
+            included = "Install" if r.action == ACTION_SKIPPED else self._proposed_verb(r)
             values = (included, "Skip")
             current = "Skip" if mod_id in self._skip else included
         else:
@@ -275,24 +241,14 @@ class ModDiffWindow(tk.Toplevel):
         return values, current
 
     def _populate(self):
-        for child in self._rows_frame.winfo_children():
-            child.destroy()
-        self._action_widgets = {}
-        self._name_labels = {}
-        self._segment_labels = {}
         for mod_id in self._order:
             self._mk_row(mod_id)
-        # The <Configure> binding usually keeps the scrollregion current, but
-        # it fires off Tk's own idle loop - forcing it here too means a
-        # rebuild never leaves a stale, too-tall region behind that would let
-        # the wheel/scrollbar move the view into empty space.
-        self._rows_frame.update_idletasks()
-        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
         # A required mod nobody can supply can't be resolved by pressing
         # Apply, so the button says so rather than failing after the fact.
         blocked = any(r.blocking for r in self._rows.values())
-        self._apply_btn.config(state="disabled" if blocked else "normal",
-                               text="Can't apply" if blocked else "Apply changes")
+        self._apply_btn.config(
+            state="disabled" if blocked or self._apply_action is None else "normal",
+            text="Can't apply" if blocked else "Apply changes")
 
     def _mk_row(self, mod_id):
         r = self._rows[mod_id]
@@ -389,7 +345,8 @@ class ModDiffWindow(tk.Toplevel):
         self._paint_toggle(mod_id, choice)
 
     def _on_apply(self):
-        if self._applying or any(r.blocking for r in self._rows.values()):
+        if (self._applying or self._apply_action is None
+                or any(r.blocking for r in self._rows.values())):
             return
         # Bring the plan in line with the screen, so what gets rendered is what
         # was shown. Kept mods come out of to_deactivate and stay where they are;
@@ -409,10 +366,6 @@ class ModDiffWindow(tk.Toplevel):
         # into an always-on pin alongside saving the declines.
         self.declined = sorted(self._skip)
         self.pinned_keeps = sorted(self._pin)
-        if self._apply_action is None:
-            self.result = True
-            self.destroy()
-            return
         self._begin_apply()
         self._apply_action(self)
 
@@ -483,27 +436,22 @@ class ModDiffWindow(tk.Toplevel):
         if self._closed:
             return
         self._applying = False
-        self.result = bool(ok)
+        self._succeeded = bool(ok)
         if ok:
             self._steps_done = self._steps_total
             self._draw_bar()
         if ok and self._close_on_success:
             self.destroy()
             return
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
         self._status_lbl.config(fg=GREEN if ok else RED)
         self._status.set(message or ("Done." if ok else "Couldn't apply the changes."))
         self._apply_btn.config(state="disabled", text="Applied" if ok else "Not applied")
         self._cancel_btn.config(state="normal", text="Close")
 
     def _on_cancel(self):
-        if self._applying:
-            return
-        self.result = False
-        self.destroy()
-
-    def _on_close(self):
-        self.destroy()
+        if not self._applying:
+            self.destroy()
 
     def destroy(self):
         # on_cancel means "the caller isn't getting an applied plan", so it
@@ -512,5 +460,5 @@ class ModDiffWindow(tk.Toplevel):
         first = not self._closed
         self._closed = True
         super().destroy()
-        if first and not self.result and self._on_cancel_cb:
+        if first and not self._succeeded and self._on_cancel_cb:
             self._on_cancel_cb(self)
