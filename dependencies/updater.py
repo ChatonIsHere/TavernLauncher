@@ -378,6 +378,18 @@ def clear_partial_update_marker(install_dir=None):
         pass
 
 
+def partial_update_message(files):
+    """The dialog text for a marker's files, shown by the relaunched app."""
+    return (f"The launcher itself updated, but {len(files)} file(s) couldn't be "
+            "replaced:\n\n" + "\n".join(f"  • {f}" for f in files[:10])
+            + ("\n  • …" if len(files) > 10 else "")
+            + "\n\nThey were most likely locked by antivirus, or blocked by "
+              "Windows' Controlled Folder Access. The launcher is running the new "
+              "version, but these files are still the old ones.\n\n"
+              "Re-running the update usually fixes it. If it doesn't, add an "
+              "exclusion for the launcher's folder in Windows Security first.")
+
+
 def _log_update_event(msg):
     """A plain append-only log file, separate from the in-app progress
     label — the whole point of a persistent, on-disk log is that it's

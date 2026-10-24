@@ -27,14 +27,9 @@ try:
 except ImportError:
     pass
 from tavern_shared.log_tailer import GameLogTailer
-from tavern_shared.mod_install import (
-    NEEDS_ATTENTION, _melonloader_installed, _mods_need_attention,
-)
-from tavern_shared.patch import _patch_needs_attention
 from tavern_shared.game_guard import game_is_running
-from tavern_shared.mods_window import SetupWindow
 from tavern_shared import mods
-from tavern_shared.mods.ui.manager_window import ModManagerWindow
+from tavern_shared.launcher_common import LauncherCommon
 from tavern_shared.log_archive import archive_log_now, should_auto_archive
 
 from server.core.data_store import (
@@ -58,7 +53,7 @@ try:
 except ImportError:
     _updater = None
 
-class ServerLauncher(tk.Tk):
+class ServerLauncher(LauncherCommon, tk.Tk):
     def __init__(self):
         super().__init__()
         _start_hidden(self)
@@ -83,16 +78,10 @@ class ServerLauncher(tk.Tk):
         self._auth_on  = False
         self._tailer   = None
         self._mgr_win  = None
-        self._setup_win = None
-        self._mod_manager_win = None
         self._sett_win = None
         self._console_win = None
         self._tickets_win = None
-        # Read every tick by start_flashing_button on the main thread, and
-        # only ever written from the main thread (see _refresh_setup_alert),
-        # so the background check can't tear it.
-        self._setup_needs_attention = False
-        self._exe_check_job   = None
+        self._init_launcher_common()
         self._build_ui()
         self._load()
         self._start_log_tailer()
@@ -361,32 +350,7 @@ class ServerLauncher(tk.Tk):
         # Update check runs a couple seconds after startup, off the UI
         # thread, so it never delays the window actually appearing.
         self.after(2000, self._check_for_launcher_update)
-        self.after(1200, self._report_partial_update)
-
-    def _report_partial_update(self):
-        """Tells the user when the update they just applied replaced the exe
-        but couldn't replace everything else. See the client launcher's copy
-        for why this is read here rather than reported where it happens."""
-        if _updater is None:
-            return
-        marker = _updater.read_partial_update_marker()
-        if not marker:
-            return
-        _updater.clear_partial_update_marker()
-        files = marker.get("files", [])
-        self._print(f"Update warning: {len(files)} file(s) could not be replaced.", "warn")
-        for f in files:
-            self._print(f"  · {f}", "warn")
-        messagebox.showwarning("Update didn't fully apply",
-            f"The launcher itself updated, but {len(files)} file(s) couldn't be "
-            "replaced:\n\n" + "\n".join(f"  • {f}" for f in files[:10])
-            + ("\n  • …" if len(files) > 10 else "")
-            + "\n\nThey were most likely locked by antivirus, or blocked by "
-              "Windows' Controlled Folder Access. The launcher is running the new "
-              "version, but these files are still the old ones.\n\n"
-              "Re-running the update usually fixes it. If it doesn't, add an "
-              "exclusion for the launcher's folder in Windows Security first.",
-            parent=self)
+        self.after(1200, lambda: self._report_partial_update(_updater))
 
     def _check_for_launcher_update(self):
         if _updater is None:
@@ -501,30 +465,10 @@ class ServerLauncher(tk.Tk):
             self._console_win.lift(); return
         self._console_win = ConsoleWindow(self)
 
-    def _open_setup(self):
-        exe = self.v_exe.get().strip()
-        if not exe or not os.path.isfile(exe):
-            messagebox.showerror("Game not found",
-                "Please set the path to 'A Township Tale.exe' above first.", parent=self)
-            return
-        if self._setup_win and self._setup_win.winfo_exists():
-            self._setup_win.lift(); return
-        self._setup_win = SetupWindow(self, exe,
-                                      on_status_change=self._refresh_setup_alert,
-                                      on_installed=self._warn_if_running)
+    MOD_SIDE = "server"
 
-    def _open_mod_manager(self):
-        exe = self.v_exe.get().strip()
-        if not exe or not os.path.isfile(exe):
-            messagebox.showerror("Game not found",
-                "Please set the path to 'A Township Tale.exe' above first.", parent=self)
-            return
-        if self._mod_manager_win and self._mod_manager_win.winfo_exists():
-            self._mod_manager_win.lift(); return
-        self._mod_manager_win = ModManagerWindow(
-            self, os.path.dirname(exe), side="server",
-            on_change=self._on_mods_changed,
-            server_scene=self._server_scene)
+    def _mod_manager_kwargs(self):
+        return {"server_scene": self._server_scene}
 
     def _server_scene(self):
         """The scene this server is set to run, by the names a mod manifest's
@@ -556,20 +500,11 @@ class ServerLauncher(tk.Tk):
                             f"{', '.join(scenes)} scene{'s' if len(scenes) > 1 else ''}, "
                             f"not the {scene} scene this server is starting in.", "warn")
 
-    def _on_mods_changed(self):
-        """Fires after any Setup or Mod Manager action changes what's on disk.
-        Beyond refreshing the alert, it closes a quiet trap: the handshake
-        (this launcher's auth service AND TavernLib's own join-time parity
-        check) reads Mods/ live, but the running game session loaded its mods
-        at startup. Change mods while the server is up and joining clients are
-        told about - and matched against - a set the live session isn't
-        actually running until it restarts. Nothing here can restart the game
-        safely on its own, so the honest move is to say so, every time it
-        happens while the server is running."""
-        self._refresh_setup_alert()
-        self._warn_if_running()
-
-    def _warn_if_running(self):
+    def _mods_written(self):
+        """The handshake (this launcher's auth service and TavernLib's join
+        check) reads Mods/ live, but the running session loaded its mods at
+        startup, so joining clients get matched against a set it isn't
+        running. Nothing here can restart the game safely, so it says so."""
         if game_is_running(self._proc):
             self._print("Mods changed while the server is running: the changes "
                         "take effect after a server restart. Until then, joining "
@@ -585,88 +520,6 @@ class ServerLauncher(tk.Tk):
     def _current_game_dir(self):
         exe = self.v_exe.get().strip()
         return os.path.dirname(exe) if exe and os.path.isfile(exe) else None
-
-    # ── Setup button (same mechanism as the client launcher) ────────────────
-
-    def _on_exe_changed(self, *_):
-        if self._exe_check_job:
-            try: self.after_cancel(self._exe_check_job)
-            except Exception: pass
-        self._exe_check_job = self.after(800, self._refresh_tool_states)
-
-    def _refresh_tool_states(self):
-        """Enables/disables the Setup and Mod Manager buttons based on
-        whether a valid game exe is selected, then separately refreshes the
-        Setup button's flashing-alert condition. State is only ever touched
-        here, and start_flashing_button only ever touches bg — kept
-        deliberately separate so neither path can clobber the other."""
-        exe = self.v_exe.get().strip()
-        valid = bool(exe and os.path.isfile(exe))
-        state = "normal" if valid else "disabled"
-        try: self._setup_btn.config(state=state)
-        except Exception: pass
-        try: self._mod_manager_btn.config(state=state)
-        except Exception: pass
-        self._refresh_setup_alert()
-
-    def _refresh_setup_alert(self, states=None):
-        """One alert for the whole Setup sequence: a required mod missing or
-        outdated or damaged — the patch included, on the same rule. These
-        used to be two separately flashing buttons for what is really one
-        "this install isn't ready yet" state.
-
-        The checks hit the network and the disk, so they run on a worker and
-        only the resulting flag is written back on the main thread -- the
-        flashing loop reads it every tick and must never block."""
-        exe = self.v_exe.get().strip()
-        if not exe or not os.path.isfile(exe):
-            self._setup_needs_attention = False
-            self._set_mod_manager_badge(0)
-            return
-        game_dir = os.path.dirname(exe)
-        def worker():
-            try:
-                # The patch is judged by the same missing/outdated/damaged
-                # rule as the other two components — so a newly published
-                # patch release flashes this alert instead of sitting
-                # invisible behind an applied-but-stale install, and a failed
-                # update check (network down) still never false-alarms.
-                if states:
-                    need = any(s in NEEDS_ATTENTION for s in states.values())
-                else:
-                    need = _mods_need_attention(game_dir) or _patch_needs_attention(exe)
-            except Exception:
-                need = False
-            badge = self._count_mods_needing_attention(game_dir)
-            self.after(0, lambda: (setattr(self, "_setup_needs_attention", need),
-                                   self._set_mod_manager_badge(badge)))
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _count_mods_needing_attention(self, game_dir):
-        """How many installed community mods are outdated or damaged - a
-        quiet count on the Mod Manager button rather than a flash (an
-        available update is information, not an emergency; damage does also
-        count here since a reinstall from the manager is its fix). 0 on any
-        failure, so a network blip never decorates the button with a false
-        alarm. Runs off the UI thread only."""
-        try:
-            installed = [r for r in mods.list_installed_mods(game_dir)
-                         if r.get("server_side")]
-            if not installed:
-                return 0
-            index = mods.fetch_indexes(mods.list_repos(load_cfg()))
-            return sum(1 for r in installed
-                       if mods.mod_status(game_dir, r["id"], index)
-                       in ("outdated", "damaged"))
-        except Exception:
-            return 0
-
-    def _set_mod_manager_badge(self, count):
-        label = "📦 Mod Manager"
-        if count:
-            label += f"  ({count} need{'s' if count == 1 else ''} attention)"
-        try: self._mod_manager_btn.config(text=label)
-        except Exception: pass
 
     def _open_saves(self):
         try: os.makedirs(PLAYERS_SAVE, exist_ok=True); os.startfile(PLAYERS_SAVE)
