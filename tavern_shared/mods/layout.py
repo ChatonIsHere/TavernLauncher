@@ -1,5 +1,5 @@
-"""The on-disk install layout: Mods/<id>/ and its record, UserLibs/
-sidecars, staging paths. TavernLib's ModPaths mirrors it; any other
+"""The on-disk install layout: Mods/<id>/, its record and per-target
+.<target>/ folders, UserLibs/ sidecars, staging paths. TavernLib's ModPaths mirrors it; any other
 installer must match it byte-for-byte."""
 import os
 
@@ -52,6 +52,12 @@ def _displaced_base(game_dir):
 
 def _mod_dir_path(game_dir, mod_id):
     return os.path.join(_mods_base(game_dir), _safe_basename(mod_id))
+
+
+def _target_dir_path(game_dir, mod_id, target):
+    # Dot-prefixed, so MelonLoader skips it; TavernLib adds back the one
+    # folder that matches the process it runs in.
+    return os.path.join(_mod_dir_path(game_dir, mod_id), _safe_basename(f".{target}"))
 
 
 def _mod_record_path(game_dir, mod_id):

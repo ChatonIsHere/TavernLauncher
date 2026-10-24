@@ -1,5 +1,6 @@
 """The wire shapes: a repository.json summary row (ModSummary), a full
-per-version manifest (ModManifest), and a library dependency."""
+per-version manifest (ModManifest), its per-target builds (Artifact), and a
+library dependency. CommunityMods' docs/REPO_STRUCTURE.md is the contract."""
 import os
 import re
 from dataclasses import dataclass
@@ -11,7 +12,26 @@ from tavern_shared.mods.version import _major, _parse_version
 
 
 # A manifest of any other schema major is skipped rather than mis-parsed.
-SUPPORTED_MANIFEST_MAJOR = 1
+SUPPORTED_MANIFEST_MAJOR = 2
+
+
+# Every target a manifest may name. Any other name is ignored, so a target
+# added later doesn't break this build; "quest" is parsed but never installed.
+TARGETS = ("pc", "server", "quest")
+
+
+# The targets an installer here installs: the client launcher "pc", the
+# server launcher "server".
+INSTALL_TARGETS = ("pc", "server")
+
+
+# An artifact with any other package is ignored, like an unknown target.
+PACKAGES = ("dll", "zip")
+
+
+# Compiled-manifest key order, which the install record keeps.
+_ARTIFACT_KEYS = ("targets", "download_url", "sha256", "package", "library_dependencies")
+_LIBRARY_KEYS = ("name", "download_url", "sha256", "filename")
 
 
 @dataclass
@@ -86,6 +106,28 @@ def scene_from_arg(scene_arg):
 
 
 @dataclass
+class Artifact:
+    """One build of a mod: the file at download_url, installed into
+    Mods/<id>/.<target>/ for each target it lists."""
+    targets: list                           # the known targets it lists, in manifest order
+    download_url: str
+    sha256: str                             # lowercase hex
+    package: str                            # "dll" (single file) or "zip" (extracted bundle)
+    library_dependencies: list              # pinned UserLibs/ files (list[LibraryDependency])
+
+    def install_name(self, mod_id):
+        """The basename a package="dll" build gets in its target folder: the
+        name it was published under (from download_url), unless that fails
+        _safe_basename or doesn't end in .dll, in which case f"{mod_id}.dll"."""
+        base = os.path.basename(urlparse(self.download_url).path)
+        try:
+            safe = _safe_basename(base)
+        except ModManagerError:
+            safe = ""
+        return safe if safe.lower().endswith(".dll") else f"{mod_id}.dll"
+
+
+@dataclass
 class ModManifest:
     manifest_version: int                   # schema version; unknown-major is skipped at parse
     id: str                                 # "<github-user>.<github-repo>", path-safe (single segment)
@@ -93,27 +135,20 @@ class ModManifest:
     version: str                            # exactly "MAJOR.MINOR.PATCH"
     author: str
     description: str
-    client_side: bool
-    server_side: bool                       # at least one of client_side/server_side is True
     dependencies: dict                      # other MODS: id -> min version, SemVer major-locked
-    library_dependencies: list             # pinned UserLibs/ files (list[LibraryDependency])
-    download_url: str
-    sha256: str
+    artifacts: list                         # the usable builds (list[Artifact]); ignored ones dropped
     source_repo: str                        # injected by fetch_indexes, NOT read from the file
-    package: str = "dll"                    # "dll" (single file) or "zip" (extracted bundle)
     parity_required: bool = True            # see parity_required() above
     scenes: list = None                     # see mod_scenes(); None = every scene
+    record_artifacts: list = None           # every artifact, as the install record keeps it
 
-    def install_name(self):
-        """The basename a package="dll" mod's file gets in Mods/<id>/: the name it
-        was published under (from download_url), unless that fails
-        _safe_basename or doesn't end in .dll, in which case f"{id}.dll"."""
-        base = os.path.basename(urlparse(self.download_url).path)
-        try:
-            safe = _safe_basename(base)
-        except ModManagerError:
-            safe = ""
-        return safe if safe.lower().endswith(".dll") else f"{self.id}.dll"
+    def artifact_for(self, target):
+        """The build for `target`, or None when the mod doesn't support it."""
+        return next((a for a in self.artifacts if target in a.targets), None)
+
+    @property
+    def targets(self):
+        return sorted({t for a in self.artifacts for t in a.targets})
 
 
 @dataclass
@@ -125,8 +160,7 @@ class ModSummary:
     name: str
     author: str
     description: str
-    client_side: bool
-    server_side: bool
+    targets: list                           # known targets the release has a build for, sorted
     versions: list                          # every version string in THIS major
     source_repo: str                        # injected by fetch_indexes
     parity_required: bool = True            # carried here too, so browsing can tell
@@ -154,7 +188,9 @@ def _sha256_field(d, where):
 
 
 def _library_from_dict(d):
-    for k in ("name", "download_url", "sha256", "filename"):
+    if not isinstance(d, dict):
+        raise ModManagerError(f"library_dependencies entry {d!r} isn't an object.")
+    for k in _LIBRARY_KEYS:
         if k not in d:
             raise ModManagerError(f"library_dependencies entry is missing '{k}'.")
     return LibraryDependency(
@@ -165,10 +201,72 @@ def _library_from_dict(d):
     )
 
 
+def _in_key_order(d, keys):
+    """d with `keys` first, in that order (those present), then any others as
+    they came: the record copies artifacts verbatim, in compiled order."""
+    out = {k: d[k] for k in keys if k in d}
+    out.update((k, v) for k, v in d.items() if k not in out)
+    return out
+
+
+def _record_artifact(a):
+    rec = _in_key_order(a, _ARTIFACT_KEYS)
+    if isinstance(rec.get("library_dependencies"), list):
+        rec["library_dependencies"] = [_in_key_order(l, _LIBRARY_KEYS)
+                                       for l in rec["library_dependencies"]]
+    return rec
+
+
+def _artifacts_from_list(raw, mod_id, warn=True):
+    """(usable Artifacts, every artifact as the record keeps it). Raises when
+    the list or an artifact is malformed, or a known target appears twice.
+    An artifact with no known target or an unknown package is ignored (the
+    latter with a warning, when `warn`). TavernLib's manifest parser applies
+    the same rules."""
+    where = f"manifest for {mod_id}"
+    if not isinstance(raw, list) or not raw:
+        raise ModManagerError(f"{where} has no artifacts; it needs at least one.")
+    usable, kept, seen = [], [], set()
+    for a in raw:
+        if not isinstance(a, dict):
+            raise ModManagerError(f"{where} has an artifact that isn't an object.")
+        targets = a.get("targets")
+        if (not isinstance(targets, list) or not targets
+                or not all(isinstance(t, str) for t in targets)):
+            raise ModManagerError(f"{where} has an artifact without a list of targets.")
+        known = [t for t in targets if t in TARGETS]
+        for t in known:
+            # Within one artifact too: either way it's two answers for one target.
+            if t in seen:
+                raise ModManagerError(f"{where} lists the {t} target twice.")
+            seen.add(t)
+        if not isinstance(a.get("download_url"), str):
+            raise ModManagerError(f"{where} has an artifact without a download_url.")
+        sha256 = _sha256_field(a, f"{where}'s artifact")
+        libs_raw = a.get("library_dependencies", [])
+        if not isinstance(libs_raw, list):
+            raise ModManagerError(f"{where} has an artifact whose library_dependencies isn't a list.")
+        libs = [_library_from_dict(x) for x in libs_raw]
+        kept.append(_record_artifact(a))
+        package = a.get("package")
+        package = package.lower() if isinstance(package, str) else None
+        if not known:
+            continue
+        if package not in PACKAGES:
+            if warn:
+                _warn(f"{where}: the {'/'.join(known)} artifact has unknown package "
+                      f"type {a.get('package')!r} (expected 'dll' or 'zip'), ignored.")
+            continue
+        usable.append(Artifact(targets=known, download_url=a["download_url"],
+                               sha256=sha256, package=package,
+                               library_dependencies=libs))
+    return usable, kept
+
+
 def _manifest_from_dict(d, source_repo):
     """A ModManifest from a parsed manifest, or None (with a warning) for an
-    unsupported schema major or package type. Raises for a supported manifest
-    that is structurally broken."""
+    unsupported schema major. Raises for a supported manifest that is
+    structurally broken."""
     mv = d.get("manifest_version")
     if not isinstance(mv, int):
         _warn(f"manifest for {d.get('id', '?')} has no integer manifest_version, skipped.")
@@ -178,15 +276,9 @@ def _manifest_from_dict(d, source_repo):
               f"supports v{SUPPORTED_MANIFEST_MAJOR}, skipped.")
         return None
 
-    package = str(d.get("package", "dll")).lower()
-    if package not in ("dll", "zip"):
-        _warn(f"manifest for {d.get('id', '?')} has unknown package type "
-              f"{package!r} (expected 'dll' or 'zip'), skipped.")
-        return None
-
     try:
         mod_id = str(d["id"])
-        libs = [_library_from_dict(x) for x in d.get("library_dependencies", [])]
+        artifacts, kept = _artifacts_from_list(d.get("artifacts"), mod_id)
         return ModManifest(
             manifest_version=mv,
             id=mod_id,
@@ -194,19 +286,22 @@ def _manifest_from_dict(d, source_repo):
             version=str(d["version"]),
             author=str(d.get("author", mod_id.split(".", 1)[0])),
             description=str(d.get("description", "")),
-            client_side=bool(d["client_side"]),
-            server_side=bool(d["server_side"]),
             dependencies=dict(d.get("dependencies", {}) or {}),
-            library_dependencies=libs,
-            download_url=str(d["download_url"]),
-            sha256=_sha256_field(d, "manifest"),
+            artifacts=artifacts,
             source_repo=source_repo,
-            package=package,
             parity_required=parity_required(d),
             scenes=mod_scenes(d),
+            record_artifacts=kept,
         )
     except KeyError as e:
         raise ModManagerError(f"manifest for {d.get('id', '?')} is missing field {e}.")
+
+
+def _known_targets(value):
+    """The known target names in a list, sorted; [] for anything else."""
+    if not isinstance(value, list):
+        return []
+    return sorted({t for t in value if isinstance(t, str) and t in TARGETS})
 
 
 def _summary_from_dict(d, mod_id, source_repo):
@@ -244,8 +339,7 @@ def _summary_from_dict(d, mod_id, source_repo):
         name=str(d.get("name", mod_id)),
         author=str(d.get("author", mod_id.split(".", 1)[0])),
         description=str(d.get("description", "")),
-        client_side=bool(d.get("client_side", False)),
-        server_side=bool(d.get("server_side", False)),
+        targets=_known_targets(d.get("targets")),
         versions=versions,
         source_repo=source_repo,
         parity_required=required,

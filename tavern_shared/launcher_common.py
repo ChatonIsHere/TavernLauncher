@@ -1,7 +1,7 @@
 """What the client and server launchers' main windows share around the game
 folder: the Setup and Mod Manager buttons, the Setup alert and Mod Manager
 badge behind them, and the partial-update report. Mixed into ClientLauncher
-and ServerLauncher, which differ only in their side and the hooks below."""
+and ServerLauncher, which differ only in their mod target and the hooks below."""
 import os
 from tkinter import messagebox
 
@@ -11,23 +11,23 @@ from tavern_shared.mods.hostcfg import load_cfg
 from tavern_shared.mods.install import list_installed_mods, mod_status
 from tavern_shared.mods.repos import fetch_indexes, list_repos
 from tavern_shared.mods.ui.manager_window import ModManagerWindow
-from tavern_shared.mods.ui.shared import meta_matches_side
+from tavern_shared.mods.ui.shared import record_matches_target
 from tavern_shared.mods_window import SetupWindow
 from tavern_shared.patch import _patch_needs_attention
 
 
-def count_mods_needing_attention(game_dir, side):
-    """How many of this side's installed community mods are outdated or
-    damaged. 0 on any failure, so a network blip never decorates the button
+def count_mods_needing_attention(game_dir, target):
+    """How many of this launcher's installed community mods (`target`
+    builds) are outdated or damaged. 0 on any failure, so a network blip never decorates the button
     with a false alarm. Hits the network and hashes files: workers only."""
     try:
         installed = [r for r in list_installed_mods(game_dir)
-                     if meta_matches_side(r, side)]
+                     if record_matches_target(r, target)]
         if not installed:
             return 0
         index = fetch_indexes(list_repos(load_cfg()))
         return sum(1 for r in installed
-                   if mod_status(game_dir, r["id"], index) in ("outdated", "damaged"))
+                   if mod_status(game_dir, r["id"], index, target) in ("outdated", "damaged"))
     except Exception:
         return 0
 
@@ -35,7 +35,7 @@ def count_mods_needing_attention(game_dir, side):
 class LauncherCommon:
     """Needs v_exe, _setup_btn, _mod_manager_btn and _print on the window, and
     _init_launcher_common() called before the buttons are built."""
-    MOD_SIDE = "client"
+    MOD_TARGET = "pc"           # the build this launcher installs; the server's is "server"
 
     def _init_launcher_common(self):
         # Read every tick by start_flashing_button; written only on the Tk thread.
@@ -118,7 +118,7 @@ class LauncherCommon:
             self._alert_probe_done(None)
             return
         self._alert_running = True
-        game_dir, side = os.path.dirname(exe), self.MOD_SIDE
+        game_dir, target = os.path.dirname(exe), self.MOD_TARGET
 
         def check():
             post(self, self._alert_probe_done, self._alert_probe(game_dir))
@@ -133,7 +133,7 @@ class LauncherCommon:
                         need = _mods_need_attention(game_dir) or _patch_needs_attention(exe)
                 except Exception:
                     need = False
-            return need, count_mods_needing_attention(game_dir, side)
+            return need, count_mods_needing_attention(game_dir, target)
 
         def done(result):
             need, badge = result
@@ -188,7 +188,7 @@ class LauncherCommon:
         # Browsing is harmless while the game runs, so the window opens either
         # way; the guard is on the actions that actually write.
         self._mod_manager_win = ModManagerWindow(
-            self, os.path.dirname(exe), side=self.MOD_SIDE,
+            self, os.path.dirname(exe), target=self.MOD_TARGET,
             on_change=self._on_mod_manager_change, **self._mod_manager_kwargs())
 
     def _on_mod_manager_change(self):

@@ -1,6 +1,8 @@
-"""The client mod cache: %AppData%/TheModdingTavern/mod_cache/<id>/<version>/
-and _libraries/<filename>/<sha256>/, so switching servers is a file move
-rather than a download."""
+"""The client mod cache: %AppData%/TheModdingTavern/mod_cache/<id>/<version>/<sha256>/
+(one target build, keyed by its artifact's sha256) and
+_libraries/<filename>/<sha256>/, so switching servers is a file move rather
+than a download."""
+import json
 import os
 import shutil
 import time
@@ -8,17 +10,18 @@ import time
 from tavern_shared import paths
 from tavern_shared.paths import _sha256_file
 
-from tavern_shared.mods.errors import ModManagerError, _warn
+from tavern_shared.mods.errors import ModManagerError
 from tavern_shared.mods.install import (
-    _clear_install_path, _files_intact, _invalidate_verify_memo, _library_present,
-    _read_mod_record, _read_sidecar, install_library_dependency,
-    list_installed_mods, verify_mod_files,
+    _files_intact, _installed_entry, _library_present, _place_target,
+    _read_mod_record, _read_sidecar, _record_target_libraries,
+    install_library_dependency, installed_targets, list_installed_mods,
+    verify_mod_files,
 )
 from tavern_shared.mods.layout import (
-    DISABLED_RECORD_NAME, RECORD_NAME, _library_sidecar_path, _mod_dir_path,
-    _mods_base, _safe_basename, _staging_path, _userlibs_dir,
+    _library_sidecar_path, _safe_basename, _staging_path, _target_dir_path,
+    _userlibs_dir,
 )
-from tavern_shared.mods.manifest import _library_from_dict
+from tavern_shared.mods.manifest import _SHA256, parity_required
 
 # Reached through the module, not imported by name, so tests can point the
 # cache at a temp directory by replacing paths._tavern_data_dir.
@@ -28,63 +31,80 @@ def _cache_base():
     return os.path.join(paths._tavern_data_dir(), "mod_cache")
 
 
-def _cache_mod_dir(mod_id, version):
-    return os.path.join(_cache_base(), _safe_basename(mod_id), _safe_basename(version))
+def _cache_mod_dir(mod_id, version, sha256):
+    return os.path.join(_cache_base(), _safe_basename(mod_id), _safe_basename(version),
+                        _safe_basename(sha256))
+
+
+# Inside an entry: the target folder's tree, and the record that placed it
+# (its `installed` cut to that one target), which restore re-verifies the
+# tree against and writes back.
+_CACHE_TREE = "tree"
+_CACHE_RECORD = "record.json"
 
 
 def _cache_library_dir(filename, sha256):
     return os.path.join(_cache_base(), "_libraries", _safe_basename(filename), sha256)
 
 
-# Cached versions kept per mod: the server's current, the previous, and one
+# Cached builds kept per mod: the server's current, the previous, and one
 # pinned. Pruned oldest-stored-first by the entry's mtime, which
 # cache_store_mod stamps on landing (copytree carries over the install's).
 _CACHE_KEEP_VERSIONS = 3
 
 
-def _prune_mod_cache(mod_id, keep_version):
+def _prune_mod_cache(mod_id, keep):
+    """Drops a mod's oldest entries past _CACHE_KEEP_VERSIONS, never `keep`."""
     base = os.path.join(_cache_base(), _safe_basename(mod_id))
     if not os.path.isdir(base):
         return
-    versions = [d for d in os.listdir(base)
-                if os.path.isdir(os.path.join(base, d)) and not d.endswith(".caching")]
-    if len(versions) <= _CACHE_KEEP_VERSIONS:
+    entries = [os.path.join(base, v, sha)
+               for v in os.listdir(base) if os.path.isdir(os.path.join(base, v))
+               for sha in os.listdir(os.path.join(base, v))
+               if os.path.isdir(os.path.join(base, v, sha)) and not sha.endswith(".caching")]
+    if len(entries) <= _CACHE_KEEP_VERSIONS:
         return
-    versions.sort(key=lambda d: os.path.getmtime(os.path.join(base, d)), reverse=True)
-    for d in versions[_CACHE_KEEP_VERSIONS:]:
-        if d == keep_version:
+    entries.sort(key=os.path.getmtime, reverse=True)
+    for path in entries[_CACHE_KEEP_VERSIONS:]:
+        if os.path.normcase(path) == os.path.normcase(keep):
             continue
-        shutil.rmtree(os.path.join(base, d), ignore_errors=True)
+        shutil.rmtree(path, ignore_errors=True)
+        try:
+            os.rmdir(os.path.dirname(path))     # the version folder, once empty
+        except OSError:
+            pass
 
 
-def cache_store_mod(game_dir, mod_id):
-    """Copies Mods/<id>/ (enabled or disabled) into the cache under its recorded
-    version unless already cached, then prunes that mod's older entries.
-    Returns the version, or None if it isn't installed or is damaged."""
+def cache_store_mod(game_dir, mod_id, target):
+    """Copies Mods/<id>/.<target>/ (enabled or disabled) into the cache under
+    its recorded version and artifact sha256, unless already cached, then
+    prunes that mod's older entries. Returns the version, or None if that
+    target isn't installed or is damaged."""
     rec = _read_mod_record(game_dir, mod_id)
-    if not rec or not rec.get("version"):
+    entry = _installed_entry(rec, target)
+    if not rec or not rec.get("version") or not entry:
+        return None
+    sha256 = str(entry.get("sha256", "")).lower()
+    if not _SHA256.fullmatch(sha256):
         return None
     version = rec["version"]
-    dest = _cache_mod_dir(mod_id, version)
+    dest = _cache_mod_dir(mod_id, version, sha256)
     if os.path.isdir(dest):
         return version
-    if verify_mod_files(game_dir, mod_id) is False:
+    if verify_mod_files(game_dir, mod_id, target) is False:
         return None     # never cache a damaged copy as the good one
 
-    src = _mod_dir_path(game_dir, mod_id)
     staging = dest + ".caching"
     if os.path.isdir(staging):
         shutil.rmtree(staging, ignore_errors=True)
-    shutil.copytree(src, staging)
-    # The cache has no disabled state; restore always looks for RECORD_NAME.
-    disabled = os.path.join(staging, DISABLED_RECORD_NAME)
-    if os.path.isfile(disabled):
-        os.replace(disabled, os.path.join(staging, RECORD_NAME))
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.copytree(_target_dir_path(game_dir, mod_id, target),
+                    os.path.join(staging, _CACHE_TREE))
+    with open(os.path.join(staging, _CACHE_RECORD), "w", encoding="utf-8") as f:
+        json.dump(dict(rec, installed={target: entry}), f, indent=2)
     os.replace(staging, dest)
     now = time.time_ns()
     os.utime(dest, ns=(now, now))
-    _prune_mod_cache(mod_id, version)
+    _prune_mod_cache(mod_id, dest)
     return version
 
 
@@ -115,62 +135,71 @@ def cache_store_library(game_dir, filename):
 
 
 def clear_mod_cache():
-    """Deletes the whole mod cache; Mods/ is untouched. Entries are keyed on
-    id+version alone, so this is the fix for one that has gone stale."""
+    """Deletes the whole mod cache; Mods/ is untouched. Entries are keyed by
+    their build's sha256 and re-verified on restore, so this only frees
+    space."""
     base = _cache_base()
     if os.path.isdir(base):
         shutil.rmtree(base)
 
 
-def adopt_installed_mods(game_dir):
-    """Caches everything in Mods/ (and the libraries it pins) without touching
-    Mods/. The client calls it before planning a join: a mod installed straight
-    into Mods/ is otherwise unknown to the cache, and rendering another version
-    over it would destroy the only copy. Returns the ids newly cached."""
+def adopt_installed_mods(game_dir, target):
+    """Caches every `target` build in Mods/ (and the libraries it pins)
+    without touching Mods/. The client calls it before planning a join: a mod
+    installed straight into Mods/ is otherwise unknown to the cache, and
+    rendering another version over it would destroy the only copy. Returns
+    the ids newly cached."""
     adopted = []
     for rec in list_installed_mods(game_dir):
-        version = rec.get("version")
-        if not version:
+        entry = _installed_entry(rec, target)
+        if not rec.get("version") or not entry:
             continue
-        already_cached = os.path.isdir(_cache_mod_dir(rec["id"], version))
-        if cache_store_mod(game_dir, rec["id"]) and not already_cached:
+        sha256 = str(entry.get("sha256", "")).lower()
+        already_cached = bool(_SHA256.fullmatch(sha256)) and os.path.isdir(
+            _cache_mod_dir(rec["id"], rec["version"], sha256))
+        if cache_store_mod(game_dir, rec["id"], target) and not already_cached:
             adopted.append(rec["id"])
-        for filename in rec.get("libraries", []):
+        for filename in entry.get("libraries") or []:
             cache_store_library(game_dir, filename)
     return adopted
 
 
-def cache_restore_mod(game_dir, mod_id, version):
-    """Copies a cached version into Mods/<id>/, enabled, through staging and an
-    atomic swap; a folder that isn't ours is displaced, as install_mod does.
-    The staged copy is checked against the record's `files` first: a failure
-    discards the cache entry and raises, and render_active_set falls back to a
-    download. An entry without `files` is restored unchecked. Raises if that
-    version isn't cached."""
-    src = _cache_mod_dir(mod_id, version)
-    if not os.path.isdir(src):
+def cache_restore_mod(game_dir, mod_id, version, sha256, target):
+    """Installs a cached build as Mods/<id>/.<target>/ and updates the record
+    exactly as an install would (see install._place_target), enabled; a
+    folder that isn't ours is displaced. The staged copy is checked against
+    the cached record's `files` first: a failure discards the cache entry and
+    raises, and render_active_set falls back to a download. Raises if that
+    build isn't cached."""
+    src = _cache_mod_dir(mod_id, version, sha256)
+    rec = _read_sidecar(os.path.join(src, _CACHE_RECORD))
+    entry = _installed_entry(rec, target)
+    if not rec or not entry or rec.get("id") != mod_id or rec.get("version") != version:
         raise ModManagerError(f"'{mod_id}' {version} isn't in the local cache.")
 
-    dest = _mod_dir_path(game_dir, mod_id)
     staging = _staging_path(game_dir, mod_id)
     if os.path.isdir(staging):
         shutil.rmtree(staging, ignore_errors=True)
-    shutil.copytree(src, staging)
-    rec = _read_sidecar(os.path.join(staging, RECORD_NAME))
-    files = (rec or {}).get("files")
-    bad = _files_intact(staging, files) if isinstance(files, dict) and files else None
-    if bad is not None:
-        shutil.rmtree(staging, ignore_errors=True)
-        shutil.rmtree(src, ignore_errors=True)
-        raise ModManagerError(
-            f"The cached copy of '{mod_id}' {version} no longer matches "
-            f"what was stored ({bad} is missing or altered). The bad cache "
-            f"entry has been discarded; this version will need to be "
-            f"re-downloaded.")
-    _clear_install_path(game_dir, mod_id)
-    os.makedirs(_mods_base(game_dir), exist_ok=True)
-    os.replace(staging, dest)
-    _invalidate_verify_memo(game_dir, mod_id)
+    try:
+        shutil.copytree(os.path.join(src, _CACHE_TREE), staging)
+        files = entry.get("files")
+        bad = _files_intact(staging, files) if isinstance(files, dict) and files else None
+        try:
+            parity_required(rec)
+        except ModManagerError:
+            bad = "its record"
+        if bad is not None:
+            shutil.rmtree(src, ignore_errors=True)
+            raise ModManagerError(
+                f"The cached copy of '{mod_id}' {version} no longer matches "
+                f"what was stored ({bad} is missing or altered). The bad cache "
+                f"entry has been discarded; this version will need to be "
+                f"re-downloaded.")
+        base = {k: v for k, v in rec.items() if k != "installed"}
+        _place_target(game_dir, base, target, staging, entry)
+    finally:
+        if os.path.isdir(staging):
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 def cache_restore_library(game_dir, filename, sha256):
@@ -223,22 +252,20 @@ def _ensure_library(game_dir, lib, progress, verb="Restoring"):
 
 
 def ensure_mod_libraries(game_dir, mod_id, on_progress=None):
-    """Restores every library a mod's record pins (cache first, else download)
-    and returns the filenames it had to restore. The manager window calls this
-    after a bare enable: the join flow prunes libraries no enabled mod pins, so
-    a re-enabled mod would otherwise load without them. An unparseable record
-    entry is skipped with a warning."""
+    """Restores every library the record's installed targets pin (cache first,
+    else download) and returns the filenames it had to restore. The manager
+    window calls this after a bare enable: the join flow prunes libraries no
+    enabled mod pins, and enabling the record turns on every target in the
+    folder, so a re-enabled mod would otherwise load without them."""
     progress = on_progress or (lambda *_a: None)
     rec = _read_mod_record(game_dir, mod_id)
-    restored = []
-    for entry in (rec.get("library_dependencies") if rec else []) or []:
-        try:
-            lib = _library_from_dict(dict(entry))
+    restored, seen = [], set()
+    for target in installed_targets(rec):
+        for lib in _record_target_libraries(rec, target):
             filename = _safe_basename(lib.filename)
-        except (ModManagerError, TypeError):
-            _warn(f"'{mod_id}' pins a library its record doesn't describe "
-                  f"usably ({entry!r}); skipped.")
-            continue
-        if _ensure_library(game_dir, lib, progress):
-            restored.append(filename)
+            if filename in seen:
+                continue
+            seen.add(filename)
+            if _ensure_library(game_dir, lib, progress):
+                restored.append(filename)
     return restored

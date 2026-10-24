@@ -144,7 +144,7 @@ def _mods_snapshot(game_dir):
         if hit and now - hit[0] < _SNAPSHOT_TTL:
             return hit[1]
         generation = _snapshot_generation
-    snapshot = mods.handshake_snapshot(game_dir)
+    snapshot = mods.handshake_snapshot(game_dir, target="server")
     with _snapshot_lock:
         if generation == _snapshot_generation:
             _snapshot_cache[game_dir] = (now, snapshot)

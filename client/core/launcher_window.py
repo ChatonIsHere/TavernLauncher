@@ -1004,7 +1004,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         # installed straight to Mods/ isn't cached yet, and rendering a
         # different version would destroy the only copy of this one.
         try:
-            adopted = mods.adopt_installed_mods(game_dir)
+            adopted = mods.adopt_installed_mods(game_dir, CLIENT_TARGET)
             if adopted:
                 self._print(f"Cached {len(adopted)} already-installed mod(s): "
                             f"{', '.join(adopted)}", "dim")
@@ -1046,7 +1046,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         holds. ModParity.ValidateClient's rule: mods the server doesn't require
         are skipped, and a required mod with no version always mismatches."""
         required = {m["id"]: m.get("version") for m in server_mods
-                    if m.get("client_side")
+                    if CLIENT_TARGET in (m.get("targets") or [])
                     and mods.parity_required(m)}
         have = {m["id"]: m.get("version") for m in installed}
         return [(mid, ver, have.get(mid)) for mid, ver in required.items()
@@ -1054,17 +1054,20 @@ class ClientLauncher(LauncherCommon, tk.Tk):
 
     def _build_divergence(self, server_mods, installed):
         """Warnings for mods with the same id and version on both sides but a
-        different sha256: version parity passes, but an in-game misbehaviour
-        from it would otherwise be undiagnosable. Silent when either side
-        predates the sha256 field."""
+        different pc build: the installed pc sha256 against the server's
+        target_sha256.pc. Version parity passes, but an in-game misbehaviour
+        from it would otherwise be undiagnosable. Silent when either is
+        missing."""
         have = {m["id"]: m for m in installed}
         warnings = []
         for m in server_mods:
-            local = have.get(m["id"]) if m.get("client_side") else None
+            local = have.get(m["id"])
             if not local or local.get("version") != m.get("version"):
                 continue
-            server_sha = (m.get("sha256") or "").lower()
-            local_sha = (local.get("sha256") or "").lower()
+            shas = m.get("target_sha256")
+            server_sha = str((shas if isinstance(shas, dict) else {}).get(CLIENT_TARGET) or "").lower()
+            entry = (local.get("installed") or {}).get(CLIENT_TARGET) or {}
+            local_sha = str(entry.get("sha256") or "").lower()
             if server_sha and local_sha and server_sha != local_sha:
                 warnings.append(
                     f"Heads up: {m['id']} {m.get('version')} is the same "
@@ -1368,9 +1371,10 @@ class ClientLauncher(LauncherCommon, tk.Tk):
             scene=mods.scene_from_arg(scene_arg))
 
     def _mods_claim(self, game_dir, installed=None):
-        """The TavernMods claim: {id: version} of every enabled managed mod,
-        for the server's exact-version parity check (an untracked mod has no
-        id or version to claim). Empty when Mods/ can't be read, which a server
+        """The TavernMods claim: {id: version} of every enabled managed mod
+        installed for pc, for the server's exact-version parity check (an
+        untracked mod has no id or version to claim, and a server-only build
+        in this folder isn't something the game loads). Empty when Mods/ can't be read, which a server
         enforcing parity reads as "no mods"."""
         try:
             if installed is None:
@@ -1491,7 +1495,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
             repo_bases = mods.list_repos(load_cfg())
             index = mods.fetch_indexes(repo_bases)
             roots, dependencies = mods.resolve_missing_mods(missing, index, repo_bases)
-            mods.install_mod_set(game_dir, dependencies + roots,
+            mods.install_mod_set(game_dir, dependencies + roots, CLIENT_TARGET,
                                  lambda m: self._print(m, "dim"))
 
         run_bg(self, recover, lambda _r: self._recovery_done(relaunch),
@@ -1614,16 +1618,23 @@ class ClientLauncher(LauncherCommon, tk.Tk):
             self._print(f"Menu launch failed: {e}", "err")
 
 
+# The build this launcher installs, joins with and claims.
+CLIENT_TARGET = "pc"
+
+
 def _enabled_mods(game_dir):
-    return [m for m in mods.list_installed_mods(game_dir) if m.get("enabled")]
+    """The enabled mods installed for pc: what the game loads, so what the
+    claim lists and parity is checked against."""
+    return [m for m in mods.list_installed_mods(game_dir)
+            if m.get("enabled") and mods.has_target(m, CLIENT_TARGET)]
 
 
 def _tavernessentials_installed(game_dir):
     """Whether TavernEssentials will load in this game folder: an enabled
     TavernEssentials.dll, either loose in Mods/ (how upstream 1.8.5 installed
-    it) or inside a mod folder MelonLoader loads, one with a manifest.json
-    (how the Mod Manager installs it). Read off the files rather than an index
-    id, so it holds whichever way it got there."""
+    it) or in the .pc/ build folder of a mod folder with a manifest.json (how
+    the Mod Manager installs it). Read off the files rather than an index id,
+    so it holds whichever way it got there."""
     mods_dir = os.path.join(game_dir, "Mods")
     try:
         entries = os.listdir(mods_dir)
@@ -1636,7 +1647,8 @@ def _tavernessentials_installed(game_dir):
         if (os.path.isdir(full) and not name.startswith((".", "~"))
                 and os.path.isfile(os.path.join(full, "manifest.json"))):
             try:
-                if any(f.lower() == "tavernessentials.dll" for f in os.listdir(full)):
+                build = os.path.join(full, "." + CLIENT_TARGET)
+                if any(f.lower() == "tavernessentials.dll" for f in os.listdir(build)):
                     return True
             except OSError:
                 pass

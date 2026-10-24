@@ -55,7 +55,7 @@ except ImportError:
     _updater = None
 
 class ServerLauncher(LauncherCommon, tk.Tk):
-    MOD_SIDE = "server"
+    MOD_TARGET = "server"
 
     def __init__(self):
         super().__init__()
@@ -486,7 +486,8 @@ class ServerLauncher(LauncherCommon, tk.Tk):
         except Exception:
             return
         for rec in installed:
-            if not rec.get("enabled"):
+            # A pc build in the same folder is the host's, not the server's.
+            if not rec.get("enabled") or not mods.has_target(rec, "server"):
                 continue
             try:
                 scenes = mods.mod_scenes(rec)

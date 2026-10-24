@@ -1,7 +1,7 @@
 """Dependency closure and by-id resolution (latest.json / latest.<major>.json)."""
 from tavern_shared.mods import repos
 from tavern_shared.mods.errors import ModManagerError, _warn
-from tavern_shared.mods.manifest import _manifest_from_dict
+from tavern_shared.mods.manifest import INSTALL_TARGETS, _manifest_from_dict
 from tavern_shared.mods.repos import _norm
 from tavern_shared.mods.version import _parse_version
 
@@ -14,9 +14,6 @@ from tavern_shared.mods.version import _parse_version
 MAX_DEPENDENCY_DEPTH = 5
 
 
-SIDES = ("client", "server")
-
-
 # Per-version manifests are immutable by contract, so a fetched one is kept
 # for the life of the process: (normalized repo base, id, version) -> manifest.
 # Successes only; the latest*.json pointers move and are never memoized.
@@ -27,13 +24,7 @@ def _clear_manifest_memo():
     _manifest_memo.clear()
 
 
-def _runs_on(manifest, side):
-    """Whether this mod can load in a `side` process. Read off the per-version
-    manifest, which requires both flags; a ModSummary defaults them to False."""
-    return manifest.client_side if side == "client" else manifest.server_side
-
-
-def resolve_dependencies(roots, summary_index, fetch_manifest, side):
+def resolve_dependencies(roots, summary_index, fetch_manifest, target):
     """The dependency closure of one or more roots as a flat, deduplicated
     list of ModManifests, roots excluded. Several roots at once is what lets
     two independent required mods be caught pulling incompatible versions of
@@ -43,17 +34,18 @@ def resolve_dependencies(roots, summary_index, fetch_manifest, side):
     summary_index lists in the required major that is >= the running minimum.
     fetch_manifest(id, version, source_repo) loads only what the closure uses.
 
-    `side` ("client"/"server", no default) is the process being installed
-    into. A dependency that can't load there is pruned, with everything only
-    it needed, before its constraints are recorded, and reported via _warn.
+    `target` ("pc"/"server", no default) is what's being installed. A
+    dependency with no build for it is pruned, with everything only it
+    needed, before its constraints are recorded, and reported via _warn.
+    Roots aren't filtered: they're what the caller asked for.
 
     Raises, naming the mods involved, on a cycle, a chain deeper than
     MAX_DEPENDENCY_DEPTH, a cross-major (diamond) conflict, or a missing
     version."""
-    if side not in SIDES:
+    if target not in INSTALL_TARGETS:
         raise ModManagerError(
-            f"resolve_dependencies needs side={' or '.join(map(repr, SIDES))}, "
-            f"got {side!r}.")
+            f"resolve_dependencies needs target="
+            f"{' or '.join(map(repr, INSTALL_TARGETS))}, got {target!r}.")
 
     summ = {}            # (id, major) -> ModSummary
     for s in summary_index:
@@ -66,13 +58,13 @@ def resolve_dependencies(roots, summary_index, fetch_manifest, side):
     req_major = {}       # id -> locked major
     req_min = {}         # id -> highest min-version tuple required so far
     req_by = {}          # id -> (mod name, constraint str) of first requirer, for messages
-    pruned = {}          # id -> the wrong-side ModManifest, so it's fetched at most once
+    pruned = {}          # id -> the ModManifest with no `target` build, fetched at most once
 
     def add_requirement(dep_id, min_v, requirer, chain):
         if dep_id in pruned:
             # Reported for every requirer, fetched and walked once.
-            _warn(f"{requirer} depends on '{dep_id}', which doesn't run on the "
-                  f"{side}; skipped.")
+            _warn(f"{requirer} depends on '{dep_id}', which has no {target} "
+                  f"build; skipped.")
             return
 
         try:
@@ -113,12 +105,12 @@ def resolve_dependencies(roots, summary_index, fetch_manifest, side):
             return
 
         manifest = fetch_manifest(dep_id, pick_version, summary.source_repo)
-        if not _runs_on(manifest, side):
+        if manifest.artifact_for(target) is None:
             # Before record(): a mod we aren't installing can't raise a diamond
             # conflict, and nothing only it needs is walked.
             pruned[dep_id] = manifest
-            _warn(f"{requirer} depends on '{dep_id}' {pick_version}, which doesn't "
-                  f"run on the {side}; skipped, along with anything only it needed.")
+            _warn(f"{requirer} depends on '{dep_id}' {pick_version}, which has no "
+                  f"{target} build; skipped, along with anything only it needed.")
             return
 
         record()
