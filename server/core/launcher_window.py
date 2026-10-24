@@ -75,6 +75,7 @@ class ServerLauncher(tk.Tk):
         if ttk.Style().theme_use() != "clam":
             ttk.Style().theme_use("clam")
         self._proc     = None
+        self._starting = False         # between Open Server and the launch
         self._auth_on  = False
         self._tailer   = None
         self._mgr_win  = None
@@ -720,6 +721,14 @@ class ServerLauncher(tk.Tk):
             messagebox.showerror("Not found",
                 "Could not find the game.\nPlease browse first.", parent=self)
             return
+        # The archive below runs on a worker thread for up to a couple of
+        # seconds before the server is actually launched, so Start has to go
+        # grey now - not when _set_running fires - or a second click in that
+        # window launches a second server.
+        if self._starting:
+            return
+        self._starting = True
+        self._btn_start.config(state="disabled")
         # Archive the previous log before starting -- also covers auto-reboot,
         # since that calls _start() too.
         self._archive_log_with_tailer_paused(
@@ -730,7 +739,14 @@ class ServerLauncher(tk.Tk):
             self._print(f"Log archived to {result}", "ok")
         elif not locked and result != "No active log file found to archive.":
             self._print(f"Couldn't archive previous log: {result}", "err")
-        self._start_after_archive(exe)
+        try:
+            self._start_after_archive(exe)
+        finally:
+            self._starting = False
+            # A launch that failed never reached _set_running(True), which
+            # is what would otherwise own the button from here.
+            if not (self._proc and self._proc.poll() is None):
+                self._btn_start.config(state="normal")
 
     def _start_after_archive(self, exe):
         try: port = int(self.v_port.get())
