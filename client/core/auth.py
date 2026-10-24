@@ -132,8 +132,9 @@ def _recv_framed(s, timeout):
 def fetch_server_mods(host, timeout=10):
     """Fetches the server's full mod list. Returns (mods, untracked):
     - mods: every currently-enabled MANAGED mod as {"id", "version",
-      "client_side", "server_side", "parity_required", "source_repo"} -- the
-      same six fields handshake_snapshot builds and TavernLib's
+      "client_side", "server_side", "parity_required", "source_repo",
+      "sha256"} (plus "scenes" when set) -- the same fields handshake_snapshot
+      builds and TavernLib's
       ModHandshake.Entry serialises, so both kinds of server answer this
       identically. This is what plan_join resolves against. parity_required
       decides whether a client must match a mod or may decline it, and
