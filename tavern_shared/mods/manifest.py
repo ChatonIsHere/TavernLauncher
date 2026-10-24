@@ -248,8 +248,8 @@ def _artifacts_from_list(raw, mod_id, warn=True):
             raise ModManagerError(f"{where} has an artifact whose library_dependencies isn't a list.")
         libs = [_library_from_dict(x) for x in libs_raw]
         kept.append(_record_artifact(a))
+        # Exactly "dll" or "zip", as TavernLib reads it: the tooling writes it.
         package = a.get("package")
-        package = package.lower() if isinstance(package, str) else None
         if not known:
             continue
         if package not in PACKAGES:
