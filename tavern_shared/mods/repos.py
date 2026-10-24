@@ -97,14 +97,8 @@ def _source_display(url):
 
 
 def _named_repos(cfg):
-    """cfg[CFG_REPOS_KEY] as {shorthand: url}, migrating a pre-shorthand
-    list-of-URLs shape in memory (older configs stored a plain list; new ones
-    store the dict directly). Doesn't write back on its own - callers that
-    mutate the result save via _save_cfg."""
-    raw = cfg.get(CFG_REPOS_KEY, {})
-    if isinstance(raw, list):
-        return {_repo_shorthand(u): u for u in raw}
-    return dict(raw)
+    """A copy of cfg[CFG_REPOS_KEY]: {shorthand: url}."""
+    return dict(cfg.get(CFG_REPOS_KEY) or {})
 
 
 def list_repos(cfg):
