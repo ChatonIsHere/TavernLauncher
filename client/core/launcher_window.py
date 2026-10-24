@@ -798,6 +798,9 @@ class ClientLauncher(tk.Tk):
     # ── Log helpers ─────────────────────────────────────────────────────────
 
     def _print(self, msg, tag=""):
+        if threading.current_thread() is not threading.main_thread():
+            self.after(0, lambda: self._print(msg, tag))
+            return
         self.log.config(state="normal")
         self.log.insert("end", f"[{time.strftime('%H:%M:%S')}] {msg}\n", tag)
         self.log.see("end"); self.log.config(state="disabled")
@@ -1263,10 +1266,9 @@ class ClientLauncher(tk.Tk):
         unresolved = [m for m in sorted(undeclined)
                       if m not in {e.mod_id for e in fresh.entries}]
         if unresolved:
-            self.after(0, lambda: self._print(
-                f"Couldn't install {', '.join(unresolved)}: this server "
-                f"recommends it but no source you've added has it. Joining "
-                f"isn't affected.", "warn"))
+            self._print(f"Couldn't install {', '.join(unresolved)}: this server "
+                        f"recommends it but no source you've added has it. "
+                        f"Joining isn't affected.", "warn")
         self.after(0, lambda: win.retarget(fresh))
         return fresh
 
@@ -1348,13 +1350,11 @@ class ClientLauncher(tk.Tk):
         # log rather than by opening the comparison window: it's the player's
         # own setting, it has nothing to do with this server, and it would
         # otherwise be a modal on every single join until they fixed it.
-        # Marshalled onto the UI thread because _print writes to a Tk widget
-        # and this method runs on a worker.
         for mod_id, version in plan.unresolved_pins:
-            self.after(0, lambda i=mod_id, v=version: self._print(
-                f"Your pinned mod {i} ({v}) isn't in any source you've added, "
-                f"so it can't be installed. This doesn't affect joining - "
-                f"remove the pin in Mod Manager to stop this notice.", "warn"))
+            self._print(f"Your pinned mod {mod_id} ({version}) isn't in any "
+                        f"source you've added, so it can't be installed. This "
+                        f"doesn't affect joining - remove the pin in Mod "
+                        f"Manager to stop this notice.", "warn")
         return "plan", (plan, server_mods)
 
     def _verify_mod_parity(self, game_dir, server_mods):
@@ -1790,12 +1790,7 @@ class ClientLauncher(tk.Tk):
             with open(path, "r", encoding="utf-8") as f:
                 payload = json.load(f)
         except Exception as e:
-            # Bound as a default, not captured: Python clears the `as e` name
-            # when the except block ends, and this lambda runs later on the UI
-            # thread, so a free reference would be a NameError instead of the
-            # warning it is meant to print.
-            self.after(0, lambda e=e: self._print(
-                f"Could not read the rejection file: {e}", "warn"))
+            self._print(f"Could not read the rejection file: {e}", "warn")
             return
         finally:
             try: os.remove(path)   # consumed either way, never re-act on it twice
