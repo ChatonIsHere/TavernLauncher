@@ -1,7 +1,18 @@
-# Byte-compiled / optimized / cache
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+.vs
+
+addons/
 
 # Distribution / packaging
 build/
@@ -11,12 +22,9 @@ dist/
 .eggs/
 pip-wheel-metadata/
 MANIFEST
-
-# PyInstaller
 *.spec
-*.manifest
 
-# Test / coverage artifacts
+# Test and coverage data
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -25,27 +33,24 @@ MANIFEST
 htmlcov/
 .tox/
 .nox/
-.pyre/
-.hypothesis/
 
-# Virtual environments
-.venv/
-venv/
-env/
-ENV/
-.env
-.env.*
-
-# Editor / OS cruft
+# IDEs and editors
 .idea/
 .vscode/
-.vs
 *.swp
 *.swo
-.ipynb_checkpoints/
-.DS_Store
-Thumbs.db
+
+# Type checker caches
+.pyre/
+.hypothesis/
 
 # Logs and local configuration
 *.log
 *.local
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
