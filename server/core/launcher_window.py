@@ -86,7 +86,6 @@ class ServerLauncher(LauncherCommon, tk.Tk):
         self._tickets_win = None
         self._served_game_dir = None   # read by the auth service's threads
         self._starting = False
-        self._init_launcher_common()
         self._build_ui()
         self._load()
         self._start_log_tailer()
@@ -117,14 +116,7 @@ class ServerLauncher(LauncherCommon, tk.Tk):
              padx=10, pady=6).pack(side="right")
         btn_row_mods = tk.Frame(self, bg=BG)
         btn_row_mods.pack(fill="x", padx=20, pady=(4,0))
-        self._setup_btn = _btn(btn_row_mods, "🛠 Setup", self._open_setup,
-             font=("Segoe UI",9), pady=5, padx=10)
-        self._setup_btn.pack(side="left")
-        start_flashing_button(self._setup_btn,
-            lambda: self._setup_needs_attention, normal_bg=SURF2, alert_bg="#5a3d0e")
-        self._mod_manager_btn = _btn(btn_row_mods, "📦 Mod Manager", self._open_mod_manager,
-             font=("Segoe UI",9), pady=5, padx=10)
-        self._mod_manager_btn.pack(side="left", padx=(6,0))
+        self._build_mod_buttons(btn_row_mods)
         _section_label(self, "GAME PORT")
         pf2 = _field(self)
         self.v_port = tk.StringVar(value="1757")
