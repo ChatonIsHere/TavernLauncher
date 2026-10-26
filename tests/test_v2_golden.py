@@ -58,10 +58,10 @@ class _Golden:
                     game = self._install(spec["id"], order)
                     self.assertEqual(self._record(game, spec["id"]), _expected(case))
                     helper = os.path.join(game, "Mods", "ExampleDev.PcHelper")
-                    if spec["id"] == "ExampleDev.ExampleMod" and "pc" in targets:
+                    if spec["id"] == "ExampleDev.ExampleMod" and "client_windows" in targets:
                         # Pulled in as ExampleMod's dependency, not installed directly.
                         self.assertEqual(self._record(game, "ExampleDev.PcHelper"),
-                                         _expected("PcHelper.pc"))
+                                         _expected("PcHelper.client_windows"))
                     elif spec["id"] == "ExampleDev.ExampleMod":
                         self.assertFalse(os.path.exists(helper))   # pc-only: pruned
 

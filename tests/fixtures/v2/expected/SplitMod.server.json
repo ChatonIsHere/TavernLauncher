@@ -4,7 +4,7 @@
   "name": "Split Mod",
   "version": "1.0.0",
   "author": "ExampleDev",
-  "description": "different pc and server builds",
+  "description": "different client and server builds",
   "parity_required": true,
   "dependencies": {},
   "artifacts": [
@@ -19,7 +19,7 @@
     },
     {
       "targets": [
-        "pc"
+        "client_windows"
       ],
       "download_url": "http://127.0.0.1:8765/files/SplitMod-pc.dll",
       "sha256": "ef3a4c44d89fa2bf1c8dceb5cad500586283d6c2217533b5503deed210a41525",

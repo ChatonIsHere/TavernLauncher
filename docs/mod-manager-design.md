@@ -23,7 +23,7 @@ and verdicts.
 | `server/core/auth_service.py` | `mods_hash`/`mods_count` on ping and the framed `mods_list` reply |
 | `tavern_shared/mods_window.py` | the Setup window (patch, MelonLoader, TavernLib), with `mod_install.py`, `patch.py`, `bundled.py` and `manual_install.py` behind it |
 
-The client launcher installs `pc`, the server launcher `server`
+The client launcher installs `client_windows`, the server launcher `server`
 (`LauncherCommon.MOD_TARGET`). One game folder often serves both, so each
 lists, verifies, exports and claims only its own target.
 

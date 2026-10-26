@@ -13,11 +13,11 @@ are replaced):
   cases.json                  what each expected record is the result of
 
 Mods:
-  ExampleDev.ExampleMod 1.2.0  one dll artifact for pc+server, plus a quest zip
+  ExampleDev.ExampleMod 1.2.0  one dll artifact for client_windows+server, plus a client_android zip
                                (ignored by installers); pins a library; scenes;
                                non-ASCII description; depends on PcHelper
-  ExampleDev.PcHelper 1.0.0    pc-only, so a server install prunes it
-  ExampleDev.SplitMod 1.0.0    separate pc dll and server zip (nested files,
+  ExampleDev.PcHelper 1.0.0    client_windows only, so a server install prunes it
+  ExampleDev.SplitMod 1.0.0    separate client_windows dll and server zip (nested files,
                                mixed case, to pin the ordinal sort of `files`)
 """
 import hashlib
@@ -89,11 +89,11 @@ manifests = {
         "scenes": ["normal", "quest"],
         "dependencies": {"ExampleDev.PcHelper": "1.0.0"},
         "artifacts": [
-            {"targets": ["pc", "server"],
+            {"targets": ["client_windows", "server"],
              "download_url": write_bytes("files/ExampleMod.dll", ex_dll),
              "sha256": sha(ex_dll), "package": "dll",
              "library_dependencies": [lib]},
-            {"targets": ["quest"],
+            {"targets": ["client_android"],
              "download_url": write_bytes("files/ExampleMod-quest.zip", ex_quest),
              "sha256": sha(ex_quest), "package": "zip",
              "library_dependencies": []},
@@ -105,11 +105,11 @@ manifests = {
         "name": "PC Helper",
         "version": "1.0.0",
         "author": "ExampleDev",
-        "description": "pc only",
+        "description": "Windows client only",
         "parity_required": False,
         "dependencies": {},
         "artifacts": [
-            {"targets": ["pc"],
+            {"targets": ["client_windows"],
              "download_url": write_bytes("files/PcHelper.dll", helper_dll),
              "sha256": sha(helper_dll), "package": "dll",
              "library_dependencies": []},
@@ -121,7 +121,7 @@ manifests = {
         "name": "Split Mod",
         "version": "1.0.0",
         "author": "ExampleDev",
-        "description": "different pc and server builds",
+        "description": "different client and server builds",
         "parity_required": True,
         "dependencies": {},
         "artifacts": [
@@ -129,7 +129,7 @@ manifests = {
              "download_url": write_bytes("files/SplitMod-server.zip", split_server),
              "sha256": sha(split_server), "package": "zip",
              "library_dependencies": []},
-            {"targets": ["pc"],
+            {"targets": ["client_windows"],
              "download_url": write_bytes("files/SplitMod-pc.dll", split_pc),
              "sha256": sha(split_pc), "package": "dll",
              "library_dependencies": []},
@@ -186,11 +186,11 @@ def record(m, targets):
 
 by_id = {m["id"]: m for m in manifests.values()}
 cases = {
-    "ExampleMod.pc": ("ExampleDev.ExampleMod", ["pc"]),
+    "ExampleMod.client_windows": ("ExampleDev.ExampleMod", ["client_windows"]),
     "ExampleMod.server": ("ExampleDev.ExampleMod", ["server"]),
-    "ExampleMod.pc+server": ("ExampleDev.ExampleMod", ["pc", "server"]),
-    "PcHelper.pc": ("ExampleDev.PcHelper", ["pc"]),
-    "SplitMod.pc+server": ("ExampleDev.SplitMod", ["server", "pc"]),
+    "ExampleMod.client_windows+server": ("ExampleDev.ExampleMod", ["client_windows", "server"]),
+    "PcHelper.client_windows": ("ExampleDev.PcHelper", ["client_windows"]),
+    "SplitMod.client_windows+server": ("ExampleDev.SplitMod", ["server", "client_windows"]),
     "SplitMod.server": ("ExampleDev.SplitMod", ["server"]),
 }
 os.makedirs(os.path.join(OUT, "expected"))
