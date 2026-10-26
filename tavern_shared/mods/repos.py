@@ -9,7 +9,7 @@ from tavern_shared.mods.base import ModManagerError, _parse_version, _warn, save
 from tavern_shared.mods.manifest import _summary_from_dict
 
 
-DEFAULT_REPO = "https://raw.githubusercontent.com/ChatonIsHere/CommunityMods/main"
+DEFAULT_REPO = "https://raw.githubusercontent.com/ModdingTavern/TavernMods/main"
 # {"Author/Repo": base url} of user-added repos; DEFAULT_REPO is implicit.
 CFG_REPOS_KEY = "mod_repos"
 SUPPORTED_INDEX_MAJOR = 2
