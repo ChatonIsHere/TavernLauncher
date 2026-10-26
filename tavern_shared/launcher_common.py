@@ -7,7 +7,7 @@ from tkinter import messagebox
 
 from tavern_shared.bg import post, run_bg
 from tavern_shared.mod_install import NEEDS_ATTENTION, _mods_need_attention
-from tavern_shared.mods.hostcfg import load_cfg
+from tavern_shared.mods.base import load_cfg
 from tavern_shared.mods.install import list_installed_mods, mod_status
 from tavern_shared.mods.repos import fetch_indexes, list_repos
 from tavern_shared.mods.ui.manager_window import ModManagerWindow

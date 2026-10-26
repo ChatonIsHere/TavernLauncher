@@ -65,8 +65,8 @@ def _tag_order(tag):
     lazily: tavern_shared.mods imports mod_install, which imports this."""
     if not isinstance(tag, str):
         return None
-    from tavern_shared.mods.errors import ModManagerError
-    from tavern_shared.mods.version import _parse_version
+    from tavern_shared.mods.base import ModManagerError
+    from tavern_shared.mods.base import _parse_version
     try:
         return _parse_version(tag.strip().lstrip("vV"))
     except ModManagerError:

@@ -14,10 +14,10 @@ from tavern_shared.game_guard import confirm_while_game_running
 from tavern_shared.window_chrome import _enable_dark_titlebar
 
 from tavern_shared.mods.cache import ensure_mod_libraries
-from tavern_shared.mods.errors import ModManagerError
-from tavern_shared.mods.hostcfg import load_cfg
+from tavern_shared.mods.base import ModManagerError
+from tavern_shared.mods.base import load_cfg
 from tavern_shared.mods.install import (
-    _invalidate_verify_memo, disable_mod, disable_untracked_dll, enable_mod,
+    _verify_memo, disable_mod, disable_untracked_dll, enable_mod,
     enable_untracked_dll, installed_targets, list_installed_mods,
     list_untracked_mods, uninstall_mod,
 )
@@ -34,7 +34,7 @@ from tavern_shared.mods.ui.shared import (
     target_label,
 )
 from tavern_shared.mods.ui.version_window import ModVersionWindow
-from tavern_shared.mods.version import _parse_version
+from tavern_shared.mods.base import _parse_version
 
 
 class ModManagerWindow(ModListWindow):
@@ -151,7 +151,7 @@ class ModManagerWindow(ModListWindow):
             # Refresh means "look again, actually": damage checks are memoized
             # per install (see verify_mod_files), and this is the explicit
             # user gesture that says re-hash everything.
-            _invalidate_verify_memo()
+            _verify_memo.clear()
         prev_index = self._index
         def load():
             on_disk = self._read_installed()
