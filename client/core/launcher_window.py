@@ -994,7 +994,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
                 if not ver or have.get(mid) != ver]
 
     def _build_divergence(self, server_mods, installed):
-        """Warnings for a mod at the same version but a different pc build."""
+        """Warnings for a mod at the same version but a different client_windows build."""
         have = {m["id"]: m for m in installed}
         warnings = []
         for m in server_mods:
@@ -1523,7 +1523,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
             self._print(f"Menu launch failed: {e}", "err")
 
 
-CLIENT_TARGET = "pc"
+CLIENT_TARGET = "client_windows"
 
 
 def _enabled_mods(game_dir):
@@ -1534,7 +1534,7 @@ def _enabled_mods(game_dir):
 
 def _tavernessentials_installed(game_dir):
     """An enabled TavernEssentials.dll, loose in Mods/ (as upstream 1.8.5
-    installed it) or in an enabled mod's .pc/, whatever its id."""
+    installed it) or in an enabled mod's .client_windows/, whatever its id."""
     mods_dir = os.path.join(game_dir, "Mods")
     try:
         entries = os.listdir(mods_dir)
