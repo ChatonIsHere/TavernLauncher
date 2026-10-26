@@ -22,6 +22,10 @@ from tavern_shared.mod_install import (
     _melonloader_status, _tavernlib_status,
 )
 
+_ARCH_UNKNOWN = ("Couldn't determine whether the game is 32- or 64-bit from "
+                 "the selected .exe. Try re-browsing to it on the main screen.")
+
+
 class SetupWindow(tk.Toplevel):
     """on_status_change(states) follows every check and on_installed() every
     write, reaching the owner even after this window closes."""
@@ -234,9 +238,7 @@ class SetupWindow(tk.Toplevel):
             return
         arch = _detect_exe_arch(self._exe)
         if not arch:
-            messagebox.showerror("Can't tell architecture",
-                "Couldn't determine whether the game is 32- or 64-bit from "
-                "the selected .exe. Try re-browsing to it on the main screen.", parent=self)
+            messagebox.showerror("Can't tell architecture", _ARCH_UNKNOWN, parent=self)
             return
         game_dir = self._game_dir
         def work(progress):
@@ -280,9 +282,7 @@ class SetupWindow(tk.Toplevel):
             if (shown.get("ml") or _melonloader_status(game_dir)) in AUTO_SETUP_STATES:
                 arch = _detect_exe_arch(exe)
                 if not arch:
-                    raise RuntimeError(
-                        "Couldn't determine whether the game is 32- or 64-bit from "
-                        "the selected .exe. Try re-browsing to it on the main screen.")
+                    raise RuntimeError(_ARCH_UNKNOWN)
                 progress(f"Detected {arch} game — installing MelonLoader…")
                 _install_melonloader(game_dir, arch, progress)
                 changed = True

@@ -17,7 +17,7 @@ from tavern_shared.window_chrome import _enable_dark_titlebar
 from tavern_shared.mods.base import ModManagerError, _parse_version, load_cfg
 from tavern_shared.mods.cache import clear_mod_cache, ensure_mod_libraries
 from tavern_shared.mods.install import (
-    _is_pre_v2, _verify_memo, disable_mod, disable_untracked_dll, enable_mod,
+    _highest_by_id, _is_pre_v2, _verify_memo, disable_mod, disable_untracked_dll, enable_mod,
     enable_untracked_dll, has_target, install_mod_closure, installed_targets,
     list_installed_mods, list_mods, list_untracked_mods, mod_status,
     uninstall_mod,
@@ -627,11 +627,7 @@ class ModManagerWindow(ModListWindow):
 
     def _apply_installed(self, on_disk):
         installed, untracked = on_disk
-        summaries = {}     # id -> its highest-major ModSummary
-        for s in self._index:
-            cur = summaries.get(s.id)
-            if cur is None or _parse_version(s.highest()) > _parse_version(cur.highest()):
-                summaries[s.id] = s
+        summaries = _highest_by_id(self._index)
         rows = {}
         for meta in installed:
             mod_id = meta.get("id")
