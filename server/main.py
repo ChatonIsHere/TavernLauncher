@@ -39,8 +39,7 @@ def _write_error_log(err_text):
         pass
 
 
-# Tell the mod manager which config file it is working against -- the server's
-# own, not the client's. Same placement and reasoning as client/main.py.
+# The mod manager's config, wired before addons load: one may use it.
 from tavern_shared.mods import base as _mods_base
 from server.core.data_store import load_cfg as _load_cfg, save_cfg as _save_cfg
 _mods_base.set_config_accessors(_load_cfg, _save_cfg)

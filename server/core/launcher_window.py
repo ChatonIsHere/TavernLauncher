@@ -85,7 +85,7 @@ class ServerLauncher(LauncherCommon, tk.Tk):
         self._console_win = None
         self._tickets_win = None
         self._served_game_dir = None   # read by the auth service's threads
-        self._starting = False         # between Open Server and the launch
+        self._starting = False
         self._init_launcher_common()
         self._build_ui()
         self._load()
@@ -468,25 +468,19 @@ class ServerLauncher(LauncherCommon, tk.Tk):
         return {"server_scene": self._server_scene}
 
     def _server_scene(self):
-        """The scene this server is set to run, by the names a mod manifest's
-        `scenes` uses. Tutorial wins over quest, as it does for the launch
-        arguments below and in TavernLib."""
+        """Tutorial wins over quest, as in the launch arguments and TavernLib."""
         if self.v_tutorial_scene.get():
             return "tutorial"
         return "quest" if self.v_quest_scene.get() else "normal"
 
     def _warn_mods_outside_scene(self, game_dir):
-        """Names every enabled mod that says it doesn't work in the scene this
-        start is about to run. A warning, not a block: which mods to run is the
-        operator's call, and they may know better than a manifest. A headless
-        server, with nobody to tell, skips such a mod instead."""
+        """A warning, not a block: the operator may know better than a manifest."""
         scene = self._server_scene()
         try:
             installed = mods.list_installed_mods(game_dir)
         except Exception:
             return
         for rec in installed:
-            # A pc build in the same folder is the host's, not the server's.
             if not rec.get("enabled") or not mods.has_target(rec, "server"):
                 continue
             try:
@@ -499,10 +493,8 @@ class ServerLauncher(LauncherCommon, tk.Tk):
                             f"not the {scene} scene this server is starting in.", "warn")
 
     def _mods_written(self):
-        """The handshake (this launcher's auth service and TavernLib's join
-        check) reads Mods/ live, but the running session loaded its mods at
-        startup, so joining clients get matched against a set it isn't
-        running. Nothing here can restart the game safely, so it says so."""
+        """The handshake reads Mods/ live, but a running session loaded its
+        mods at startup, and nothing here can restart it safely."""
         invalidate_mods_snapshot()
         if game_is_running(self._proc):
             self._print("Mods changed while the server is running: the changes "
@@ -563,7 +555,7 @@ class ServerLauncher(LauncherCommon, tk.Tk):
 
             # Still locked with our own tailer paused -- the game itself
             # has it open, which only happens if the server's running.
-            server_running = game_is_running(self._proc)
+            server_running = self._proc is not None and self._proc.poll() is None
             if not server_running:
                 self._print(f"Couldn't archive log: {result}", "err")
                 return
@@ -630,10 +622,8 @@ class ServerLauncher(LauncherCommon, tk.Tk):
             messagebox.showerror("Not found",
                 "Could not find the game.\nPlease browse first.", parent=self)
             return
-        # The archive below runs on a worker thread for up to a couple of
-        # seconds before the server is actually launched, so Start has to go
-        # grey now - not when _set_running fires - or a second click in that
-        # window launches a second server.
+        # Greyed now, not by _set_running: the archive below takes a moment,
+        # and a second click meanwhile would launch a second server.
         if self._starting:
             return
         self._starting = True
@@ -652,9 +642,7 @@ class ServerLauncher(LauncherCommon, tk.Tk):
             self._start_after_archive(exe)
         finally:
             self._starting = False
-            # A launch that failed never reached _set_running(True), which
-            # is what would otherwise own the button from here.
-            if not game_is_running(self._proc):
+            if not game_is_running(self._proc):    # a failed launch
                 self._btn_start.config(state="normal")
 
     def _start_after_archive(self, exe):
@@ -707,7 +695,7 @@ class ServerLauncher(LauncherCommon, tk.Tk):
 
     def _watch(self):
         time.sleep(8)
-        if game_is_running(self._proc):
+        if self._proc and self._proc.poll() is None:
             self._print("Server ready. Players may connect.", "ok")
         else:
             self._print("Server exited unexpectedly.", "err")
@@ -756,7 +744,7 @@ class ServerLauncher(LauncherCommon, tk.Tk):
 
     def _do_auto_reboot(self):
         self._reboot_after_id = None
-        if game_is_running(self._proc):
+        if self._proc and self._proc.poll() is None:
             self._print("Auto-reboot triggered.", "warn")
             self._stop(reboot=True)
         else:
@@ -825,7 +813,7 @@ class ServerLauncher(LauncherCommon, tk.Tk):
         self.after(0, _do)
 
     def _on_close(self):
-        if game_is_running(self._proc):
+        if self._proc and self._proc.poll() is None:
             if messagebox.askyesno("Server running",
                                    "Stop the server before closing?", parent=self):
                 self._stop()

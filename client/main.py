@@ -45,9 +45,7 @@ def _write_error_log(err_text):
         pass
 
 
-# Tell the mod manager which config file it is working against. Done before
-# addons load, since an enabled addon may reach for mod state as it registers,
-# and certainly before any window is built.
+# The mod manager's config, wired before addons load: one may use it.
 from tavern_shared.mods import base as _mods_base
 from client.core.config import load_cfg as _load_cfg, save_cfg as _save_cfg
 _mods_base.set_config_accessors(_load_cfg, _save_cfg)

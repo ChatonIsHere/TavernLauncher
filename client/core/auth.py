@@ -83,10 +83,7 @@ def ticket_request(host, action, username, token, timeout=10, **kwargs):
 
 
 def ping_server(host, timeout=5):
-    """Returns (info_dict, latency_ms) or raises. info_dict carries mods_hash/
-    mods_count alongside the existing fields when the server supports it. An
-    older server without them just omits those keys, so callers must use
-    .get(), not [] indexing, for either."""
+    """Returns (info_dict, latency_ms) or raises."""
     t0 = time.time()
     s  = socket.socket()
     s.settimeout(timeout)
@@ -98,16 +95,11 @@ def ping_server(host, timeout=5):
     return json.loads(raw.decode()), ms
 
 
-# Hard ceiling on a framed response body.
 _MAX_FRAMED_BYTES = 8 * 1024 * 1024
 
 
 def _recv_framed(s, timeout):
-    """Reads one length-prefixed message: a 4-byte big-endian byte count, then
-    exactly that many bytes, looping recv() since a single call can return a
-    partial read no matter the buffer size. Raises on a short/closed stream, or
-    on a declared length past _MAX_FRAMED_BYTES (rejected from the header alone,
-    before a single body byte is read or buffered)."""
+    """One message of a 4-byte big-endian length, then the body."""
     s.settimeout(timeout)
     header = b""
     while len(header) < 4:
@@ -130,11 +122,8 @@ def _recv_framed(s, timeout):
 
 
 def _server_mod_entry(entry):
-    """One mods_list entry, checked for the manifest-v2 shape: a non-empty
-    string id and a `targets` list of strings (unknown names kept, for the
-    planner to ignore). A missing or malformed target_sha256 is advisory, so
-    it becomes {}. Raises otherwise: an entry without targets comes from a
-    server on the older format, and guessing would skip mods it requires."""
+    """Raises unless the entry has the v2 shape: guessing a v1 server's
+    targets would skip mods it requires. target_sha256 is advisory."""
     if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not entry["id"]:
         raise Exception("The server's mod list has an entry without an id.")
     targets = entry.get("targets")
@@ -149,27 +138,8 @@ def _server_mod_entry(entry):
 
 
 def fetch_server_mods(host, timeout=10):
-    """Fetches the server's full mod list. Returns (mods, untracked):
-    - mods: every mod the server runs (enabled, installed for `server`) as
-      {"id", "version", "parity_required", "source_repo", "targets",
-      "target_sha256"} (plus "scenes" when set) -- the same fields
-      handshake_snapshot builds and TavernLib's ModHandshake.Entry
-      serialises, so both kinds of server answer this identically, each
-      checked by _server_mod_entry. This is what plan_join resolves
-      against. parity_required decides whether a client must match a mod or
-      may decline it, and source_repo is a hint only (never resolved into a
-      pull on its own); omitting either from a caller's expectations turns a
-      "recommended" mod into a hard join failure.
-    - untracked: every enabled mod the server runs that its own manager didn't
-      install, as {"name", "kind"}. Advisory only - there's no id or version to
-      resolve, so it's shown and never acted on, and a server that doesn't send
-      the key (an older TavernLib/launcher) simply yields [].
-
-    Only called on a mods_hash cache miss (or right before a join); the
-    ordinary ping/pong stays a single small recv, this is the one request that
-    needs proper length-prefixed framing since a large mod list can genuinely
-    exceed one recv's buffer. Raises on any connection/parse failure or a
-    server that doesn't understand the request (older TavernLib/launcher)."""
+    """(mods, untracked) from a server's mods_list reply, as
+    handshake_snapshot and TavernLib's ModHandshake build it."""
     s = socket.socket()
     s.settimeout(timeout)
     try:
@@ -177,8 +147,6 @@ def fetch_server_mods(host, timeout=10):
         s.sendall(json.dumps({"mods_list": True}).encode())
         body = _recv_framed(s, timeout)
     finally:
-        # Closed on every path: this runs against an unreachable or misbehaving
-        # host often enough that leaking the socket on the error path matters.
         try: s.close()
         except OSError: pass
     resp = json.loads(body.decode())
@@ -237,10 +205,9 @@ def build_tokens(user_id, username, tavern_token="", mods_claim=""):
     against the server's own records closes that gap regardless of what
     else the presented JWT claims to be.
 
-    mods_claim is the "TavernMods" claim: a JSON {mod_id: version} of every
-    enabled community mod, for TavernLib's exact-version parity check, or ""
-    for none. Both claims also go on the identity token, the only one the
-    game sends a server (RequestJoinMessage.UserCredentials)."""
+    mods_claim ("TavernMods", JSON {id: version}) is for TavernLib's parity
+    check; like TavernToken it rides the identity token, the one the game
+    sends a server."""
     exp, uid = 9999999999, str(user_id)
     a = _jwt({"UserId":uid,"Username":username,"role":"Access","is_verified":"True",
               "is_member":"True","Policy":["offline","play_offline","server_access_pre_alpha",
