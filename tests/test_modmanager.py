@@ -60,7 +60,7 @@ def default_url(mod_id, version):
 _ARTIFACT_FIELDS = ("download_url", "sha256", "package", "library_dependencies")
 
 
-def manifest_dict(mod_id, version, targets=("pc", "server"), **over):
+def manifest_dict(mod_id, version, targets=("client_windows", "server"), **over):
     """A v2 manifest with one dll artifact for `targets`; download_url,
     sha256, package and library_dependencies overrides land on it."""
     author, repo = (mod_id.split(".", 1) + ["repo"])[:2]
@@ -93,7 +93,7 @@ def make_manifest(mod_id, version, base=DEFAULT, **over):
     return mm._manifest_from_dict(manifest_dict(mod_id, version, **over), base)
 
 
-def summary(mod_id, versions, targets=("pc", "server"), source=DEFAULT, name=None,
+def summary(mod_id, versions, targets=("client_windows", "server"), source=DEFAULT, name=None,
             description=""):
     return mm.ModSummary(
         id=mod_id, name=name or mod_id.split(".", 1)[-1],
@@ -101,7 +101,7 @@ def summary(mod_id, versions, targets=("pc", "server"), source=DEFAULT, name=Non
         targets=sorted(targets), versions=list(versions), source_repo=source)
 
 
-def slim_entry(versions, name="M", author="a", description="", targets=("pc", "server"),
+def slim_entry(versions, name="M", author="a", description="", targets=("client_windows", "server"),
                parity_required=True):
     return {"name": name, "author": author, "description": description,
             "parity_required": parity_required, "targets": sorted(targets),
@@ -112,7 +112,7 @@ def slim_index(mods):
     return {"index_version": 2, "mods": mods}
 
 
-def _srv(mod_id, version, targets=("pc", "server"), required=None, source_repo=None):
+def _srv(mod_id, version, targets=("client_windows", "server"), required=None, source_repo=None):
     """One handshake mods-list entry, as plan_join receives it. parity_required
     is always stated; its absence is its own contract (a raise)."""
     entry = {"id": mod_id, "version": version,
@@ -382,7 +382,7 @@ class Resolution(unittest.TestCase):
         index = [summary("dep.k", ["1.1.0", "1.4.0"]), summary("dep.k", ["2.1.0"])]
         fetch = store(make_manifest("dep.k", "1.4.0"))
         root = make_manifest("root.m", "1.0.0", dependencies={"dep.k": "1.2.0"})
-        got = resolve_deps(self, [root], index, fetch, target="pc")
+        got = resolve_deps(self, [root], index, fetch, target="client_windows")
         self.assertEqual([m.version for m in got], ["1.4.0"])   # not 2.1.0, not 1.1.0
 
     def test_diamond_conflict_raises(self):
@@ -392,7 +392,7 @@ class Resolution(unittest.TestCase):
         a = make_manifest("a.a", "1.0.0", dependencies={"dep.k": "1.0.0"})
         b = make_manifest("b.b", "1.0.0", dependencies={"dep.k": "2.0.0"})
         with self.assertRaises(mm.ModManagerError):
-            resolve_deps(self, [a, b], index, fetch, target="pc")
+            resolve_deps(self, [a, b], index, fetch, target="client_windows")
 
     def test_cycle_raises(self):
         index = [summary("a.a", ["1.0.0"]), summary("b.b", ["1.0.0"])]
@@ -400,7 +400,7 @@ class Resolution(unittest.TestCase):
         b = make_manifest("b.b", "1.0.0", dependencies={"a.a": "1.0.0"})
         fetch = store(a, b)
         with self.assertRaises(mm.ModManagerError):
-            resolve_deps(self, [a], index, fetch, target="pc")
+            resolve_deps(self, [a], index, fetch, target="client_windows")
 
     def test_a_root_that_is_also_a_dependency_is_not_refetched(self):
         a = make_manifest("a.a", "1.0.0")
@@ -411,7 +411,7 @@ class Resolution(unittest.TestCase):
             fetched.append(mid)
             raise AssertionError("roots are already in hand")
         self.assertEqual(resolve_deps(self,
-            [a, b], [summary("a.a", ["1.0.0"])], fetch, target="pc"), [])
+            [a, b], [summary("a.a", ["1.0.0"])], fetch, target="client_windows"), [])
         self.assertEqual(fetched, [])
 
     def test_a_chain_deeper_than_the_cap_raises(self):
@@ -424,17 +424,17 @@ class Resolution(unittest.TestCase):
 
         mods, index = chain(mm.MAX_DEPENDENCY_DEPTH - 1)
         self.assertEqual(len(resolve_deps(self,
-            mods[:1], index, store(*mods), target="pc")), len(mods) - 1)
+            mods[:1], index, store(*mods), target="client_windows")), len(mods) - 1)
         mods, index = chain(mm.MAX_DEPENDENCY_DEPTH)
         with self.assertRaises(mm.ModManagerError) as caught:
-            resolve_deps(self, mods[:1], index, store(*mods), target="pc")
+            resolve_deps(self, mods[:1], index, store(*mods), target="client_windows")
         self.assertIn("too deep", str(caught.exception))
         self.assertIn(" -> ".join(m.id for m in mods), str(caught.exception))
 
     def test_missing_dependency_raises(self):
         root = make_manifest("root.m", "1.0.0", dependencies={"nope.x": "1.0.0"})
         with self.assertRaises(mm.ModManagerError):
-            resolve_deps(self, [root], [], store(), target="pc")
+            resolve_deps(self, [root], [], store(), target="client_windows")
 
 
 class TargetFilteredResolution(unittest.TestCase):
@@ -443,8 +443,8 @@ class TargetFilteredResolution(unittest.TestCase):
 
     # A pc+server root whose dependency has only a pc build.
     def _dual_root_with_client_only_dep(self):
-        index = [summary("ui.kit", ["1.0.0"], targets=("pc",))]
-        dep = make_manifest("ui.kit", "1.0.0", targets=("pc",))
+        index = [summary("ui.kit", ["1.0.0"], targets=("client_windows",))]
+        dep = make_manifest("ui.kit", "1.0.0", targets=("client_windows",))
         root = make_manifest("dual.m", "1.0.0", dependencies={"ui.kit": "1.0.0"})
         return index, dep, root
 
@@ -457,7 +457,7 @@ class TargetFilteredResolution(unittest.TestCase):
         # Identical inputs to the test above; only the side differs. The pair is
         # the point: one input, two correct answers.
         index, dep, root = self._dual_root_with_client_only_dep()
-        got = resolve_deps(self, [root], index, store(dep), target="pc")
+        got = resolve_deps(self, [root], index, store(dep), target="client_windows")
         self.assertEqual([m.id for m in got], ["ui.kit"])
 
     def test_server_only_dependency_pruned_on_client(self):
@@ -465,7 +465,7 @@ class TargetFilteredResolution(unittest.TestCase):
         dep = make_manifest("db.tools", "1.0.0", targets=("server",))
         root = make_manifest("dual.m", "1.0.0", dependencies={"db.tools": "1.0.0"})
         self.assertEqual(resolve_deps(self, [root], index, store(dep),
-                                                  target="pc"), [])
+                                                  target="client_windows"), [])
         self.assertEqual([m.id for m in resolve_deps(self,
             [root], index, store(dep), target="server")], ["db.tools"])
 
@@ -473,14 +473,14 @@ class TargetFilteredResolution(unittest.TestCase):
         index = [summary("shared.d", ["1.0.0"])]
         dep = make_manifest("shared.d", "1.0.0")
         root = make_manifest("root.m", "1.0.0", dependencies={"shared.d": "1.0.0"})
-        for target in ("pc", "server"):
+        for target in ("client_windows", "server"):
             got = resolve_deps(self, [root], index, store(dep), target=target)
             self.assertEqual([m.id for m in got], ["shared.d"], target)
 
     def test_subtree_under_pruned_dependency_is_never_walked(self):
-        index = [summary("ui.kit", ["1.0.0"], targets=("pc",)),
+        index = [summary("ui.kit", ["1.0.0"], targets=("client_windows",)),
                  summary("deep.d", ["1.0.0"])]
-        dep = make_manifest("ui.kit", "1.0.0", targets=("pc",),
+        dep = make_manifest("ui.kit", "1.0.0", targets=("client_windows",),
                             dependencies={"deep.d": "1.0.0"})
         deep = make_manifest("deep.d", "1.0.0")
         root = make_manifest("dual.m", "1.0.0", dependencies={"ui.kit": "1.0.0"})
@@ -493,9 +493,9 @@ class TargetFilteredResolution(unittest.TestCase):
     def test_dependency_also_reachable_by_a_valid_path_still_arrives(self):
         """Pruning ui.kit must not take shared.d with it when something else
         needs shared.d in its own right. Pruning is 'drop what only IT needed'."""
-        index = [summary("ui.kit", ["1.0.0"], targets=("pc",)),
+        index = [summary("ui.kit", ["1.0.0"], targets=("client_windows",)),
                  summary("shared.d", ["1.0.0"])]
-        ui = make_manifest("ui.kit", "1.0.0", targets=("pc",),
+        ui = make_manifest("ui.kit", "1.0.0", targets=("client_windows",),
                            dependencies={"shared.d": "1.0.0"})
         shared = make_manifest("shared.d", "1.0.0")
         # a is visited first, so shared.d is first reached THROUGH the pruned dep.
@@ -508,20 +508,20 @@ class TargetFilteredResolution(unittest.TestCase):
         """A mod we aren't installing must not be able to fail the whole resolve
         over a version disagreement about itself - the reason its constraints are
         recorded only after the side check passes."""
-        index = [summary("ui.kit", ["1.0.0"], targets=("pc",)),
-                 summary("ui.kit", ["2.0.0"], targets=("pc",))]
-        ui1 = make_manifest("ui.kit", "1.0.0", targets=("pc",))
+        index = [summary("ui.kit", ["1.0.0"], targets=("client_windows",)),
+                 summary("ui.kit", ["2.0.0"], targets=("client_windows",))]
+        ui1 = make_manifest("ui.kit", "1.0.0", targets=("client_windows",))
         a = make_manifest("a.a", "1.0.0", dependencies={"ui.kit": "1.0.0"})
         b = make_manifest("b.b", "1.0.0", dependencies={"ui.kit": "2.0.0"})
         self.assertEqual(resolve_deps(self, [a, b], index, store(ui1),
                                                   target="server"), [])
         # The same disagreement is still a hard error on the side that installs it.
         with self.assertRaises(mm.ModManagerError):
-            resolve_deps(self, [a, b], index, store(ui1), target="pc")
+            resolve_deps(self, [a, b], index, store(ui1), target="client_windows")
 
     def test_wrong_target_dependency_fetched_only_once(self):
-        index = [summary("ui.kit", ["1.0.0"], targets=("pc",))]
-        ui = make_manifest("ui.kit", "1.0.0", targets=("pc",))
+        index = [summary("ui.kit", ["1.0.0"], targets=("client_windows",))]
+        ui = make_manifest("ui.kit", "1.0.0", targets=("client_windows",))
         a = make_manifest("a.a", "1.0.0", dependencies={"ui.kit": "1.0.0"})
         b = make_manifest("b.b", "1.0.0", dependencies={"ui.kit": "1.0.0"})
         fetched = []
@@ -539,8 +539,8 @@ class TargetFilteredResolution(unittest.TestCase):
         self.assertIn("server", msg)
 
     def test_second_requirer_of_a_pruned_dependency_also_reported(self):
-        index = [summary("ui.kit", ["1.0.0"], targets=("pc",))]
-        ui = make_manifest("ui.kit", "1.0.0", targets=("pc",))
+        index = [summary("ui.kit", ["1.0.0"], targets=("client_windows",))]
+        ui = make_manifest("ui.kit", "1.0.0", targets=("client_windows",))
         a = make_manifest("a.a", "1.0.0", dependencies={"ui.kit": "1.0.0"})
         b = make_manifest("b.b", "1.0.0", dependencies={"ui.kit": "1.0.0"})
         err = io.StringIO()
@@ -553,7 +553,7 @@ class TargetFilteredResolution(unittest.TestCase):
         """Only dependencies are filtered: a root is what the caller asked for."""
         index = [summary("shared.d", ["1.0.0"])]
         dep = make_manifest("shared.d", "1.0.0")
-        root = make_manifest("client.only", "1.0.0", targets=("pc",),
+        root = make_manifest("client.only", "1.0.0", targets=("client_windows",),
                              dependencies={"shared.d": "1.0.0"})
         got = resolve_deps(self, [root], index, store(dep), target="server")
         self.assertEqual([m.id for m in got], ["shared.d"])
@@ -567,23 +567,23 @@ class Libraries(unittest.TestCase):
     def test_same_library_dedupes(self):
         a = make_manifest("a.a", "1.0.0", library_dependencies=[self._lib("a" * 64)])
         b = make_manifest("b.b", "1.0.0", library_dependencies=[self._lib("a" * 64)])
-        self.assertEqual(len(mm.collect_library_dependencies([a, b], "pc")), 1)
+        self.assertEqual(len(mm.collect_library_dependencies([a, b], "client_windows")), 1)
 
     def test_conflicting_library_raises(self):
         a = make_manifest("a.a", "1.0.0", library_dependencies=[self._lib("a" * 64)])
         b = make_manifest("b.b", "1.0.0", library_dependencies=[self._lib("b" * 64)])
         with self.assertRaises(mm.ModManagerError):
-            mm.collect_library_dependencies([a, b], "pc")
+            mm.collect_library_dependencies([a, b], "client_windows")
 
 
 class Listing(unittest.TestCase):
     def test_target_filter_and_collapse(self):
         index = [
-            summary("a.a", ["1.0.0"], targets=("pc",)),
-            summary("a.a", ["1.2.0"], targets=("pc",)),   # separate major-1 entry, higher
+            summary("a.a", ["1.0.0"], targets=("client_windows",)),
+            summary("a.a", ["1.2.0"], targets=("client_windows",)),   # separate major-1 entry, higher
             summary("b.b", ["1.0.0"], targets=("server",)),
         ]
-        client = mm.list_mods(index, "pc")
+        client = mm.list_mods(index, "client_windows")
         self.assertEqual([(s.id, s.highest()) for s in client], [("a.a", "1.2.0")])
         server = mm.list_mods(index, "server")
         self.assertEqual([s.id for s in server], ["b.b"])
@@ -593,7 +593,7 @@ class _FakeInstallFixture:
     """Real installs against fake download/hash helpers, mixed in beside
     unittest.TestCase. Installs are for TARGET unless a test says otherwise."""
     BASE = DEFAULT
-    TARGET = "pc"
+    TARGET = "client_windows"
 
     def setUp(self):
         self.game = temp_dir(self, "tavern_game_")
@@ -671,7 +671,7 @@ class _FakeInstallFixture:
 
     def _restore(self, mod_id, version):
         mm.cache_restore_mod(self.game, mod_id, version,
-                             self._sha_for(default_url(mod_id, version)), "pc")
+                             self._sha_for(default_url(mod_id, version)), "client_windows")
 
 
 class _TempDataDirFixture(_FakeInstallFixture):
@@ -694,11 +694,11 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
 
         index = [summary("dep.k", ["1.0.0"]), summary("root.m", ["1.0.0"])]
         root_summary = summary("root.m", ["1.0.0"])
-        mm.install_mod_closure(self.game, root_summary, index, [self.BASE], self.progress.append, target="pc")
+        mm.install_mod_closure(self.game, root_summary, index, [self.BASE], self.progress.append, target="client_windows")
 
         # Each mod lands in its own folder, Mods/<id>/, with the dll inside.
-        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "root.m", ".pc", "root.m.dll")))
-        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "dep.k", ".pc", "dep.k.dll")))
+        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "root.m", ".client_windows", "root.m.dll")))
+        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "dep.k", ".client_windows", "dep.k.dll")))
         self.assertTrue(os.path.isfile(os.path.join(self.game, "UserLibs", "ExampleLib.dll")))
 
         # Mods/<id>/manifest.json is also MelonLoader's folder marker.
@@ -707,11 +707,11 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
         self.assertEqual(mod_meta["artifacts"][0]["package"], "dll")
         self.assertNotIn("filename", mod_meta)
         self.assertIn("source_repo", mod_meta)
-        self.assertEqual(list(mod_meta["installed"]), ["pc"])
-        self.assertEqual(mod_meta["installed"]["pc"]["libraries"], ["ExampleLib.dll"])
+        self.assertEqual(list(mod_meta["installed"]), ["client_windows"])
+        self.assertEqual(mod_meta["installed"]["client_windows"]["libraries"], ["ExampleLib.dll"])
         # Nothing but the record and the target folder in Mods/<id>/.
         self.assertEqual(sorted(os.listdir(os.path.join(self.game, "Mods", "root.m"))),
-                         [".pc", "manifest.json"])
+                         [".client_windows", "manifest.json"])
         # No flat sidecar beside a bare dll.
         self.assertFalse(os.path.exists(os.path.join(self.game, "Mods", "root.m.meta.json")))
         self.assertFalse(os.path.exists(os.path.join(self.game, "Mods", "root.m.dll")))
@@ -727,7 +727,7 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
         self._publish("v.v", "2.0.0")
         index = [summary("v.v", ["1.0.0", "2.0.0"])]
         mm.install_mod_closure(self.game, summary("v.v", ["1.0.0", "2.0.0"]), index,
-                               [self.BASE], self.progress.append, version="1.0.0", target="pc")
+                               [self.BASE], self.progress.append, version="1.0.0", target="client_windows")
         mod_meta = read_json(os.path.join(self.game, "Mods", "v.v", "manifest.json"))
         self.assertEqual(mod_meta["version"], "1.0.0")
 
@@ -742,8 +742,8 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
 
     def test_status_current_then_outdated(self):
         self._install("s.s", "1.0.0")
-        self.assertEqual(mm.mod_status(self.game, "s.s", [summary("s.s", ["1.0.0"])], "pc"), "current")
-        self.assertEqual(mm.mod_status(self.game, "s.s", [summary("s.s", ["1.0.0", "1.1.0"])], "pc"), "outdated")
+        self.assertEqual(mm.mod_status(self.game, "s.s", [summary("s.s", ["1.0.0"])], "client_windows"), "current")
+        self.assertEqual(mm.mod_status(self.game, "s.s", [summary("s.s", ["1.0.0", "1.1.0"])], "client_windows"), "outdated")
 
     def test_status_agrees_with_the_listings_about_a_legacy_record(self):
         """A record without parity_required isn't ours to the listings, so
@@ -756,7 +756,7 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
         with open(record, "w", encoding="utf-8") as f:
             json.dump(rec, f)
 
-        self.assertEqual(mm.mod_status(self.game, "legacy.m", [summary("legacy.m", ["1.0.0"])], "pc"),
+        self.assertEqual(mm.mod_status(self.game, "legacy.m", [summary("legacy.m", ["1.0.0"])], "client_windows"),
                          "missing")
         self.assertEqual([m["id"] for m in mm.list_installed_mods(self.game)], [])
         self.assertEqual([u["name"] for u in mm.list_untracked_mods(self.game)], ["legacy.m"])
@@ -767,7 +767,7 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
 
         self.assertTrue(mm.uninstall_mod(self.game, "u.m"))
         self.assertFalse(os.path.exists(os.path.join(self.game, "Mods", "u.m")))
-        self.assertEqual(mm.mod_status(self.game, "u.m", [], "pc"), "missing")
+        self.assertEqual(mm.mod_status(self.game, "u.m", [], "client_windows"), "missing")
         # No mod needs the library anymore, so it and its sidecar are gone too.
         self.assertFalse(os.path.exists(os.path.join(self.game, "UserLibs", "OrphanLib.dll")))
         self.assertFalse(os.path.exists(os.path.join(self.game, "UserLibs", "OrphanLib.dll.meta.json")))
@@ -801,7 +801,7 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
         self.assertTrue(os.path.isfile(disabled))
         self.assertTrue(os.path.isdir(folder))
         # Still installed and version-comparable while disabled.
-        self.assertEqual(mm.mod_status(self.game, "d.m", [summary("d.m", ["1.0.0"])], "pc"), "current")
+        self.assertEqual(mm.mod_status(self.game, "d.m", [summary("d.m", ["1.0.0"])], "client_windows"), "current")
         rec = next(r for r in mm.list_installed_mods(self.game) if r["id"] == "d.m")
         self.assertIs(rec["enabled"], False)
 
@@ -853,21 +853,21 @@ class InstallModSet(_FakeInstallFixture, unittest.TestCase):
     def test_an_intact_enabled_mod_and_library_are_not_refetched(self):
         self._install("set.m", library_dependencies=[dict(self.LIB)])
         downloads = len(self.dl_dirs)
-        self.assertEqual(mm.install_mod_set(self.game, self._set("set.m"), "pc", noop), [])
+        self.assertEqual(mm.install_mod_set(self.game, self._set("set.m"), "client_windows", noop), [])
         self.assertEqual(len(self.dl_dirs), downloads)
 
     def test_a_damaged_mod_is_reinstalled(self):
         self._install("dmg.m")
-        with open(os.path.join(self.game, "Mods", "dmg.m", ".pc", "dmg.m.dll"), "wb") as f:
+        with open(os.path.join(self.game, "Mods", "dmg.m", ".client_windows", "dmg.m.dll"), "wb") as f:
             f.write(b"junk")
         mm._verify_memo.clear()
-        self.assertEqual(mm.install_mod_set(self.game, self._set("dmg.m"), "pc", noop), ["dmg.m"])
-        self.assertIs(mm.verify_mod_files(self.game, "dmg.m", "pc"), True)
+        self.assertEqual(mm.install_mod_set(self.game, self._set("dmg.m"), "client_windows", noop), ["dmg.m"])
+        self.assertIs(mm.verify_mod_files(self.game, "dmg.m", "client_windows"), True)
 
     def test_a_disabled_mod_is_reinstalled_enabled(self):
         self._install("off.m")
         mm.disable_mod(self.game, "off.m")
-        self.assertEqual(mm.install_mod_set(self.game, self._set("off.m"), "pc", noop), ["off.m"])
+        self.assertEqual(mm.install_mod_set(self.game, self._set("off.m"), "client_windows", noop), ["off.m"])
         self.assertTrue(os.path.isfile(mm._mod_record_path(self.game, "off.m")))
 
     def test_a_tampered_library_is_reinstalled(self):
@@ -876,7 +876,7 @@ class InstallModSet(_FakeInstallFixture, unittest.TestCase):
         with open(lib_path, "wb") as f:
             f.write(b"junk")
         downloads = len(self.dl_dirs)
-        mm.install_mod_set(self.game, self._set("lib.m"), "pc", noop)
+        mm.install_mod_set(self.game, self._set("lib.m"), "client_windows", noop)
         self.assertEqual(len(self.dl_dirs), downloads + 1)
         with open(lib_path, "rb") as f:
             self.assertEqual(f.read(), b"BYTES:https://x/SetLib.dll")
@@ -885,7 +885,7 @@ class InstallModSet(_FakeInstallFixture, unittest.TestCase):
         self._publish("a.m", "1.0.0", library_dependencies=[dict(self.LIB)])
         self._publish("b.m", "1.0.0")
         lines = []
-        mm.install_mod_set(self.game, self._set("a.m", "b.m"), "pc", lines.append)
+        mm.install_mod_set(self.game, self._set("a.m", "b.m"), "client_windows", lines.append)
         self.assertEqual(sorted({l.split("]")[0] + "]" for l in lines}),
                          ["[1/3]", "[2/3]", "[3/3]"])
 
@@ -1020,8 +1020,8 @@ class HandshakeSnapshot(_FakeInstallFixture, unittest.TestCase):
         self.assertEqual(count, 2)
         self.assertEqual([e["id"] for e in entries], ["a.a", "z.z"])
         self.assertEqual(entries[0]["version"], "2.1.0")
-        self.assertEqual(entries[0]["targets"], ["pc", "server"])
-        self.assertEqual(set(entries[0]["target_sha256"]), {"pc", "server"})
+        self.assertEqual(entries[0]["targets"], ["client_windows", "server"])
+        self.assertEqual(set(entries[0]["target_sha256"]), {"client_windows", "server"})
 
         expected = hashlib.sha256(b"a.a@2.1.0@req\nz.z@1.0.0@req").hexdigest()
         self.assertEqual(mods_hash, expected)
@@ -1182,7 +1182,7 @@ class DisplacedFolders(_TempDataDirFixture, unittest.TestCase):
         """The likelier of the two paths to meet a foreign folder: it runs on
         every join that switches a mod's version, not just on a fresh install."""
         self._install("p.p")
-        mm.cache_store_mod(self.game, "p.p", "pc")
+        mm.cache_store_mod(self.game, "p.p", "client_windows")
         shutil.rmtree(os.path.join(self.game, "Mods", "p.p"))
         self._foreign("p.p", marker="theirs, mid-join")
 
@@ -1199,14 +1199,14 @@ class ClientModCache(_TempDataDirFixture, unittest.TestCase):
 
     def test_store_then_restore_round_trip(self):
         self._install("c.m", "1.0.0")
-        self.assertTrue(mm.cache_store_mod(self.game, "c.m", "pc"))
+        self.assertTrue(mm.cache_store_mod(self.game, "c.m", "client_windows"))
         self.assertTrue(os.path.isdir(self._cache_entry("c.m", "1.0.0")))
 
         mm.uninstall_mod(self.game, "c.m")
         self.assertFalse(os.path.exists(os.path.join(self.game, "Mods", "c.m")))
 
         self._restore("c.m", "1.0.0")
-        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "c.m", ".pc", "c.m.dll")))
+        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "c.m", ".client_windows", "c.m.dll")))
         restored = read_json(os.path.join(self.game, "Mods", "c.m", "manifest.json"))
         self.assertEqual(restored["version"], "1.0.0")
 
@@ -1216,24 +1216,24 @@ class ClientModCache(_TempDataDirFixture, unittest.TestCase):
 
     def test_store_is_idempotent(self):
         self._install("i.m", "1.0.0")
-        self.assertTrue(mm.cache_store_mod(self.game, "i.m", "pc"))
+        self.assertTrue(mm.cache_store_mod(self.game, "i.m", "client_windows"))
         # A second call with the cached copy already present is a no-op, not
         # an error (shutil.copytree onto an existing dir would raise).
-        self.assertFalse(mm.cache_store_mod(self.game, "i.m", "pc"))
+        self.assertFalse(mm.cache_store_mod(self.game, "i.m", "client_windows"))
 
     def test_disabled_mod_still_caches_its_build(self):
         self._install("dis.m", "1.0.0")
         mm.disable_mod(self.game, "dis.m")
-        self.assertTrue(mm.cache_store_mod(self.game, "dis.m", "pc"))
+        self.assertTrue(mm.cache_store_mod(self.game, "dis.m", "client_windows"))
         cached = self._cache_entry("dis.m", "1.0.0")
         self.assertEqual(sorted(os.listdir(cached)), ["record.json", "tree"])
         self.assertEqual(os.listdir(os.path.join(cached, "tree")), ["dis.m.dll"])
 
     def test_multiple_versions_coexist_in_cache(self):
         self._install("mv.m", "1.0.0")
-        mm.cache_store_mod(self.game, "mv.m", "pc")
+        mm.cache_store_mod(self.game, "mv.m", "client_windows")
         self._install("mv.m", "2.0.0")
-        mm.cache_store_mod(self.game, "mv.m", "pc")
+        mm.cache_store_mod(self.game, "mv.m", "client_windows")
         self.assertTrue(os.path.isdir(self._cache_entry("mv.m", "1.0.0")))
         self.assertTrue(os.path.isdir(self._cache_entry("mv.m", "2.0.0")))
 
@@ -1267,14 +1267,14 @@ class ClientModCache(_TempDataDirFixture, unittest.TestCase):
         self._install("ad.m", "1.0.0", library_dependencies=[dict(lib)])
         self._install("ad2.m", "1.0.0")
 
-        adopted = mm.adopt_installed_mods(self.game, "pc")
+        adopted = mm.adopt_installed_mods(self.game, "client_windows")
         self.assertEqual(sorted(adopted), ["ad.m", "ad2.m"])
         self.assertTrue(os.path.isdir(self._cache_entry("ad.m", "1.0.0")))
         self.assertTrue(os.path.isdir(self._cache_entry("ad2.m", "1.0.0")))
         self.assertTrue(os.path.isdir(mm._cache_library_dir("Adopted.dll", self._lib_sha("Adopted"))))
 
         # Re-running adopts nothing new - both mods are already cached.
-        self.assertEqual(mm.adopt_installed_mods(self.game, "pc"), [])
+        self.assertEqual(mm.adopt_installed_mods(self.game, "client_windows"), [])
 
 
 class PlanJoin(_TempDataDirFixture, unittest.TestCase):
@@ -1440,7 +1440,7 @@ class PlanJoin(_TempDataDirFixture, unittest.TestCase):
 
     def test_cached_true_when_version_cached_but_not_currently_active(self):
         self._install("cch.m", "1.0.0")
-        mm.cache_store_mod(self.game, "cch.m", "pc")
+        mm.cache_store_mod(self.game, "cch.m", "client_windows")
         mm.uninstall_mod(self.game, "cch.m")
         server_mods = [_srv("cch.m", "1.0.0")]
         index = [summary("cch.m", ["1.0.0"])]
@@ -1517,7 +1517,7 @@ class ModDiff(_TempDataDirFixture, unittest.TestCase):
 
     def test_cached_version_activates_rather_than_downloads(self):
         self._install("d.cch", "1.0.0")
-        mm.cache_store_mod(self.game, "d.cch", "pc")
+        mm.cache_store_mod(self.game, "d.cch", "client_windows")
         mm.uninstall_mod(self.game, "d.cch")
         rows, _ = self._diff([_srv("d.cch", "1.0.0")], [summary("d.cch", ["1.0.0"])])
         row = rows["d.cch"]
@@ -1626,12 +1626,12 @@ class RenderActiveSet(_TempDataDirFixture, unittest.TestCase):
         plan = self._plan(server_mods, index)
 
         mm.render_active_set(self.game, plan, noop, noop)
-        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "dl.m", ".pc", "dl.m.dll")))
+        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "dl.m", ".client_windows", "dl.m.dll")))
         self.assertTrue(os.path.isdir(self._cache_entry("dl.m", "1.0.0")))
 
     def test_restores_from_cache_without_redownload(self):
         self._install("cch.m", "1.0.0")
-        mm.cache_store_mod(self.game, "cch.m", "pc")
+        mm.cache_store_mod(self.game, "cch.m", "client_windows")
         mm.uninstall_mod(self.game, "cch.m")
 
         server_mods = [_srv("cch.m", "1.0.0")]
@@ -1641,7 +1641,7 @@ class RenderActiveSet(_TempDataDirFixture, unittest.TestCase):
 
         mm.render_active_set(self.game, plan, noop, noop)
         self.assertEqual(len(self.dl_dirs), downloads_before)   # no new download
-        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "cch.m", ".pc", "cch.m.dll")))
+        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "cch.m", ".client_windows", "cch.m.dll")))
 
     def test_adopting_first_preserves_the_version_a_render_replaces(self):
         """Why the client adopts installed mods before planning: rendering another
@@ -1650,7 +1650,7 @@ class RenderActiveSet(_TempDataDirFixture, unittest.TestCase):
         self._publish("adopt.m", "2.0.0")
         self.assertFalse(os.path.isdir(self._cache_entry("adopt.m", "1.0.0")))
 
-        mm.adopt_installed_mods(self.game, "pc")
+        mm.adopt_installed_mods(self.game, "client_windows")
         self.assertTrue(os.path.isdir(self._cache_entry("adopt.m", "1.0.0")))
 
         server_mods = [_srv("adopt.m", "2.0.0")]
@@ -1689,7 +1689,7 @@ class RenderActiveSet(_TempDataDirFixture, unittest.TestCase):
         self.assertIn("damaged", row.note)
 
         mm.render_active_set(self.game, plan, noop, noop)
-        self.assertIs(mm.verify_mod_files(self.game, "dmg.m", "pc"), True)
+        self.assertIs(mm.verify_mod_files(self.game, "dmg.m", "client_windows"), True)
         self.assertTrue(self._plan(server_mods, index).entries[0].active)
 
     def test_a_damaged_disabled_mod_is_reinstalled_not_just_enabled(self):
@@ -1699,13 +1699,13 @@ class RenderActiveSet(_TempDataDirFixture, unittest.TestCase):
         server_mods = [_srv("dmgoff.m", "1.0.0")]
         plan = self._plan(server_mods, [summary("dmgoff.m", ["1.0.0"])])
         mm.render_active_set(self.game, plan, noop, noop)
-        self.assertIs(mm.verify_mod_files(self.game, "dmgoff.m", "pc"), True)
+        self.assertIs(mm.verify_mod_files(self.game, "dmgoff.m", "client_windows"), True)
         self.assertTrue(os.path.isfile(mm._mod_record_path(self.game, "dmgoff.m")))
 
     def test_a_damaged_mod_is_never_cached_as_the_good_copy(self):
         self._install("dmgc.m", "1.0.0")
         self._damage("dmgc.m")
-        self.assertFalse(mm.cache_store_mod(self.game, "dmgc.m", "pc"))
+        self.assertFalse(mm.cache_store_mod(self.game, "dmgc.m", "client_windows"))
         self.assertFalse(os.path.isdir(self._cache_entry("dmgc.m", "1.0.0")))
 
     def test_already_active_entry_is_left_alone(self):
@@ -1717,7 +1717,7 @@ class RenderActiveSet(_TempDataDirFixture, unittest.TestCase):
 
         mm.render_active_set(self.game, plan, noop, noop)
         self.assertEqual(len(self.dl_dirs), downloads_before)
-        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "act.m", ".pc", "act.m.dll")))
+        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "act.m", ".client_windows", "act.m.dll")))
 
     def test_deactivated_mod_is_disabled_not_uninstalled(self):
         """Deactivating is a rename, not a delete. The mod stays installed and
@@ -1737,7 +1737,7 @@ class RenderActiveSet(_TempDataDirFixture, unittest.TestCase):
         self.assertIn("old.m", listed)
         self.assertFalse(listed["old.m"]["enabled"])
         # And not reported to a server, which is what makes the parity check pass.
-        self.assertEqual(mm.handshake_snapshot(self.game, "pc")[2], [])
+        self.assertEqual(mm.handshake_snapshot(self.game, "client_windows")[2], [])
         # Cached all the same, so a version switch later is still a file move.
         self.assertTrue(os.path.isdir(self._cache_entry("old.m", "1.0.0")))
         # And a second sync finds nothing left to do, since to_deactivate only
@@ -1936,7 +1936,7 @@ class Parity(_TempDataDirFixture, unittest.TestCase):
         self._break_record("p.old", lambda r: r.pop("parity_required"))
 
         self.assertEqual(mm.list_installed_mods(self.game), [])
-        self.assertEqual(mm.handshake_snapshot(self.game, "pc")[2], [])
+        self.assertEqual(mm.handshake_snapshot(self.game, "client_windows")[2], [])
         # The files are still there, so reinstalling is what fixes it.
         self.assertTrue(os.path.isdir(mm._mod_dir_path(self.game, "p.old")))
         # Not ours by the shared predicate, so the folder demotes to untracked
@@ -1952,7 +1952,7 @@ class Parity(_TempDataDirFixture, unittest.TestCase):
         self._break_record("p.junk", lambda r: r.update(parity_required="yes"))
 
         self.assertEqual(mm.list_installed_mods(self.game), [])
-        self.assertEqual(mm.handshake_snapshot(self.game, "pc")[2], [])
+        self.assertEqual(mm.handshake_snapshot(self.game, "client_windows")[2], [])
         # Same demotion as an absent field: unusable record, untracked folder.
         self.assertEqual([u["name"] for u in mm.list_untracked_mods(self.game)],
                          ["p.junk"])
@@ -1960,7 +1960,7 @@ class Parity(_TempDataDirFixture, unittest.TestCase):
     def test_an_index_entry_without_a_usable_field_is_skipped(self):
         """One bad entry is dropped; the rest of the index still loads."""
         d = {"name": "M", "author": "a", "description": "",
-             "targets": ["pc", "server"], "versions": ["1.0.0"]}
+             "targets": ["client_windows", "server"], "versions": ["1.0.0"]}
         self.assertIsNone(mm._summary_from_dict(d, "no.parity", self.BASE))
         d["parity_required"] = "yes"
         self.assertIsNone(mm._summary_from_dict(d, "no.parity", self.BASE))
@@ -1972,7 +1972,7 @@ class Parity(_TempDataDirFixture, unittest.TestCase):
         having its requirements guessed at."""
         with self.assertRaises(mm.ModManagerError):
             self._plan([{"id": "p.x", "version": "1.0.0",
-                           "targets": ["pc", "server"]}],
+                           "targets": ["client_windows", "server"]}],
                          [])
 
     # -- carrying it through -------------------------------------------------
@@ -1984,7 +1984,7 @@ class Parity(_TempDataDirFixture, unittest.TestCase):
         rec = mm._read_mod_record(self.game, "p.opt")
         self.assertIs(rec["parity_required"], False)
 
-        _, _, mods, _ = mm.handshake_snapshot(self.game, "pc")
+        _, _, mods, _ = mm.handshake_snapshot(self.game, "client_windows")
         by_id = {m["id"]: m for m in mods}
         self.assertIs(by_id["p.opt"]["parity_required"], False)
         self.assertIs(by_id["p.req"]["parity_required"], True)
@@ -2247,27 +2247,27 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         self._install("dis.m", "1.0.0")
         mm.disable_mod(self.game, "dis.m")
 
-        out = mm.export_modlist(self.game, {}, "pc")
+        out = mm.export_modlist(self.game, {}, "client_windows")
         self.assertEqual(out["schema"], mm.MODLIST_SCHEMA)
         self.assertEqual(out["mods"], ["en.m"])
 
     def test_export_pin_versions_writes_exact_versions(self):
         self._install("pin.m", "1.4.0")
-        out = mm.export_modlist(self.game, {}, "pc", pin_versions=True)
+        out = mm.export_modlist(self.game, {}, "client_windows", pin_versions=True)
         self.assertEqual(out["mods"], ["pin.m@1.4.0"])
 
     def test_export_repos_are_informational_shorthands(self):
         cfg = {}
         self.manifests[f"{OTHER}/repository.json"] = slim_index({})
         mm.add_repo(cfg, OTHER)
-        out = mm.export_modlist(self.game, cfg, "pc")
+        out = mm.export_modlist(self.game, cfg, "client_windows")
         self.assertIn("someone/theirmods", out["repos"])
         self.assertIn("ModdingTavern/TavernMods", out["repos"])
 
     def test_import_resolves_bare_id_via_latest(self):
         self._publish_latest("lat.m", "2.0.0")
         modlist = {"schema": 1, "repos": [], "mods": ["lat.m"]}
-        plan = mm.import_modlist(modlist, [], [self.BASE], target="pc")
+        plan = mm.import_modlist(modlist, [], [self.BASE], target="client_windows")
         self.assertFalse(plan.blocking)
         self.assertEqual([(m.id, m.version) for m in plan.roots], [("lat.m", "2.0.0")])
         self.assertEqual(plan.untracked, [])    # a modlist from before the key
@@ -2286,7 +2286,7 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         self._install("en.m", "1.0.0")
         self._untracked("Manual.dll")
 
-        out = mm.export_modlist(self.game, {}, "pc")
+        out = mm.export_modlist(self.game, {}, "client_windows")
         self.assertEqual(out["mods"], ["en.m"])
         self.assertEqual(out["untracked"], [{"name": "Manual.dll", "kind": "file"}])
 
@@ -2297,20 +2297,20 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         self._untracked("Off.dll")
         mm.disable_untracked_dll(self.game, "Off.dll")
 
-        out = mm.export_modlist(self.game, {}, "pc")
+        out = mm.export_modlist(self.game, {}, "client_windows")
         self.assertEqual([u["name"] for u in out["untracked"]], ["On.dll"])
 
     def test_export_has_the_key_even_with_nothing_untracked(self):
         """Always present, so a reader never has to tell "none" from "an
         exporter too old to say"."""
         self._install("en.m", "1.0.0")
-        self.assertEqual(mm.export_modlist(self.game, {}, "pc")["untracked"], [])
+        self.assertEqual(mm.export_modlist(self.game, {}, "client_windows")["untracked"], [])
 
     def test_import_carries_untracked_through_without_resolving_it(self):
         self._publish_latest("lat.m", "2.0.0")
         modlist = {"schema": 1, "repos": [], "mods": ["lat.m"],
                    "untracked": [{"name": "Manual.dll", "kind": "file"}]}
-        plan = mm.import_modlist(modlist, [], [self.BASE], target="pc")
+        plan = mm.import_modlist(modlist, [], [self.BASE], target="client_windows")
 
         self.assertFalse(plan.blocking)
         self.assertEqual(plan.untracked, [{"name": "Manual.dll", "kind": "file"}])
@@ -2322,7 +2322,7 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
     def test_an_untracked_block_never_blocks_an_import(self):
         modlist = {"schema": 1, "repos": [], "mods": [],
                    "untracked": [{"name": "Manual.dll", "kind": "file"}]}
-        plan = mm.import_modlist(modlist, [], [self.BASE], target="pc")
+        plan = mm.import_modlist(modlist, [], [self.BASE], target="client_windows")
         self.assertFalse(plan.blocking)
 
     def test_importing_never_disables_the_importers_own_untracked_mods(self):
@@ -2334,7 +2334,7 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         self._untracked("Manual.dll")
 
         plan = mm.import_modlist({"schema": 1, "repos": [], "mods": ["lat.m"]},
-                                 [], [self.BASE], target="pc")
+                                 [], [self.BASE], target="client_windows")
         # The managed mod is on the disable list; the untracked one isn't there
         # to be listed at all.
         self.assertEqual(mm.modlist_import_disables(self.game, plan), ["mine.m"])
@@ -2349,15 +2349,15 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         self._install("lat.m", "2.0.0")
         self._untracked("Manual.dll")
 
-        exported = mm.export_modlist(self.game, {}, "pc")
-        plan = mm.import_modlist(exported, [], [self.BASE], target="pc")
+        exported = mm.export_modlist(self.game, {}, "client_windows")
+        plan = mm.import_modlist(exported, [], [self.BASE], target="client_windows")
         self.assertEqual([u["name"] for u in plan.untracked], ["Manual.dll"])
 
     def test_import_resolves_pinned_exact_version(self):
         self._publish("pin.m", "1.0.0")
         self._publish("pin.m", "2.0.0")
         modlist = {"schema": 1, "repos": [], "mods": ["pin.m@1.0.0"]}
-        plan = mm.import_modlist(modlist, [], [self.BASE], target="pc")
+        plan = mm.import_modlist(modlist, [], [self.BASE], target="client_windows")
         self.assertEqual([(m.id, m.version) for m in plan.roots], [("pin.m", "1.0.0")])
 
     def test_import_pulls_in_dependencies(self):
@@ -2365,13 +2365,13 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         self._publish_latest("root.m", "1.0.0", dependencies={"dep.k": "1.0.0"})
         index = [summary("dep.k", ["1.0.0"])]
         modlist = {"schema": 1, "repos": [], "mods": ["root.m"]}
-        plan = mm.import_modlist(modlist, index, [self.BASE], target="pc")
+        plan = mm.import_modlist(modlist, index, [self.BASE], target="client_windows")
         self.assertEqual([m.id for m in plan.roots], ["root.m"])
         self.assertEqual([m.id for m in plan.dependencies], ["dep.k"])
 
     def test_import_unresolved_entry_blocks(self):
         modlist = {"schema": 1, "repos": ["Some/Pack"], "mods": ["ghost.m@1.0.0"]}
-        plan = mm.import_modlist(modlist, [], [self.BASE], target="pc")
+        plan = mm.import_modlist(modlist, [], [self.BASE], target="client_windows")
         self.assertTrue(plan.blocking)
         self.assertEqual(plan.unresolved, [("ghost.m", "1.0.0")])
         self.assertEqual(plan.hinted_repos, ["Some/Pack"])
@@ -2379,7 +2379,7 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
     def test_import_rejects_unsupported_schema(self):
         modlist = {"schema": 2, "repos": [], "mods": []}
         with self.assertRaises(mm.ModManagerError):
-            mm.import_modlist(modlist, [], [self.BASE], target="pc")
+            mm.import_modlist(modlist, [], [self.BASE], target="client_windows")
 
     def _publish_conflicting_pair(self):
         """Two mods pinning the same library filename at different content -
@@ -2399,7 +2399,7 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         self._publish_conflicting_pair()
         modlist = {"schema": 1, "repos": [], "mods": ["one.m", "two.m"]}
         with self.assertRaises(mm.ModManagerError) as caught:
-            mm.import_modlist(modlist, [], [self.BASE], target="pc")
+            mm.import_modlist(modlist, [], [self.BASE], target="client_windows")
         self.assertIn("Shared.dll", str(caught.exception))
 
     def test_apply_import_installs_nothing_on_a_library_conflict(self):
@@ -2410,7 +2410,7 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
             roots=[mm._fetch_manifest([self.BASE], "one.m", "1.0.0"),
                    mm._fetch_manifest([self.BASE], "two.m", "1.0.0")],
             dependencies=[], unresolved=[], hinted_repos=[], untracked=[],
-            target="pc", no_build=[])
+            target="client_windows", no_build=[])
 
         with self.assertRaises(mm.ModManagerError):
             mm.apply_import(self.game, plan, self.progress.append)
@@ -2423,18 +2423,18 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         self._publish_latest("root.m", "1.0.0", dependencies={"dep.k": "1.0.0"})
         index = [summary("dep.k", ["1.0.0"])]
         modlist = {"schema": 1, "repos": [], "mods": ["root.m"]}
-        plan = mm.import_modlist(modlist, index, [self.BASE], target="pc")
+        plan = mm.import_modlist(modlist, index, [self.BASE], target="client_windows")
 
         mm.apply_import(self.game, plan, self.progress.append)
-        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "root.m", ".pc", "root.m.dll")))
-        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "dep.k", ".pc", "dep.k.dll")))
+        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "root.m", ".client_windows", "root.m.dll")))
+        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "dep.k", ".client_windows", "dep.k.dll")))
 
     def test_apply_import_disables_installed_mods_not_in_list(self):
         self._install("keep.m", "1.0.0")
         self._install("drop.m", "1.0.0")
         self._publish_latest("keep.m", "1.0.0")
         modlist = {"schema": 1, "repos": [], "mods": ["keep.m"]}
-        plan = mm.import_modlist(modlist, [], [self.BASE], target="pc")
+        plan = mm.import_modlist(modlist, [], [self.BASE], target="client_windows")
 
         mm.apply_import(self.game, plan, self.progress.append)
 
@@ -2448,7 +2448,7 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         self._publish_latest("root.m", "1.0.0", dependencies={"dep.k": "1.0.0"})
         index = [summary("dep.k", ["1.0.0"])]
         modlist = {"schema": 1, "repos": [], "mods": ["root.m"]}
-        plan = mm.import_modlist(modlist, index, [self.BASE], target="pc")
+        plan = mm.import_modlist(modlist, index, [self.BASE], target="client_windows")
 
         mm.apply_import(self.game, plan, self.progress.append)
 
@@ -2459,7 +2459,7 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         self._install("dis.m", "1.0.0")
         mm.disable_mod(self.game, "dis.m")
         modlist = {"schema": 1, "repos": [], "mods": []}
-        plan = mm.import_modlist(modlist, [], [self.BASE], target="pc")
+        plan = mm.import_modlist(modlist, [], [self.BASE], target="client_windows")
 
         mm.apply_import(self.game, plan, self.progress.append)
 
@@ -2471,7 +2471,7 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
         self._install("drop.m", "1.0.0")
         self._publish_latest("keep.m", "1.0.0")
         modlist = {"schema": 1, "repos": [], "mods": ["keep.m"]}
-        plan = mm.import_modlist(modlist, [], [self.BASE], target="pc")
+        plan = mm.import_modlist(modlist, [], [self.BASE], target="client_windows")
 
         self.assertEqual(mm.modlist_import_disables(self.game, plan), ["drop.m"])
         installed = {r["id"]: r["enabled"] for r in mm.list_installed_mods(self.game)}
@@ -2479,19 +2479,19 @@ class ModlistImportExport(_FakeInstallFixture, unittest.TestCase):
 
     def test_apply_import_blocking_plan_raises_without_installing(self):
         modlist = {"schema": 1, "repos": [], "mods": ["ghost.m"]}
-        plan = mm.import_modlist(modlist, [], [self.BASE], target="pc")
+        plan = mm.import_modlist(modlist, [], [self.BASE], target="client_windows")
         with self.assertRaises(mm.ModManagerError):
             mm.apply_import(self.game, plan, noop)
         self.assertFalse(os.path.exists(os.path.join(self.game, "Mods")))
 
     def test_export_then_import_round_trip(self):
         self._install("rt.m", "1.0.0")
-        exported = mm.export_modlist(self.game, {}, "pc")
+        exported = mm.export_modlist(self.game, {}, "client_windows")
         # Re-serve rt.m at latest.json so the bare-id export entry resolves
         # on import, same as a real repo would.
         self.manifests[f"{self.BASE}/manifests/rt/m/latest.json"] = self.manifests[
             f"{self.BASE}/manifests/rt/m/1.0.0.json"]
-        plan = mm.import_modlist(exported, [], [self.BASE], target="pc")
+        plan = mm.import_modlist(exported, [], [self.BASE], target="client_windows")
         self.assertFalse(plan.blocking)
         self.assertEqual([m.id for m in plan.roots], ["rt.m"])
 
@@ -2601,9 +2601,9 @@ class ZipBundleInstall(_FakeInstallFixture, unittest.TestCase):
         self._install("ships.m")
         rec = self._record("ships.m")
         self.assertEqual(rec["id"], "ships.m")
-        self.assertNotIn("manifest.json", rec["installed"]["pc"]["files"])
-        self.assertIn("Content/manifest.json", rec["installed"]["pc"]["files"])
-        self.assertTrue(mm.verify_mod_files(self.game, "ships.m", "pc"))
+        self.assertNotIn("manifest.json", rec["installed"]["client_windows"]["files"])
+        self.assertIn("Content/manifest.json", rec["installed"]["client_windows"]["files"])
+        self.assertTrue(mm.verify_mod_files(self.game, "ships.m", "client_windows"))
 
     def test_zip_record_name_skip_ignores_case_and_dot_segments(self):
         """NTFS resolves all of these to the record's own file."""
@@ -2616,8 +2616,8 @@ class ZipBundleInstall(_FakeInstallFixture, unittest.TestCase):
                 self._install(mod_id)
                 rec = self._record(mod_id)
                 self.assertEqual(rec["id"], mod_id)
-                self.assertEqual(set(rec["installed"]["pc"]["files"]), {"A.dll"})
-                self.assertTrue(mm.verify_mod_files(self.game, mod_id, "pc"))
+                self.assertEqual(set(rec["installed"]["client_windows"]["files"]), {"A.dll"})
+                self.assertTrue(mm.verify_mod_files(self.game, mod_id, "client_windows"))
 
     def test_unsafe_members_are_refused_and_nothing_is_installed(self):
         """Traversal, absolute paths, colons (a drive letter, or an NTFS
@@ -2651,7 +2651,7 @@ class ZipBundleInstall(_FakeInstallFixture, unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             m = make_manifest("a.b", "1.0.0", package="rar")
         self.assertEqual(m.artifacts, [])
-        self.assertIsNone(m.artifact_for("pc"))
+        self.assertIsNone(m.artifact_for("client_windows"))
 
     def test_zip_bomb_total_size_aborts(self):
         # One member whose decompressed size exceeds the cap.
@@ -2688,26 +2688,26 @@ class DamageDetection(_FakeInstallFixture, unittest.TestCase):
         # in its own map (it isn't in the target folder at all).
         with open(self._dll("h.m"), "rb") as f:
             expected = hashlib.sha256(f.read()).hexdigest()
-        self.assertEqual(rec["installed"]["pc"]["files"], {"h.m.dll": expected})
+        self.assertEqual(rec["installed"]["client_windows"]["files"], {"h.m.dll": expected})
 
     def test_intact_install_verifies_true(self):
         self._install("ok.m", "1.0.0")
-        self.assertIs(mm.verify_mod_files(self.game, "ok.m", "pc"), True)
+        self.assertIs(mm.verify_mod_files(self.game, "ok.m", "client_windows"), True)
         self.assertEqual(mm.mod_status(self.game, "ok.m",
-                                       [summary("ok.m", ["1.0.0"])], "pc"), "current")
+                                       [summary("ok.m", ["1.0.0"])], "client_windows"), "current")
 
     def test_an_altered_file_reads_damaged(self):
         self._install("av.m", "1.0.0")
         with open(self._dll("av.m"), "wb") as f:
             f.write(b"eaten by antivirus")
-        self.assertIs(mm.verify_mod_files(self.game, "av.m", "pc"), False)
+        self.assertIs(mm.verify_mod_files(self.game, "av.m", "client_windows"), False)
         self.assertEqual(mm.mod_status(self.game, "av.m",
-                                       [summary("av.m", ["1.0.0"])], "pc"), "damaged")
+                                       [summary("av.m", ["1.0.0"])], "client_windows"), "damaged")
 
     def test_a_deleted_file_reads_damaged(self):
         self._install("gone.m", "1.0.0")
         os.remove(self._dll("gone.m"))
-        self.assertIs(mm.verify_mod_files(self.game, "gone.m", "pc"), False)
+        self.assertIs(mm.verify_mod_files(self.game, "gone.m", "client_windows"), False)
 
     def test_damage_outranks_outdated(self):
         """A damaged install's version number is a claim about files that are
@@ -2716,7 +2716,7 @@ class DamageDetection(_FakeInstallFixture, unittest.TestCase):
         with open(self._dll("d.old"), "wb") as f:
             f.write(b"junk")
         self.assertEqual(mm.mod_status(self.game, "d.old",
-                                       [summary("d.old", ["1.0.0", "2.0.0"])], "pc"), "damaged")
+                                       [summary("d.old", ["1.0.0", "2.0.0"])], "client_windows"), "damaged")
 
     def test_a_record_without_a_files_map_is_never_damaged(self):
         """Pre-existing installs, from before the field, have no map: no
@@ -2725,44 +2725,44 @@ class DamageDetection(_FakeInstallFixture, unittest.TestCase):
         self._install("legacy.m", "1.0.0")
         record_path = mm._mod_record_path(self.game, "legacy.m")
         rec = read_json(record_path)
-        del rec["installed"]["pc"]["files"]
+        del rec["installed"]["client_windows"]["files"]
         with io.open(record_path, "w", encoding="utf-8") as f:
             json.dump(rec, f)
         with open(self._dll("legacy.m"), "wb") as f:
             f.write(b"altered, but unprovable")
-        self.assertIsNone(mm.verify_mod_files(self.game, "legacy.m", "pc"))
+        self.assertIsNone(mm.verify_mod_files(self.game, "legacy.m", "client_windows"))
         self.assertEqual(mm.mod_status(self.game, "legacy.m",
-                                       [summary("legacy.m", ["1.0.0"])], "pc"), "current")
+                                       [summary("legacy.m", ["1.0.0"])], "client_windows"), "current")
 
     def test_verification_is_memoized_until_invalidated(self):
         """Damage after a clean check is only seen once the memo is invalidated
         (an install of the mod, or Refresh clearing it, as here)."""
         self._install("memo.m", "1.0.0")
-        self.assertIs(mm.verify_mod_files(self.game, "memo.m", "pc"), True)
+        self.assertIs(mm.verify_mod_files(self.game, "memo.m", "client_windows"), True)
         with open(self._dll("memo.m"), "wb") as f:
             f.write(b"corrupted after the check")
-        self.assertIs(mm.verify_mod_files(self.game, "memo.m", "pc"), True)   # stale, by design
+        self.assertIs(mm.verify_mod_files(self.game, "memo.m", "client_windows"), True)   # stale, by design
         mm._verify_memo.clear()
-        self.assertIs(mm.verify_mod_files(self.game, "memo.m", "pc"), False)
+        self.assertIs(mm.verify_mod_files(self.game, "memo.m", "client_windows"), False)
 
     def test_reinstall_invalidates_the_memo_and_repairs(self):
         self._install("fix.m", "1.0.0")
         with open(self._dll("fix.m"), "wb") as f:
             f.write(b"junk")
         mm._verify_memo.clear()
-        self.assertIs(mm.verify_mod_files(self.game, "fix.m", "pc"), False)
+        self.assertIs(mm.verify_mod_files(self.game, "fix.m", "client_windows"), False)
         self._install("fix.m", "1.0.0")    # reinstall over it
-        self.assertIs(mm.verify_mod_files(self.game, "fix.m", "pc"), True)
+        self.assertIs(mm.verify_mod_files(self.game, "fix.m", "client_windows"), True)
 
     def test_handshake_entries_carry_the_artifact_shas(self):
         """Additive advisory fields; the fingerprint hash itself must not move
         (it's byte-identical with TavernLib's C#)."""
         self._install("s.m", "1.0.0")
-        mods_hash, _, entries, _ = mm.handshake_snapshot(self.game, "pc")
+        mods_hash, _, entries, _ = mm.handshake_snapshot(self.game, "client_windows")
         rec = self._record("s.m")
         self.assertEqual(entries[0]["target_sha256"],
-                         {"pc": rec["installed"]["pc"]["sha256"],
-                          "server": rec["installed"]["pc"]["sha256"]})
+                         {"client_windows": rec["installed"]["client_windows"]["sha256"],
+                          "server": rec["installed"]["client_windows"]["sha256"]})
         self.assertEqual(mods_hash,
                          hashlib.sha256(b"s.m@1.0.0@req").hexdigest())
 
@@ -2773,7 +2773,7 @@ class CacheIntegrityAndPruning(_TempDataDirFixture, unittest.TestCase):
 
     def test_restore_verifies_and_discards_a_rotten_entry(self):
         self._install("rot.m", "1.0.0")
-        mm.cache_store_mod(self.game, "rot.m", "pc")
+        mm.cache_store_mod(self.game, "rot.m", "client_windows")
         entry = self._cache_entry("rot.m", "1.0.0")
         with open(os.path.join(entry, "tree", "rot.m.dll"), "wb") as f:
             f.write(b"bitrot")
@@ -2784,11 +2784,11 @@ class CacheIntegrityAndPruning(_TempDataDirFixture, unittest.TestCase):
         # The bad entry is gone (not poised to fail every future restore), and
         # the installed copy was never touched.
         self.assertFalse(os.path.isdir(entry))
-        self.assertIs(mm.verify_mod_files(self.game, "rot.m", "pc"), True)
+        self.assertIs(mm.verify_mod_files(self.game, "rot.m", "client_windows"), True)
 
     def test_render_falls_back_to_download_when_the_cache_entry_is_bad(self):
         self._install("fb.m", "1.0.0")
-        mm.cache_store_mod(self.game, "fb.m", "pc")
+        mm.cache_store_mod(self.game, "fb.m", "client_windows")
         mm.uninstall_mod(self.game, "fb.m")
         entry = self._cache_entry("fb.m", "1.0.0")
         with open(os.path.join(entry, "tree", "fb.m.dll"), "wb") as f:
@@ -2801,7 +2801,7 @@ class CacheIntegrityAndPruning(_TempDataDirFixture, unittest.TestCase):
         mm.render_active_set(self.game, plan, self.progress.append, noop)
         # ...but rendered as a verified download once the entry failed its
         # restore-time check, leaving a correct install either way.
-        self.assertIs(mm.verify_mod_files(self.game, "fb.m", "pc"), True)
+        self.assertIs(mm.verify_mod_files(self.game, "fb.m", "client_windows"), True)
         self.assertTrue(any("downloading instead" in m.lower() for m in self.progress))
 
     def test_an_entry_without_a_files_map_still_restores(self):
@@ -2811,13 +2811,13 @@ class CacheIntegrityAndPruning(_TempDataDirFixture, unittest.TestCase):
         self._install("old.m", "1.0.0")
         record_path = mm._mod_record_path(self.game, "old.m")
         rec = read_json(record_path)
-        del rec["installed"]["pc"]["files"]
+        del rec["installed"]["client_windows"]["files"]
         with io.open(record_path, "w", encoding="utf-8") as f:
             json.dump(rec, f)
-        mm.cache_store_mod(self.game, "old.m", "pc")
+        mm.cache_store_mod(self.game, "old.m", "client_windows")
         mm.uninstall_mod(self.game, "old.m")
         self._restore("old.m", "1.0.0")
-        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "old.m", ".pc", "old.m.dll")))
+        self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "old.m", ".client_windows", "old.m.dll")))
 
     def test_store_prunes_oldest_stored_versions_past_the_cap(self):
         """By when each entry was stored, not by the installed folder's mtime
@@ -2827,7 +2827,7 @@ class CacheIntegrityAndPruning(_TempDataDirFixture, unittest.TestCase):
         for i, version in enumerate(["1.0.0", "1.1.0", "1.2.0", "1.3.0"]):
             self._install("pr.m", version)
             os.utime(self._mod_file("pr.m"), (4000 - i, 4000 - i))
-            mm.cache_store_mod(self.game, "pr.m", "pc")
+            mm.cache_store_mod(self.game, "pr.m", "client_windows")
 
         kept = sorted(d for d in os.listdir(base) if not d.endswith(".caching"))
         self.assertEqual(kept, ["1.1.0", "1.2.0", "1.3.0"])
@@ -2838,9 +2838,9 @@ class CacheIntegrityAndPruning(_TempDataDirFixture, unittest.TestCase):
         base = os.path.join(mm._cache_base(), "pin.m")
         for version in ["1.0.0", "1.1.0", "1.2.0"]:
             self._install("pin.m", version)
-            mm.cache_store_mod(self.game, "pin.m", "pc")
+            mm.cache_store_mod(self.game, "pin.m", "client_windows")
         self._install("pin.m", "1.0.0")
-        mm.cache_store_mod(self.game, "pin.m", "pc")    # early return: already cached
+        mm.cache_store_mod(self.game, "pin.m", "client_windows")    # early return: already cached
         kept = sorted(d for d in os.listdir(base) if not d.endswith(".caching"))
         self.assertEqual(kept, ["1.0.0", "1.1.0", "1.2.0"])
 
@@ -2973,14 +2973,14 @@ class Scenes(_TempDataDirFixture, unittest.TestCase):
 
     def test_the_handshake_reports_scenes_but_does_not_hash_them(self):
         self._install("m.m")
-        before, _, entries, _ = mm.handshake_snapshot(self.game, "pc")
+        before, _, entries, _ = mm.handshake_snapshot(self.game, "client_windows")
         self.assertNotIn("scenes", entries[0])
         record_path = mm._mod_record_path(self.game, "m.m")
         record = read_json(record_path)
         record["scenes"] = ["quest"]
         with io.open(record_path, "w", encoding="utf-8") as f:
             json.dump(record, f)
-        after, _, entries, _ = mm.handshake_snapshot(self.game, "pc")
+        after, _, entries, _ = mm.handshake_snapshot(self.game, "client_windows")
         self.assertEqual(entries[0]["scenes"], ["quest"])
         self.assertEqual(before, after)
         self.assertEqual(after, hashlib.sha256(b"m.m@1.0.0@req").hexdigest())

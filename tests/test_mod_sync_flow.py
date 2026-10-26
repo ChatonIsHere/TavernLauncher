@@ -244,7 +244,7 @@ class NoModsVersusNoModInfo(unittest.TestCase):
         self.assertIsNone(self._get_server_mods({}))
 
     def test_a_reported_list_comes_back(self):
-        mods_list = [{"id": "a.mod", "version": "1.0.0", "targets": ["pc"]}]
+        mods_list = [{"id": "a.mod", "version": "1.0.0", "targets": ["client_windows"]}]
         self.assertEqual(
             self._get_server_mods({"mods_hash": "h"}, fetched=(mods_list, [])),
             mods_list)
@@ -290,7 +290,7 @@ class SyncVerifiesBeforeClaimingSuccess(unittest.TestCase):
     parity check the join path runs after the same render."""
 
     def _sync(self, installed):
-        server_mods = [{"id": "a.mod", "version": "1.0.0", "targets": ["pc", "server"],
+        server_mods = [{"id": "a.mod", "version": "1.0.0", "targets": ["client_windows", "server"],
                         "parity_required": True, "target_sha256": {}}]
         opened = []
         ns = launcher(
@@ -312,13 +312,13 @@ class SyncVerifiesBeforeClaimingSuccess(unittest.TestCase):
 
     def test_a_matching_render_is_reported_as_a_match(self):
         win = self._sync([{"id": "a.mod", "version": "1.0.0", "enabled": True,
-                           "installed": {"pc": {}}}])
+                           "installed": {"client_windows": {}}}])
         self.assertEqual(len(win.finished), 1)
         self.assertTrue(win.finished[0][0])
 
     def test_a_render_that_left_a_mismatch_says_so(self):
         win = self._sync([{"id": "a.mod", "version": "0.9.0", "enabled": True,
-                           "installed": {"pc": {}}}])
+                           "installed": {"client_windows": {}}}])
         ok, message = win.finished[0]
         self.assertFalse(ok)
         self.assertIn("a.mod needs 1.0.0", message)
@@ -329,19 +329,19 @@ class ServerModsListShape(unittest.TestCase):
 
     def test_a_v2_entry_passes_through(self):
         e = {"id": "a.mod", "version": "1.0.0", "parity_required": True,
-             "targets": ["pc", "server", "future"], "target_sha256": {"pc": "ab"}}
+             "targets": ["client_windows", "server", "future"], "target_sha256": {"client_windows": "ab"}}
         self.assertEqual(auth._server_mod_entry(e), e)
 
     def test_an_entry_without_targets_is_refused(self):
         """A v1 server's entry: guessing its targets would skip a mod it requires."""
         for bad in ({"id": "a.mod", "client_side": True, "server_side": True},
-                    {"id": "a.mod", "targets": "pc"}, {"id": "a.mod", "targets": [1]},
-                    {"targets": ["pc"]}, {"id": "", "targets": ["pc"]}, "a.mod"):
+                    {"id": "a.mod", "targets": "client_windows"}, {"id": "a.mod", "targets": [1]},
+                    {"targets": ["client_windows"]}, {"id": "", "targets": ["client_windows"]}, "a.mod"):
             with self.subTest(entry=bad), self.assertRaises(Exception):
                 auth._server_mod_entry(bad)
 
     def test_a_malformed_sha_map_is_dropped_not_fatal(self):
-        e = auth._server_mod_entry({"id": "a.mod", "targets": ["pc"], "target_sha256": "ab"})
+        e = auth._server_mod_entry({"id": "a.mod", "targets": ["client_windows"], "target_sha256": "ab"})
         self.assertEqual(e["target_sha256"], {})
 
 

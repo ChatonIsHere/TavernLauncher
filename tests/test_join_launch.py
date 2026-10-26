@@ -119,7 +119,7 @@ class MainMenuLaunch(unittest.TestCase):
             _save=lambda: None, _print=lambda msg, tag="": printed.append((msg, tag)),
             _popen_console_kwargs=lambda: {})
         bind(ns, "_do_launch_menu", "_mods_claim")
-        pc = {"installed": {"pc": {}}}
+        pc = {"installed": {"client_windows": {}}}
         fake_mods = types.SimpleNamespace(
             has_target=has_target,
             list_installed_mods=lambda d: [
@@ -155,14 +155,14 @@ class MainMenuLaunch(unittest.TestCase):
         self.assertEqual(len(ns._game_procs), 1)
 
     def test_it_carries_the_same_mods_claim_as_a_join(self):
-        """Enabled mods installed for pc, and nothing else."""
+        """Enabled mods installed for client_windows, and nothing else."""
         _, _, _, claims = self._launch()
         self.assertEqual(claims, ['{"a.mod": "1.2.3"}'])
 
 
 class TavernEssentialsDetection(unittest.TestCase):
     """What shows the Main Menu button: an enabled TavernEssentials.dll,
-    loose (upstream 1.8.5's install) or in a loaded mod folder's .pc/ build
+    loose (upstream 1.8.5's install) or in a loaded mod folder's .client_windows/ build
     (ours)."""
 
     def setUp(self):
@@ -184,11 +184,11 @@ class TavernEssentialsDetection(unittest.TestCase):
 
     def test_managed_folder(self):
         self._file("Nyx12012.Tavern-Essentials", "manifest.json")
-        self._file("Nyx12012.Tavern-Essentials", ".pc", "TavernEssentials.dll")
+        self._file("Nyx12012.Tavern-Essentials", ".client_windows", "TavernEssentials.dll")
         self.assertTrue(lw._tavernessentials_installed(self.game))
 
     def test_a_server_build_does_not_count(self):
-        """Only .pc/ loads in the game a player launches."""
+        """Only .client_windows/ loads in the game a player launches."""
         self._file("Nyx12012.Tavern-Essentials", "manifest.json")
         self._file("Nyx12012.Tavern-Essentials", ".server", "TavernEssentials.dll")
         self.assertFalse(lw._tavernessentials_installed(self.game))
@@ -196,7 +196,7 @@ class TavernEssentialsDetection(unittest.TestCase):
     def test_disabled_copies_do_not_count(self):
         self._file("TavernEssentials.dll.disabled")
         self._file("Nyx12012.Tavern-Essentials", "manifest.disabled.json")
-        self._file("Nyx12012.Tavern-Essentials", ".pc", "TavernEssentials.dll")
+        self._file("Nyx12012.Tavern-Essentials", ".client_windows", "TavernEssentials.dll")
         self.assertFalse(lw._tavernessentials_installed(self.game))
 
     def test_no_game_folder(self):
@@ -215,27 +215,27 @@ class VersionlessRequiredModFailsParity(unittest.TestCase):
             return ns._verify_mod_parity(server_mods, installed)
 
     def test_no_version_against_an_absent_mod_mismatches(self):
-        server = [{"id": "a.mod", "version": None, "targets": ["pc", "server"],
+        server = [{"id": "a.mod", "version": None, "targets": ["client_windows", "server"],
                    "parity_required": True}]
         self.assertEqual(self._verify(server, []), [("a.mod", None, None)])
 
     def test_a_missing_version_key_mismatches_too(self):
-        server = [{"id": "a.mod", "targets": ["pc"], "parity_required": True}]
+        server = [{"id": "a.mod", "targets": ["client_windows"], "parity_required": True}]
         self.assertEqual(len(self._verify(server, [])), 1)
 
     def test_an_exact_match_still_passes(self):
-        server = [{"id": "a.mod", "version": "1.2.3", "targets": ["pc", "server"],
+        server = [{"id": "a.mod", "version": "1.2.3", "targets": ["client_windows", "server"],
                    "parity_required": True}]
         installed = [{"id": "a.mod", "version": "1.2.3"}]
         self.assertEqual(self._verify(server, installed), [])
 
     def test_a_mod_parity_does_not_require_is_still_ignored(self):
-        server = [{"id": "a.mod", "version": None, "targets": ["pc", "server"],
+        server = [{"id": "a.mod", "version": None, "targets": ["client_windows", "server"],
                    "parity_required": False}]
         self.assertEqual(self._verify(server, []), [])
 
     def test_a_mod_without_a_pc_build_is_never_required_of_a_client(self):
-        server = [{"id": "srv.mod", "version": "1.0.0", "targets": ["server", "quest"],
+        server = [{"id": "srv.mod", "version": "1.0.0", "targets": ["server", "client_android"],
                    "parity_required": True}]
         self.assertEqual(self._verify(server, []), [])
 

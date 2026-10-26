@@ -16,7 +16,7 @@
   "artifacts": [
     {
       "targets": [
-        "pc",
+        "client_windows",
         "server"
       ],
       "download_url": "http://127.0.0.1:8765/files/ExampleMod.dll",
@@ -33,7 +33,7 @@
     },
     {
       "targets": [
-        "quest"
+        "client_android"
       ],
       "download_url": "http://127.0.0.1:8765/files/ExampleMod-quest.zip",
       "sha256": "53c5b66a1de9cf1b81682a3efac5b29cb652d17a9ced570dd6ee923b91bdd3c6",

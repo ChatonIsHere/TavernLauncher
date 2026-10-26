@@ -8,8 +8,8 @@
         "description": "Ünïcödé ✓ check",
         "parity_required": true,
         "targets": [
-          "pc",
-          "quest",
+          "client_android",
+          "client_windows",
           "server"
         ],
         "scenes": [
@@ -25,10 +25,10 @@
       "1": {
         "name": "PC Helper",
         "author": "ExampleDev",
-        "description": "pc only",
+        "description": "Windows client only",
         "parity_required": false,
         "targets": [
-          "pc"
+          "client_windows"
         ],
         "versions": [
           "1.0.0"
@@ -39,10 +39,10 @@
       "1": {
         "name": "Split Mod",
         "author": "ExampleDev",
-        "description": "different pc and server builds",
+        "description": "different client and server builds",
         "parity_required": true,
         "targets": [
-          "pc",
+          "client_windows",
           "server"
         ],
         "versions": [

@@ -1,10 +1,10 @@
 {
   "base_url": "http://127.0.0.1:8765",
   "cases": {
-    "ExampleMod.pc": {
+    "ExampleMod.client_windows": {
       "id": "ExampleDev.ExampleMod",
       "targets": [
-        "pc"
+        "client_windows"
       ]
     },
     "ExampleMod.server": {
@@ -13,23 +13,23 @@
         "server"
       ]
     },
-    "ExampleMod.pc+server": {
+    "ExampleMod.client_windows+server": {
       "id": "ExampleDev.ExampleMod",
       "targets": [
-        "pc",
+        "client_windows",
         "server"
       ]
     },
-    "PcHelper.pc": {
+    "PcHelper.client_windows": {
       "id": "ExampleDev.PcHelper",
       "targets": [
-        "pc"
+        "client_windows"
       ]
     },
-    "SplitMod.pc+server": {
+    "SplitMod.client_windows+server": {
       "id": "ExampleDev.SplitMod",
       "targets": [
-        "pc",
+        "client_windows",
         "server"
       ]
     },

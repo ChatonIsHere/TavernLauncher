@@ -2,7 +2,7 @@
 tests/fixtures/v2 served at http://127.0.0.1:8765 (started here if nothing is
 listening there already).
 
-A host's client launcher (Python, target pc) and its server (TavernLib's
+A host's client launcher (Python, target client_windows) and its server (TavernLib's
 reconciler, target server) share one game folder. Checks, in both install
 orders: record bytes against the spec's golden files, the two implementations'
 server handshakes against each other, which folders MelonLoader would load per
@@ -111,18 +111,18 @@ for order in ("python-first", "csharp-first"):
     game = new_game()
     games.append(game)
     if order == "python-first":
-        py_install(game, EXAMPLE, "pc"); py_install(game, SPLIT, "pc")
+        py_install(game, EXAMPLE, "client_windows"); py_install(game, SPLIT, "client_windows")
         cs_server_install(game, EXAMPLE, SPLIT)
     else:
         cs_server_install(game, EXAMPLE, SPLIT)
-        py_install(game, EXAMPLE, "pc"); py_install(game, SPLIT, "pc")
+        py_install(game, EXAMPLE, "client_windows"); py_install(game, SPLIT, "client_windows")
 
     print(f"\n== shared folder, {order}")
-    check(record(game, EXAMPLE) == expected("ExampleMod.pc+server"), f"{order}: ExampleMod record bytes")
-    check(record(game, SPLIT) == expected("SplitMod.pc+server"), f"{order}: SplitMod record bytes")
-    check(record(game, HELPER) == expected("PcHelper.pc"), f"{order}: PcHelper record bytes")
+    check(record(game, EXAMPLE) == expected("ExampleMod.client_windows+server"), f"{order}: ExampleMod record bytes")
+    check(record(game, SPLIT) == expected("SplitMod.client_windows+server"), f"{order}: SplitMod record bytes")
+    check(record(game, HELPER) == expected("PcHelper.client_windows"), f"{order}: PcHelper record bytes")
     for mod_id in (EXAMPLE, SPLIT):
-        for t in ("pc", "server"):
+        for t in ("client_windows", "server"):
             check(os.path.isdir(os.path.join(game, "Mods", mod_id, "." + t)), f"{order}: {mod_id}/.{t} exists")
             check(install.verify_mod_files(game, mod_id, t) is True, f"{order}: {mod_id} {t} verifies (Python)")
         check(not any(f.endswith(".dll") for f in os.listdir(os.path.join(game, "Mods", mod_id))),
@@ -132,7 +132,7 @@ for order in ("python-first", "csharp-first"):
     py_hash, py_count, py_mods, py_untracked = install.handshake_snapshot(game, target="server")
     cs = harness_json("snap", game)
     check(cs.get("hash") == py_hash, f"{order}: mods_hash identical (py {py_hash[:12]} / cs {str(cs.get('hash'))[:12]})")
-    check(cs.get("count") == py_count == 2, f"{order}: count 2 on both (PcHelper is pc-only)")
+    check(cs.get("count") == py_count == 2, f"{order}: count 2 on both (PcHelper is client_windows-only)")
     norm = lambda ms: sorted(json.dumps(m, sort_keys=True) for m in ms)
     check(norm(cs.get("mods", [])) == norm(py_mods), f"{order}: mods_list entries identical")
     check({m["id"] for m in py_mods} == {EXAMPLE, SPLIT}, f"{order}: server lists only server-installed mods")
@@ -140,19 +140,19 @@ for order in ("python-first", "csharp-first"):
 game = games[0]
 
 print("\n== which folders MelonLoader loads")
-for role, own, other in (("server", ".server", ".pc"), ("pc", ".pc", ".server")):
+for role, own, other in (("server", ".server", ".client_windows"), ("client_windows", ".client_windows", ".server")):
     dirs = select(game, role)
     for mod_id in (EXAMPLE, SPLIT):
         check(any(d.endswith(f"/{mod_id}/{own}") for d in dirs), f"{role}: loads {mod_id}/{own}")
         check(not any(f"/{mod_id}/{other}" in d for d in dirs), f"{role}: never loads {mod_id}/{other}")
-    check(any(d.endswith(f"/{HELPER}/.pc") for d in dirs) == (role == "pc"),
-          f"{role}: PcHelper/.pc loaded only for pc")
+    check(any(d.endswith(f"/{HELPER}/.client_windows") for d in dirs) == (role == "client_windows"),
+          f"{role}: PcHelper/.client_windows loaded only for client_windows")
     if role == "server":
         check(any(d.endswith(f"/{SPLIT}/.server/Assets") for d in dirs), "server: zip subfolders load too")
 # A disabled record loads nothing for either role.
 mod_dir = os.path.join(game, "Mods", SPLIT)
 os.replace(os.path.join(mod_dir, "manifest.json"), os.path.join(mod_dir, "manifest.disabled.json"))
-for role in ("server", "pc"):
+for role in ("server", "client_windows"):
     dirs = select(game, role)
     check(not any(SPLIT in d for d in dirs), f"{role}: disabled SplitMod loads nothing")
 os.replace(os.path.join(mod_dir, "manifest.disabled.json"), os.path.join(mod_dir, "manifest.json"))
@@ -163,7 +163,7 @@ for claim, allowed, label in (
         (both, True, "claim with both exact versions"),
         (json.dumps({EXAMPLE: "1.2.0"}), False, "claim missing SplitMod"),
         (json.dumps({EXAMPLE: "1.1.0", SPLIT: "1.0.0"}), False, "claim with the wrong ExampleMod version"),
-        ("none", False, "no claim (Quest standalone), parity mods with pc targets"),
+        ("none", False, "no claim (Quest standalone), parity mods with client targets"),
 ):
     check(admitted(game, claim) == allowed, f"parity: {label} -> {'allowed' if allowed else 'denied'}")
 
@@ -189,11 +189,11 @@ def hand_record(game, mod_id, targets, parity):
 
 
 g2 = new_game(); games.append(g2)
-hand_record(g2, "T.QuestOnly", ["server", "quest"], True)
-check(admitted(g2, "none") is False, "parity: no claim vs required server+quest mod -> denied")
-check(admitted(g2, "{}") is True, "parity: PC claim vs required server+quest mod (no pc build) -> allowed")
+hand_record(g2, "T.QuestOnly", ["server", "client_android"], True)
+check(admitted(g2, "none") is False, "parity: no claim vs required server+client_android mod -> denied")
+check(admitted(g2, "{}") is True, "parity: PC claim vs required server+client_android mod (no client_windows build) -> allowed")
 g3 = new_game(); games.append(g3)
-hand_record(g3, "T.Optional", ["server", "pc"], False)
+hand_record(g3, "T.Optional", ["server", "client_windows"], False)
 hand_record(g3, "T.ServerOnly", ["server"], True)
 check(admitted(g3, "none") is True, "parity: no claim vs optional + server-only required mods -> allowed")
 check(admitted(g3, "{}") is True, "parity: empty claim vs optional + server-only required -> allowed")
@@ -207,7 +207,7 @@ with contextlib.redirect_stderr(io.StringIO()):
 reasons = {e.mod_id: e.reason for e in jp.entries}
 check(reasons.get(EXAMPLE) == "required" and reasons.get(SPLIT) == "required",
       f"plan: both parity mods required ({reasons})")
-check(HELPER in reasons, "plan: ExampleMod's pc-only dependency is pulled in for pc")
+check(HELPER in reasons, "plan: ExampleMod's client_windows-only dependency is pulled in for client_windows")
 
 print("\n== damage repair on the server side")
 victim = os.path.join(game, "Mods", SPLIT, ".server", "A.dll")
@@ -215,14 +215,14 @@ with open(victim, "wb") as f:
     f.write(b"corrupted")
 install._verify_memo.clear()     # what the Mod Manager's Refresh does; see the design doc
 check(install.verify_mod_files(game, SPLIT, "server") is False, "python sees the server build as damaged")
-check(install.verify_mod_files(game, SPLIT, "pc") is True, "python sees the pc build as intact")
+check(install.verify_mod_files(game, SPLIT, "client_windows") is True, "python sees the client_windows build as intact")
 check(harness("verify", game, SPLIT, "server").strip() == "False", "C# sees the server build as damaged")
-check(harness("verify", game, SPLIT, "pc").strip() == "True", "C# sees the pc build as intact")
+check(harness("verify", game, SPLIT, "client_windows").strip() == "True", "C# sees the client_windows build as intact")
 install._verify_memo.clear()
 cs_server_install(game, EXAMPLE, SPLIT)
-check(record(game, SPLIT) == expected("SplitMod.pc+server"), "after C# repair: record bytes still golden")
+check(record(game, SPLIT) == expected("SplitMod.client_windows+server"), "after C# repair: record bytes still golden")
 check(install.verify_mod_files(game, SPLIT, "server") is True, "after C# repair: server build verifies")
-check(install.verify_mod_files(game, SPLIT, "pc") is True, "after C# repair: pc build untouched")
+check(install.verify_mod_files(game, SPLIT, "client_windows") is True, "after C# repair: client_windows build untouched")
 
 for g in games:
     shutil.rmtree(g, ignore_errors=True)
