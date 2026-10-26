@@ -55,18 +55,31 @@ def source_label(source_repo):
     return "Modding Tavern" if _is_default(source_repo) else _source_display(source_repo)
 
 
-class ModListWindow(tk.Toplevel):
+class _Dialog(tk.Toplevel):
+    """Sets itself up around the subclass's _build; a fixed size without minsize."""
+
+    def __init__(self, parent, title, size, minsize=None):
+        super().__init__(parent)
+        self.title(title)
+        self.configure(bg=BG)
+        self.geometry(size)
+        if minsize:
+            self.minsize(*minsize)
+        else:
+            self.resizable(False, False)
+        self._build()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        _enable_dark_titlebar(self)
+        self.transient(parent)
+
+
+class ModListWindow(_Dialog):
     """What the Mod Manager and Community Mods windows share. A subclass
     builds _refresh_btn and _status in _build and provides _load, _state_ids,
     _apply_states, _read_installed and _apply_installed."""
 
     def __init__(self, parent, title, size, minsize, game_dir, target, on_change,
                  is_game_running, server_scene):
-        super().__init__(parent)
-        self.title(title)
-        self.configure(bg=BG)
-        self.geometry(size)
-        self.minsize(*minsize)
         self._game_dir = game_dir
         self._target = target
         self._on_change = on_change
@@ -75,10 +88,7 @@ class ModListWindow(tk.Toplevel):
         self._index = []
         self._rows = {}
         self._busy = False
-        self._build()
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
-        _enable_dark_titlebar(self)
-        self.transient(parent)
+        super().__init__(parent, title, size, minsize)
         self._load(force=False)
 
     def _busy_changed(self):
@@ -430,18 +440,10 @@ class CommunityModsWindow(ModListWindow):
         self._sources_win = ModSourcesWindow(self, on_change=lambda: self._load(force=True))
 
 
-class ModSourcesWindow(tk.Toplevel):
+class ModSourcesWindow(_Dialog):
     def __init__(self, parent, on_change):
-        super().__init__(parent)
-        self.title("Mod Sources")
-        self.configure(bg=BG)
-        self.geometry("520x360")
-        self.resizable(False, False)
         self._on_change = on_change
-        self._build()
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
-        _enable_dark_titlebar(self)
-        self.transient(parent)
+        super().__init__(parent, "Mod Sources", "520x360")
 
     def _build(self):
         _window_header(self, "Mod Sources")
@@ -924,28 +926,20 @@ class ModManagerWindow(ModListWindow):
                on_err=lambda e: self._finish(f"Import failed: {e}"))
 
 
-class ModVersionWindow(tk.Toplevel):
+class ModVersionWindow(_Dialog):
     """Every published version of one mod, with each one's requirements
     fetched lazily (the index doesn't carry them)."""
     _COLS   = ("version", "installed", "requires")
     _WIDTHS = (100,       80,          360)
 
     def __init__(self, parent, mod, versions, installed_version, repo_bases, on_install):
-        super().__init__(parent)
-        self.title(f"{mod.name} - Change Version")
-        self.configure(bg=BG)
-        self.geometry("580x380")
-        self.minsize(480, 260)
         self._mod = mod
         self._versions = versions
         self._installed_version = installed_version
         self._repo_bases = repo_bases
         self._on_install = on_install
         self._closed = False
-        self._build()
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
-        _enable_dark_titlebar(self)
-        self.transient(parent)
+        super().__init__(parent, f"{mod.name} - Change Version", "580x380", (480, 260))
         self._load_requires()
 
     def _build(self):
