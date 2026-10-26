@@ -1,4 +1,4 @@
-"""Community mod manager; docs/mod-manager-design.md is the map. The windows
+"""Community mod manager; formats are in TavernMods' docs/REPO_STRUCTURE.md. The windows
 live in tavern_shared.mods.ui, so importing the logic never pulls in tkinter."""
 from tavern_shared.mods.base import ModManagerError
 from tavern_shared.mods.manifest import (
