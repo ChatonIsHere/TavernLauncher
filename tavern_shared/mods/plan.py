@@ -24,7 +24,7 @@ from tavern_shared.mods.resolve import (
 )
 
 
-CLIENT_TARGET = "pc"
+CLIENT_TARGET = "client_windows"
 
 
 def _offers_client(server_entry):
@@ -73,7 +73,7 @@ class JoinPlan:
 def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=None,
               scene=None):
     """required + recommended (not declined) + their closure + pins, diffed
-    against disk and cache. Only server entries with a pc build count, and
+    against disk and cache. Only server entries with a client_windows build count, and
     everything is fetched from the client's own repos. A failure is routed by
     who asked: only a required mod can block. A pin that excludes `scene` is
     left out; mods the server runs never are."""
@@ -95,7 +95,7 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
             manifest = _fetch_manifest(repo_bases, mod_id, version,
                                        _index_source(index, mod_id, repo_bases, version))
             if manifest.artifact_for(CLIENT_TARGET) is None:
-                raise ModManagerError(f"{mod_id} {version} has no pc build.")
+                raise ModManagerError(f"{mod_id} {version} has no PC build.")
         except ModManagerError:
             if tag == "pinned":
                 unresolved_pins.append((mod_id, version))
@@ -188,7 +188,7 @@ ACTION_ENABLE      = "enable"       # right version on disk, disabled
 ACTION_DEACTIVATE  = "deactivate"   # enabled here, not in this server's set
 ACTION_MATCH       = "match"
 ACTION_SKIPPED     = "skipped"      # recommended, declined for this server
-ACTION_SERVER_ONLY = "server-only"  # no pc build
+ACTION_SERVER_ONLY = "server-only"  # no client_windows build
 ACTION_MISSING     = "missing"      # in no configured repo
 ACTION_NEEDS_REPO  = "needs-repo"   # only in a repo not added here
 
