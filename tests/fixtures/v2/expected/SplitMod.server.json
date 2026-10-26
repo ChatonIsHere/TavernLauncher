@@ -1,0 +1,43 @@
+{
+  "manifest_version": 2,
+  "id": "ExampleDev.SplitMod",
+  "name": "Split Mod",
+  "version": "1.0.0",
+  "author": "ExampleDev",
+  "description": "different pc and server builds",
+  "parity_required": true,
+  "dependencies": {},
+  "artifacts": [
+    {
+      "targets": [
+        "server"
+      ],
+      "download_url": "http://127.0.0.1:8765/files/SplitMod-server.zip",
+      "sha256": "12ca0d504ef57f3f75ca870727c4992f091338f662dfb31b79ecb0e82e67c0ad",
+      "package": "zip",
+      "library_dependencies": []
+    },
+    {
+      "targets": [
+        "pc"
+      ],
+      "download_url": "http://127.0.0.1:8765/files/SplitMod-pc.dll",
+      "sha256": "ef3a4c44d89fa2bf1c8dceb5cad500586283d6c2217533b5503deed210a41525",
+      "package": "dll",
+      "library_dependencies": []
+    }
+  ],
+  "source_repo": "http://127.0.0.1:8765",
+  "installed": {
+    "server": {
+      "sha256": "12ca0d504ef57f3f75ca870727c4992f091338f662dfb31b79ecb0e82e67c0ad",
+      "libraries": [],
+      "files": {
+        "A.dll": "91c660c6be5fbaf1fd718e268bcc2bd41be553f9612f50a7d56c89d0edb1a774",
+        "Assets/bundle.bin": "b413f47d13ee2fe6c845b2ee141af81de858df4ec549a58b7970bb96645bc8d2",
+        "B.dll": "6c72dc635497edf52d85ee18fd742456ffe06c2802d67b94d5fda6d32ba3802b",
+        "a/x.txt": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
+      }
+    }
+  }
+}

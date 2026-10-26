@@ -1,0 +1,54 @@
+{
+  "index_version": 2,
+  "mods": {
+    "ExampleDev.ExampleMod": {
+      "1": {
+        "name": "Example Mod",
+        "author": "ExampleDev",
+        "description": "Ünïcödé ✓ check",
+        "parity_required": true,
+        "targets": [
+          "pc",
+          "quest",
+          "server"
+        ],
+        "scenes": [
+          "normal",
+          "quest"
+        ],
+        "versions": [
+          "1.2.0"
+        ]
+      }
+    },
+    "ExampleDev.PcHelper": {
+      "1": {
+        "name": "PC Helper",
+        "author": "ExampleDev",
+        "description": "pc only",
+        "parity_required": false,
+        "targets": [
+          "pc"
+        ],
+        "versions": [
+          "1.0.0"
+        ]
+      }
+    },
+    "ExampleDev.SplitMod": {
+      "1": {
+        "name": "Split Mod",
+        "author": "ExampleDev",
+        "description": "different pc and server builds",
+        "parity_required": true,
+        "targets": [
+          "pc",
+          "server"
+        ],
+        "versions": [
+          "1.0.0"
+        ]
+      }
+    }
+  }
+}
