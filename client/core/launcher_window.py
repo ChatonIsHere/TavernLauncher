@@ -1,9 +1,9 @@
 """
 The main Client launcher window -- username/platform/destination fields,
-Setup/Mod Manager buttons, Check/Join Server, and the game log panel.
-_do_launch calls run_post_auth_hooks() unconditionally, so an addon that
-needs to act after auth (asset syncing, say) registers there rather than
-being hardcoded here.
+Setup/Mod Manager buttons, Check/Join Server, and the game log panel. Custom
+asset syncing is NOT hardcoded here anymore: _do_launch calls
+run_post_auth_hooks() unconditionally, and addons/custom_models/client.py
+is what actually does anything at that point, if it's part of this build.
 """
 import os
 import sys
