@@ -11,7 +11,7 @@ from tavern_shared.mods.layout import _safe_basename
 
 
 SUPPORTED_MANIFEST_MAJOR = 2
-TARGETS = ("pc", "server", "quest")
+TARGETS = ("client_windows", "server", "client_android")
 PACKAGES = ("dll", "zip")
 SCENES = ("normal", "quest", "tutorial")
 # Compiled-manifest key order, which the install record keeps.

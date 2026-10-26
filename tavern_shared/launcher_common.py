@@ -31,7 +31,7 @@ def count_mods_needing_attention(game_dir, target):
 
 class LauncherCommon:
     """Needs v_exe and _print on the window."""
-    MOD_TARGET = "pc"
+    MOD_TARGET = "client_windows"
     _setup_needs_attention = False
     _setup_win = None
     _mod_manager_win = None
