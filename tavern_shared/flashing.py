@@ -4,16 +4,17 @@ def start_flashing_button(widget, should_flash, normal_bg, alert_bg, interval_ms
     should_flash() on every tick, so it starts/stops on its own as
     conditions change -- nothing else needs to explicitly turn it off.
     """
-    state = {"on": False, "bg": None}
+    state = {"on": False}
 
     def _tick():
         if not widget.winfo_exists():
             return
-        state["on"] = not state["on"] if should_flash() else False
-        bg = alert_bg if state["on"] else normal_bg
-        if bg != state["bg"]:
-            widget.config(bg=bg)
-            state["bg"] = bg
+        if should_flash():
+            state["on"] = not state["on"]
+            widget.config(bg=(alert_bg if state["on"] else normal_bg))
+        else:
+            state["on"] = False
+            widget.config(bg=normal_bg)
         widget.after(interval_ms, _tick)
 
     _tick()

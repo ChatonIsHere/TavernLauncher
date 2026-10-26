@@ -29,10 +29,8 @@ def _patch_target_path(game_exe):
 
 
 def _patch_local_state(game_exe):
-    """Root.Township.dll always exists in an unmodified game, so presence
-    proves nothing: with no recorded hash it's the vanilla DLL, 'missing'
-    (never patched) rather than 'unrecorded'. 'missing' alerts
-    unconditionally; that difference has to survive."""
+    """Root.Township.dll exists in every game, so with no recorded hash it's
+    the vanilla DLL: 'missing', which alerts, not 'unrecorded'."""
     meta = _load_mod_meta(os.path.dirname(game_exe))
     dst = _patch_target_path(game_exe)
     return meta, _local_state(
@@ -41,24 +39,17 @@ def _patch_local_state(game_exe):
 
 
 def _patch_status(game_exe):
-    """The same states as _melonloader_status/_tavernlib_status, read from
-    the hash apply_patch last confirmed writing, recorded in the game dir's
-    meta file so either launcher sees the other's patch."""
     meta, state = _patch_local_state(game_exe)
     return state or _remote_state(
         lambda: _fetch_remote_fingerprint(PATCH_DOWNLOAD_URL), meta["patch_fingerprint"])
 
 
 def _patch_needs_attention(game_exe):
-    """Whether the patch state should flash the Setup alert, by the rule
-    _mods_need_attention applies to MelonLoader/TavernLib."""
     return _patch_status(game_exe) in NEEDS_ATTENTION
 
 
 def apply_patch(game_exe, on_progress=None):
-    """Installs the latest themoddingtavern.dll as Root.Township.dll
-    (_install_dll_component), skipping the write if it's already that file.
-    Returns "downloaded" or "current"."""
+    """Returns "downloaded" or "current"."""
     if on_progress is None:
         on_progress = lambda msg: None
 

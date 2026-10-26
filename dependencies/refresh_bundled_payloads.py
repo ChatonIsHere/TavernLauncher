@@ -1,10 +1,6 @@
-"""Re-cuts Patch/ from the current published release of each Setup payload,
-and rewrites Patch/bundled.json to describe exactly what it fetched.
-
-Run at build time (BUILD_EXECUTABLES.bat does), so the offline fallback is as
-current as the build. Fetches through the launcher's own download, tag and
-payload-type helpers, so what ships passed the same checks a user's install
-would."""
+"""Re-cuts Patch/ and Patch/bundled.json from each Setup payload's current
+release, through the launcher's own download checks. Run by
+BUILD_EXECUTABLES.bat."""
 import json
 import os
 import sys
@@ -28,15 +24,9 @@ TARGETS = [
 ]
 
 
-def _quiet(message):
-    """Swallows per-chunk progress; failures raise instead."""
-
-
 def refresh():
-    """Downloads every target to a temp file beside its destination, verifies
-    it, and only once all of them have succeeded swaps them in and rewrites
-    bundled.json. Any failure leaves Patch/ exactly as it was, still matching
-    the manifest that describes it."""
+    """Swaps nothing in until every download has succeeded, so a failure
+    leaves Patch/ matching its bundled.json."""
     dest_dir = bundled_dir()
     os.makedirs(dest_dir, exist_ok=True)
     manifest, staged = {}, []
@@ -44,13 +34,12 @@ def refresh():
         for component, url, filename, kind, extra in TARGETS:
             tag = _get_latest_release_tag(url)
             if not tag:
-                # usable_payload can't order an untagged payload, so it would
-                # never be used: dead weight that looks like a fallback.
+                # usable_payload could never use an untagged payload.
                 raise RuntimeError(f"Couldn't resolve the release tag for {component} from {url}")
             fd, tmp = tempfile.mkstemp(prefix=f".{filename}.", suffix=".part", dir=dest_dir)
             os.close(fd)
             staged.append((tmp, os.path.join(dest_dir, filename)))
-            _download_with_retries(url, tmp, _quiet, require_length=True)
+            _download_with_retries(url, tmp, lambda _m: None)
             _verify_payload_type(tmp, url, kind)
             manifest[component] = dict(
                 filename=filename, tag=tag, sha256=_sha256_file(tmp),
@@ -77,8 +66,6 @@ if __name__ == "__main__":
     try:
         refresh()
     except Exception as e:
-        # Non-fatal: a failed refresh leaves Patch/ untouched and consistent
-        # with bundled.json, just older. The caller decides on the exit code.
         print(f"  [WARN] Couldn't refresh the bundled payloads: {e}")
         print("  [WARN] Building with whatever Patch/ already contains.")
         sys.exit(1)

@@ -1,30 +1,20 @@
-"""Asks "is the game holding these files open?" before the launcher writes into
-the game folder. Windows keeps loaded assemblies locked, so a write while the
-game runs fails partway with a raw PermissionError; asking first, while
-nothing has been touched, is the fix. The only signal is the process this
-launcher started, so a game launched some other way isn't detected, and the
-prompt can be overridden ("Try anyway?") rather than hard-blocking."""
+"""Asks before writing into a game folder the running game has locked. Only
+a game this launcher started is detected, so the prompt can be overridden."""
 from tkinter import messagebox
 
 
 def game_is_running(proc):
-    """True while `proc` (a subprocess.Popen, or None) is still alive."""
     return bool(proc and proc.poll() is None)
 
 
 def any_game_running(procs):
-    """True while any of `procs` is alive, pruning exited ones in place. A list,
-    because an overridden prompt can start a second copy while the first still
-    holds files."""
+    """Prunes exited processes from `procs` in place."""
     procs[:] = [p for p in procs if game_is_running(p)]
     return bool(procs)
 
 
 def confirm_while_game_running(parent, is_game_running, action):
-    """Whether `action` (e.g. "Installing a mod") should go ahead: True at once
-    when there's no check or the game isn't running, else a prompt that
-    defaults to no. The server launcher passes no check (see its
-    _on_mods_changed)."""
+    """Whether `action` should go ahead; the server launcher passes no check."""
     if not is_game_running or not is_game_running():
         return True
     return messagebox.askyesno(

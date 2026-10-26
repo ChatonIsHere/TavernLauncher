@@ -22,7 +22,6 @@ dist/
 .eggs/
 pip-wheel-metadata/
 MANIFEST
-*.spec
 
 # Test and coverage data
 .pytest_cache/
