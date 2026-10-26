@@ -564,22 +564,19 @@ def _owned_mod_record(game_dir, mod_id):
     return found[0] if found else None
 
 
-def disable_mod(game_dir, mod_id):
-    """Returns False if nothing was enabled."""
-    src = _mod_record_path(game_dir, mod_id)
+def _rename(src, dest):
     if not os.path.isfile(src):
         return False
-    os.replace(src, _disabled_record_path(game_dir, mod_id))
+    os.replace(src, dest)
     return True
+
+
+def disable_mod(game_dir, mod_id):
+    return _rename(_mod_record_path(game_dir, mod_id), _disabled_record_path(game_dir, mod_id))
 
 
 def enable_mod(game_dir, mod_id):
-    """Returns False if nothing was disabled."""
-    src = _disabled_record_path(game_dir, mod_id)
-    if not os.path.isfile(src):
-        return False
-    os.replace(src, _mod_record_path(game_dir, mod_id))
-    return True
+    return _rename(_disabled_record_path(game_dir, mod_id), _mod_record_path(game_dir, mod_id))
 
 
 def mod_status(game_dir, mod_id, index, target):
@@ -606,16 +603,19 @@ def mod_status(game_dir, mod_id, index, target):
     return "current" if installed >= highest else "outdated"
 
 
-def list_mods(index, target):
-    """One row per id (its highest major) with a `target` build, by name."""
+def _highest_by_id(summaries):
     best = {}
-    for s in index:
-        if target not in s.targets:
-            continue
+    for s in summaries:
         cur = best.get(s.id)
         if cur is None or _parse_version(s.highest()) > _parse_version(cur.highest()):
             best[s.id] = s
-    return sorted(best.values(), key=lambda s: s.name.lower())
+    return best
+
+
+def list_mods(index, target):
+    """One row per id (its highest major) with a `target` build, by name."""
+    return sorted(_highest_by_id(s for s in index if target in s.targets).values(),
+                  key=lambda s: s.name.lower())
 
 
 def _scan_mods(game_dir):
@@ -661,13 +661,10 @@ def list_untracked_mods(game_dir):
 
 def _move_untracked_dll(src, dest):
     # Refuses rather than clobber, as TavernLib's DisableUntrackedDll does.
-    if not os.path.isfile(src):
-        return False
-    if os.path.exists(dest):
+    if os.path.isfile(src) and os.path.exists(dest):
         raise ModManagerError(f"{os.path.basename(dest)!r} already exists; "
                               f"remove or rename it first.")
-    os.replace(src, dest)
-    return True
+    return _rename(src, dest)
 
 
 def disable_untracked_dll(game_dir, filename):

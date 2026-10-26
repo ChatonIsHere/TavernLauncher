@@ -31,19 +31,17 @@ def parity_required(d):
     """Read off a manifest, record, index or handshake entry. Absent or not a
     real boolean raises rather than defaults, as TavernLib's
     ModParityField.Read does."""
+    meaning = ("true if a client joining a server running this mod must have this "
+               "exact version, false if the server shouldn't block the join over it")
     if "parity_required" not in d:
         raise ModManagerError(
             f"'{d.get('id', '?')}' has no parity_required field. It's required: "
-            f"true if a client joining a server running this mod must have this "
-            f"exact version, false if the server shouldn't block the join over "
-            f"it. A mod installed before this field existed needs reinstalling.")
+            f"{meaning}. A mod installed before this field existed needs reinstalling.")
     value = d["parity_required"]
     if not isinstance(value, bool):
         raise ModManagerError(
             f"'{d.get('id', '?')}' has a parity_required of {value!r}, which "
-            f"isn't true or false. It must be a real boolean: true if a client "
-            f"joining a server running this mod must have this exact version, "
-            f"false if the server shouldn't block the join over it.")
+            f"isn't true or false. It must be a real boolean: {meaning}.")
     return value
 
 
