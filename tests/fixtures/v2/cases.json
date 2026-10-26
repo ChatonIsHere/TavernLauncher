@@ -1,0 +1,43 @@
+{
+  "base_url": "http://127.0.0.1:8765",
+  "cases": {
+    "ExampleMod.pc": {
+      "id": "ExampleDev.ExampleMod",
+      "targets": [
+        "pc"
+      ]
+    },
+    "ExampleMod.server": {
+      "id": "ExampleDev.ExampleMod",
+      "targets": [
+        "server"
+      ]
+    },
+    "ExampleMod.pc+server": {
+      "id": "ExampleDev.ExampleMod",
+      "targets": [
+        "pc",
+        "server"
+      ]
+    },
+    "PcHelper.pc": {
+      "id": "ExampleDev.PcHelper",
+      "targets": [
+        "pc"
+      ]
+    },
+    "SplitMod.pc+server": {
+      "id": "ExampleDev.SplitMod",
+      "targets": [
+        "pc",
+        "server"
+      ]
+    },
+    "SplitMod.server": {
+      "id": "ExampleDev.SplitMod",
+      "targets": [
+        "server"
+      ]
+    }
+  }
+}
