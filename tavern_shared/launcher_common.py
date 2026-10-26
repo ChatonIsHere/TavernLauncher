@@ -4,6 +4,7 @@ import os
 from tkinter import messagebox
 
 from tavern_shared.bg import post, run_bg
+from tavern_shared.flashing import start_flashing_button
 from tavern_shared.mod_install import NEEDS_ATTENTION, _mods_need_attention
 from tavern_shared.mods.base import load_cfg
 from tavern_shared.mods.install import list_installed_mods, mod_status
@@ -11,6 +12,7 @@ from tavern_shared.mods.repos import fetch_indexes, list_repos
 from tavern_shared.mods.ui import ModManagerWindow, record_matches_target
 from tavern_shared.mods_window import SetupWindow
 from tavern_shared.patch import _patch_needs_attention
+from tavern_shared.theme import SURF2, _btn
 
 
 def count_mods_needing_attention(game_dir, target):
@@ -28,17 +30,24 @@ def count_mods_needing_attention(game_dir, target):
 
 
 class LauncherCommon:
-    """Needs v_exe, _setup_btn, _mod_manager_btn and _print on the window, and
-    _init_launcher_common() called before the buttons are built."""
+    """Needs v_exe and _print on the window."""
     MOD_TARGET = "pc"
+    _setup_needs_attention = False
+    _setup_win = None
+    _mod_manager_win = None
+    _exe_check_job = None
+    _alert_running = False
+    _alert_pending = None   # (rank, kwargs) of a refresh asked for mid-run
 
-    def _init_launcher_common(self):
-        self._setup_needs_attention = False
-        self._setup_win = None
-        self._mod_manager_win = None
-        self._exe_check_job = None
-        self._alert_running = False
-        self._alert_pending = None   # (rank, kwargs) of a refresh asked for mid-run
+    def _build_mod_buttons(self, row):
+        self._setup_btn = _btn(row, "🛠 Setup", self._open_setup,
+             font=("Segoe UI",9), pady=5, padx=10)
+        self._setup_btn.pack(side="left")
+        start_flashing_button(self._setup_btn,
+            lambda: self._setup_needs_attention, normal_bg=SURF2, alert_bg="#5a3d0e")
+        self._mod_manager_btn = _btn(row, "📦 Mod Manager", self._open_mod_manager,
+             font=("Segoe UI",9), pady=5, padx=10)
+        self._mod_manager_btn.pack(side="left", padx=(6,0))
 
     # ── Hooks ────────────────────────────────────────────────────────────────
 

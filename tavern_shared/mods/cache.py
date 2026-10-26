@@ -65,21 +65,17 @@ def _prune_mod_cache(mod_id, keep):
 
 
 def cache_store_mod(game_dir, mod_id, target):
-    """Caches an intact Mods/<id>/.<target>/ unless already cached. Returns
-    the version, or None if not installed or damaged."""
+    """Caches an intact Mods/<id>/.<target>/; returns whether it was new."""
     rec = _read_mod_record(game_dir, mod_id)
     entry = _installed_entry(rec, target)
     if not rec or not rec.get("version") or not entry:
-        return None
+        return False
     sha256 = str(entry.get("sha256", "")).lower()
     if not _SHA256.fullmatch(sha256):
-        return None
-    version = rec["version"]
-    dest = _cache_mod_dir(mod_id, version, sha256)
-    if os.path.isdir(dest):
-        return version
-    if verify_mod_files(game_dir, mod_id, target) is False:
-        return None
+        return False
+    dest = _cache_mod_dir(mod_id, rec["version"], sha256)
+    if os.path.isdir(dest) or verify_mod_files(game_dir, mod_id, target) is False:
+        return False
 
     staging = dest + ".caching"
     shutil.rmtree(staging, ignore_errors=True)
@@ -91,7 +87,7 @@ def cache_store_mod(game_dir, mod_id, target):
     now = time.time_ns()
     os.utime(dest, ns=(now, now))
     _prune_mod_cache(mod_id, dest)
-    return version
+    return True
 
 
 def cache_store_library(game_dir, filename):
@@ -127,10 +123,7 @@ def adopt_installed_mods(game_dir, target):
         entry = _installed_entry(rec, target)
         if not rec.get("version") or not entry:
             continue
-        sha256 = str(entry.get("sha256", "")).lower()
-        already_cached = bool(_SHA256.fullmatch(sha256)) and os.path.isdir(
-            _cache_mod_dir(rec["id"], rec["version"], sha256))
-        if cache_store_mod(game_dir, rec["id"], target) and not already_cached:
+        if cache_store_mod(game_dir, rec["id"], target):
             adopted.append(rec["id"])
         for filename in entry.get("libraries") or []:
             cache_store_library(game_dir, filename)

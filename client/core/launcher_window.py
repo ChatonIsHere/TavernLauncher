@@ -100,7 +100,6 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         # at all. Manually typed IPs and Saved/Recent selections always reset
         # this back to "official", matching how they've always behaved.
         self._selected_kind = "official"
-        self._init_launcher_common()
         self._mods_list_cache = {}    # host -> (mods_hash, mods, untracked)
         self._server_untracked = []
         # Every game started: the running-game guard can be overridden.
@@ -139,14 +138,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
              padx=10, pady=6).pack(side="right")
         btn_row_mods = tk.Frame(self, bg=BG)
         btn_row_mods.pack(fill="x", padx=20, pady=(4,0))
-        self._setup_btn = _btn(btn_row_mods, "🛠 Setup", self._open_setup,
-             font=("Segoe UI",9), pady=5, padx=10)
-        self._setup_btn.pack(side="left")
-        start_flashing_button(self._setup_btn,
-            lambda: self._setup_needs_attention, normal_bg=SURF2, alert_bg="#5a3d0e")
-        self._mod_manager_btn = _btn(btn_row_mods, "📦 Mod Manager",
-             self._open_mod_manager, font=("Segoe UI",9), pady=5, padx=10)
-        self._mod_manager_btn.pack(side="left", padx=(6,0))
+        self._build_mod_buttons(btn_row_mods)
         _btn(btn_row_mods, "🎮 Game Settings", self._open_game_settings,
              font=("Segoe UI",9), pady=5, padx=10).pack(side="right")
 

@@ -166,23 +166,12 @@ class CommunityModsWindow(ModListWindow):
 
     _COL_LABELS = ("Status", "Author", "Mod", "Installed", "Latest", "Source")
     _WIDTHS     = (90,       110,      160,   74,          64,       110)
-    _STATE_WORD = {
-        "missing":  "Available",
-        "damaged":  "Damaged",
-        "current":  "Installed",
-        "outdated": "Update ready",
-        "unknown":  "Installed",
-    }
-    _STATE_COLOR = {
-        "missing": PARCH, "damaged": RED, "current": GREEN,
-        "outdated": AMBER, "unknown": MUTED,
-    }
-    _PRIMARY_LABEL = {
-        "missing":  "Install",
-        "damaged":  "Reinstall",
-        "outdated": "Update",
-        "current":  "Reinstall",
-        "unknown":  "Reinstall",
+    _STATE_STYLE = {    # state -> (status, its colour, button)
+        "missing":  ("Available",    PARCH, "Install"),
+        "damaged":  ("Damaged",      RED,   "Reinstall"),
+        "current":  ("Installed",    GREEN, "Reinstall"),
+        "outdated": ("Update ready", AMBER, "Update"),
+        "unknown":  ("Installed",    MUTED, "Reinstall"),
     }
 
     def __init__(self, parent, game_dir, target, on_change, is_game_running, server_scene):
@@ -360,12 +349,10 @@ class CommunityModsWindow(ModListWindow):
         self._apply_card_state(mod_id)
 
     def _apply_card_state(self, mod_id):
-        state = self._rows[mod_id]["state"]
+        word, color, label = self._STATE_STYLE[self._rows[mod_id]["state"]]
         w = self._card_widgets[mod_id]
-        w["status_lbl"].config(text=self._STATE_WORD.get(state, ""),
-                               fg=self._STATE_COLOR.get(state, MUTED))
-        w["btn"].config(text=self._PRIMARY_LABEL.get(state, "Install"),
-                        state="disabled" if self._busy else "normal")
+        w["status_lbl"].config(text=word, fg=color)
+        w["btn"].config(text=label, state="disabled" if self._busy else "normal")
 
     def _busy_changed(self):
         for mod_id in self._card_widgets:
