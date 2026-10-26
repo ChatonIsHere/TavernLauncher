@@ -205,7 +205,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         self._sync_btn = _btn(check_row, "⇄ Sync Mods", self._on_sync_mods,
                               font=("Segoe UI",9), pady=4, padx=10)
 
-        # Check Server, Join Server, and Main Menu sit side by side.
+        # Check Server, Join Server, and Menu Menu sit side by side.
         # Checking is purely optional/informational now, never a gate on joining.
         action_row = tk.Frame(self, bg=BG)
         action_row.pack(fill="x", padx=20, pady=(0,4))
@@ -478,8 +478,8 @@ class ClientLauncher(LauncherCommon, tk.Tk):
                 _updater.download_and_apply_update(url, UPDATE_APP_FOLDER,
                     on_progress=lambda m: self.after(0, lambda: self._print(m, "warn")))
                 # download_and_apply_update relaunches and calls os._exit()
-                # on success; anything it raises comes before the installed
-                # copy is touched.
+                # on success — if we get here at all, something went wrong
+                # after the point of no return.
             except Exception as e:
                 self.after(0, lambda e=e: messagebox.showerror("Update failed",
                     f"Couldn't apply the update:\n{e}\n\n"

@@ -370,8 +370,8 @@ class ServerLauncher(LauncherCommon, tk.Tk):
                 _updater.download_and_apply_update(url, UPDATE_APP_FOLDER,
                     on_progress=lambda m: self.after(0, lambda: self._print(m, "warn")))
                 # download_and_apply_update relaunches and calls os._exit()
-                # on success; anything it raises comes before the installed
-                # copy is touched.
+                # on success — if we get here at all, something went wrong
+                # after the point of no return.
             except Exception as e:
                 self.after(0, lambda e=e: messagebox.showerror("Update failed",
                     f"Couldn't apply the update:\n{e}\n\n"
