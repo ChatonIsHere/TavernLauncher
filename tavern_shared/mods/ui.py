@@ -39,7 +39,7 @@ def record_matches_target(rec, target):
     return has_target(rec, target) or _is_pre_v2(rec)
 
 
-_TARGET_NAMES = {"client_windows": "PC", "server": "Server", "client_android": "Quest"}
+_TARGET_NAMES = {"client_windows": "Windows", "server": "Server", "client_android": "Android"}
 
 
 def target_label(targets):
