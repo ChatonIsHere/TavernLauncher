@@ -10,8 +10,8 @@ from tavern_shared.theme import (
 from tavern_shared.window_chrome import _enable_dark_titlebar
 
 from tavern_shared.mods.cache import clear_mod_cache
-from tavern_shared.mods.errors import ModManagerError
-from tavern_shared.mods.hostcfg import load_cfg
+from tavern_shared.mods.base import ModManagerError
+from tavern_shared.mods.base import load_cfg
 from tavern_shared.mods.install import list_installed_mods, list_mods
 from tavern_shared.mods.repos import fetch_indexes, list_repos
 from tavern_shared.mods.resolve import resolve_mod_by_id

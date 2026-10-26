@@ -48,9 +48,9 @@ def _write_error_log(err_text):
 # Tell the mod manager which config file it is working against. Done before
 # addons load, since an enabled addon may reach for mod state as it registers,
 # and certainly before any window is built.
-from tavern_shared.mods import hostcfg as _mods_hostcfg
+from tavern_shared.mods import base as _mods_base
 from client.core.config import load_cfg as _load_cfg, save_cfg as _save_cfg
-_mods_hostcfg.set_config_accessors(_load_cfg, _save_cfg)
+_mods_base.set_config_accessors(_load_cfg, _save_cfg)
 
 from client.core import addon_loader
 addon_loader.load_enabled_addons("client", _write_error_log)

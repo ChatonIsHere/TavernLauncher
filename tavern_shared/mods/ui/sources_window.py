@@ -9,7 +9,7 @@ from tavern_shared.theme import (
 )
 from tavern_shared.window_chrome import _enable_dark_titlebar
 
-from tavern_shared.mods.hostcfg import load_cfg
+from tavern_shared.mods.base import load_cfg
 from tavern_shared.mods.repos import (
     _is_default, _source_display, add_repo, list_repos, remove_repo,
 )

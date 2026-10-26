@@ -7,7 +7,7 @@ from tavern_shared.theme import (
 )
 from tavern_shared.window_chrome import _enable_dark_titlebar
 
-from tavern_shared.mods.errors import ModManagerError
+from tavern_shared.mods.base import ModManagerError
 from tavern_shared.mods.resolve import _fetch_manifest
 
 

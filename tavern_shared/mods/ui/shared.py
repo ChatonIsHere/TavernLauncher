@@ -11,7 +11,7 @@ from tavern_shared.game_guard import confirm_while_game_running
 from tavern_shared.mod_install import (
     _melonloader_installed, _tavernlib_installed,
 )
-from tavern_shared.mods.hostcfg import load_cfg
+from tavern_shared.mods.base import load_cfg
 from tavern_shared.mods.install import (
     _is_pre_v2, has_target, install_mod_closure, mod_status,
 )
