@@ -1,7 +1,5 @@
-"""What the client and server launchers' main windows share around the game
-folder: the Setup and Mod Manager buttons, the Setup alert and Mod Manager
-badge behind them, and the partial-update report. Mixed into ClientLauncher
-and ServerLauncher, which differ only in their mod target and the hooks below."""
+"""The Setup and Mod Manager buttons, their alert and badge, and the
+partial-update report, mixed into both launchers' main windows."""
 import os
 from tkinter import messagebox
 
@@ -16,9 +14,7 @@ from tavern_shared.patch import _patch_needs_attention
 
 
 def count_mods_needing_attention(game_dir, target):
-    """How many of this launcher's installed community mods (`target`
-    builds) are outdated or damaged. 0 on any failure, so a network blip never decorates the button
-    with a false alarm. Hits the network and hashes files: workers only."""
+    """Outdated or damaged community mods; 0 on any failure. Workers only."""
     try:
         installed = [r for r in list_installed_mods(game_dir)
                      if record_matches_target(r, target)]
@@ -34,10 +30,9 @@ def count_mods_needing_attention(game_dir, target):
 class LauncherCommon:
     """Needs v_exe, _setup_btn, _mod_manager_btn and _print on the window, and
     _init_launcher_common() called before the buttons are built."""
-    MOD_TARGET = "pc"           # the build this launcher installs; the server's is "server"
+    MOD_TARGET = "pc"
 
     def _init_launcher_common(self):
-        # Read every tick by start_flashing_button; written only on the Tk thread.
         self._setup_needs_attention = False
         self._setup_win = None
         self._mod_manager_win = None
@@ -54,8 +49,7 @@ class LauncherCommon:
         return {}
 
     def _alert_probe(self, game_dir):
-        """A cheap extra disk check run on the alert's worker; its result goes
-        to _alert_probe_done on the Tk thread (None when there's no game)."""
+        """Run on the alert's worker; the result goes to _alert_probe_done."""
         return None
 
     def _alert_probe_done(self, result):
@@ -84,11 +78,6 @@ class LauncherCommon:
         self._exe_check_job = self.after(800, self._refresh_tool_states)
 
     def _refresh_tool_states(self):
-        """Enables/disables the Setup and Mod Manager buttons based on whether
-        a valid game exe is selected, then separately refreshes the Setup
-        button's flashing-alert condition. State is only ever touched here, and
-        start_flashing_button only ever touches bg — kept deliberately separate
-        so neither path can clobber the other."""
         state = "normal" if self._game_exe() else "disabled"
         for btn in (self._setup_btn, self._mod_manager_btn):
             try: btn.config(state=state)
@@ -96,15 +85,10 @@ class LauncherCommon:
         self._refresh_setup_alert()
 
     def _refresh_setup_alert(self, states=None, components=True):
-        """Refreshes the Setup alert (patch, MelonLoader or TavernLib missing,
-        outdated or damaged), the Mod Manager badge and _alert_probe on a
-        worker. states are the component states Setup just checked, used
-        instead of checking again; components=False keeps the alert as it is
-        and refreshes only the rest.
-
-        One refresh runs at a time. Requests made meanwhile collapse into one
-        follow-up, the most thorough of them (a full check, then states, then
-        badge only)."""
+        """Refreshes the Setup alert, the Mod Manager badge and _alert_probe on
+        a worker; `states` are Setup's just-checked ones, and components=False
+        leaves the alert alone. Requests during a refresh collapse into one
+        follow-up, the most thorough of them."""
         rank = 2 if components and states is None else 1 if components else 0
         if self._alert_running:
             if self._alert_pending is None or rank >= self._alert_pending[0]:
@@ -127,8 +111,6 @@ class LauncherCommon:
                     if states:
                         need = any(s in NEEDS_ATTENTION for s in states.values())
                     else:
-                        # The patch is judged by the same rule as the other
-                        # two, and a failed update check never false-alarms.
                         need = _mods_need_attention(game_dir) or _patch_needs_attention(exe)
                 except Exception:
                     need = False
@@ -141,9 +123,8 @@ class LauncherCommon:
             self._set_mod_manager_badge(badge)
             self._alert_finished()
 
-        # Started from the event loop: the first refresh is asked for during
-        # __init__, and Tkinter drops a worker's hand-back if mainloop hasn't
-        # started within a second of it.
+        # Via the event loop: Tkinter drops a worker's hand-back if mainloop
+        # hasn't started within about a second, and the first is from __init__.
         self.after(0, lambda: run_bg(self, check, on_ok=done,
                                      on_err=lambda e: self._alert_finished()))
 
@@ -174,7 +155,7 @@ class LauncherCommon:
 
     def _on_setup_installed(self):
         self._mods_written()
-        # An open Setup re-checks and reports its states itself.
+        # An open Setup reports its own re-check.
         if not (self._setup_win and self._setup_win.winfo_exists()):
             self._refresh_setup_alert()
 
@@ -184,8 +165,6 @@ class LauncherCommon:
             return
         if self._mod_manager_win and self._mod_manager_win.winfo_exists():
             self._mod_manager_win.lift(); return
-        # Browsing is harmless while the game runs, so the window opens either
-        # way; the guard is on the actions that actually write.
         self._mod_manager_win = ModManagerWindow(
             self, os.path.dirname(exe), target=self.MOD_TARGET,
             on_change=self._on_mod_manager_change, **self._mod_manager_kwargs())
@@ -197,8 +176,6 @@ class LauncherCommon:
     # ── Updates ──────────────────────────────────────────────────────────────
 
     def _report_partial_update(self, updater):
-        """Shows the report the updater's staging process left behind when it
-        couldn't replace every file (see updater.read_partial_update_marker)."""
         if updater is None:
             return
         marker = updater.read_partial_update_marker()
