@@ -127,10 +127,8 @@ def build_server_tokens():
     return a, r, i
 
 
-# handshake_snapshot reads every record in Mods/ and is asked for on every
-# ping, so it's cached briefly per game folder (TavernLib's handshake does the
-# same with the same TTL). The generation stops a snapshot that started before
-# an invalidation from being stored after it.
+# Cached per game folder for every ping, as TavernLib's handshake does. The
+# generation stops a snapshot taken before an invalidation being stored after.
 _SNAPSHOT_TTL = 5.0
 _snapshot_lock = threading.Lock()
 _snapshot_cache = {}       # game_dir -> (taken_at, snapshot)
@@ -152,7 +150,6 @@ def _mods_snapshot(game_dir):
 
 
 def invalidate_mods_snapshot():
-    """Call after anything changes Mods/, so the next ping reads it afresh."""
     global _snapshot_generation
     with _snapshot_lock:
         _snapshot_generation += 1
@@ -160,10 +157,7 @@ def invalidate_mods_snapshot():
 
 
 def _send_framed(conn, obj):
-    """Length-prefixed write: a 4-byte big-endian byte count, then the JSON
-    body. Used only for responses that can genuinely grow past a single
-    recv's buffer (the full mods list); everything else here still fits the
-    plain single-recv exchange the rest of this protocol relies on."""
+    """A 4-byte big-endian length, then the JSON body."""
     body = json.dumps(obj).encode()
     conn.sendall(len(body).to_bytes(4, "big") + body)
 
@@ -206,18 +200,13 @@ def _handle_auth(conn, addr, log_fn, get_game_dir):
             conn.sendall(json.dumps(resp).encode())
             return
 
-        # ── full mod list, only sent on request (a client's mods_hash cache
-        # miss, or right before a join). Length-prefixed, since a mods list
-        # can outgrow a single recv unlike everything else on this port ──
+        # ── full mod list: framed, since it can outgrow a single recv ──
         if req.get("mods_list"):
             try:
                 game_dir = get_game_dir()
                 if not game_dir:
                     raise RuntimeError("this server has no game folder set")
                 _, _, mods_list, untracked = _mods_snapshot(game_dir)
-                # "untracked" is additive and advisory: a client too old to know
-                # the key ignores it and joins exactly as before, which is the
-                # right outcome for something that never blocks a join anyway.
                 _send_framed(conn, {"status": "ok", "mods": mods_list,
                                     "untracked": untracked})
             except Exception as e:
@@ -403,8 +392,7 @@ def _handle_auth(conn, addr, log_fn, get_game_dir):
 
 
 def start_auth_service(log_fn, get_game_dir, port=AUTH_PORT):
-    """get_game_dir() is the folder whose Mods/ the handshake describes, asked
-    per request so it follows the server to a different install."""
+    """get_game_dir() is asked per request, so it follows a changed install."""
     def serve():
         try:
             s = socket.socket()
