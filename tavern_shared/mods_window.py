@@ -23,12 +23,8 @@ from tavern_shared.mod_install import (
 )
 
 class SetupWindow(tk.Toplevel):
-    """Patch, MelonLoader, TavernLib, in that order — the fixed sequence
-    everything else in the launcher depends on. Each step's button stays
-    disabled until the step before it has been installed at least once
-    (see _lock_row) — a fresh install can't jump ahead — but that lock never
-    blocks re-running a step that's already installed (an update or a
-    reinstall), even if an earlier step has since gone missing again."""
+    """on_status_change(states) follows every check and on_installed() every
+    write, reaching the owner even after this window closes."""
 
     def __init__(self, parent, exe_path, on_status_change=None,
                  on_installed=None, is_game_running=None):
@@ -43,14 +39,8 @@ class SetupWindow(tk.Toplevel):
         self._game_dir = os.path.dirname(exe_path)
         self._busy = False
         self._states = None   # {"patch"|"ml"|"tl": state} as last shown
-        # on_status_change(states) follows every status check, so the owner
-        # can update its alert without re-checking; on_installed() follows an
-        # install that wrote something. Both reach the owner even if this
-        # window has been closed by then.
         self._on_status_change = on_status_change
         self._on_installed = on_installed
-        # Every step replaces a file the running game has loaded, so all three
-        # ask first when the owner can tell (see tavern_shared.game_guard).
         self._is_game_running = is_game_running
         self._build()
         self.update_idletasks()
@@ -109,14 +99,10 @@ class SetupWindow(tk.Toplevel):
         tk.Label(tf, text=title, bg=SURF, fg=PARCH, font=("Georgia",10,"bold")).pack(anchor="w")
         tk.Label(tf, text=subtitle, bg=SURF, fg=MUTED, font=("Segoe UI",8),
                  wraplength=280, justify="left").pack(anchor="w")
-        # The status note: its own line, reserved even when empty so the row
-        # doesn't change height.
         notevar = tk.StringVar(value="")
         note = tk.Label(tf, textvariable=notevar, bg=SURF, fg=MUTED, font=("Segoe UI",8),
                         wraplength=280, justify="left")
         note.pack(anchor="w")
-        # Fixed width so the row doesn't shift when the label changes length
-        # ("⬇ Install" vs "⟳ Reinstall") as a step's state changes.
         btn = _btn(row, "…", on_click, font=("Segoe UI",9), pady=6, padx=12, width=11)
         btn.pack(side="right", padx=12)
         btn._dotvar = dotvar
@@ -135,15 +121,10 @@ class SetupWindow(tk.Toplevel):
         "unknown":    ("●", MUTED, "⟳ Reinstall"),
         "current":    ("●", GREEN, "⟳ Reinstall"),
     }
-    # Every state gets a note (a silent row reads as "probably fine"), tinted
-    # like the dot for the states that ask for action.
     _STATE_NOTE = {
         "missing":    ("Not installed yet.", MUTED),
         "outdated":   ("Update available — a newer version is published.", AMBER),
-        # Says what was checked: the version looks right, the file isn't.
         "damaged":    ("Installed file doesn't match what was installed — repair it.", RED),
-        # No recorded baseline: no damage detection, update checks or version
-        # display until a reinstall (Automatic Setup does it) records one.
         "unrecorded": ("Installed, but its install record is incomplete — "
                        "reinstall (or run Automatic Setup) to enable update checks.", AMBER),
         "unknown":    ("Installed — couldn't check for updates.", MUTED),
@@ -156,12 +137,8 @@ class SetupWindow(tk.Toplevel):
                   "tl":    ("tavernlib_tag", "tavernlib_source")}
 
     def _refresh_states(self, keep_status=None):
-        """Re-reads what's installed and repaints the rows.
-
-        keep_status is the message from a just-finished install, held on screen
-        across the refresh instead of the usual "Checking status…" -> blank
-        cycle, which would blank a failure's reason before anyone could read it.
-        """
+        """keep_status, a finished install's message, stays on screen: on a
+        failure it's the only place the reason is shown."""
         self._status.set("Checking status…" if keep_status is None else keep_status)
         exe, game_dir = self._exe, self._game_dir
         owner, notify = self.master, self._on_status_change
@@ -184,8 +161,6 @@ class SetupWindow(tk.Toplevel):
         for key, btn in (("patch", self._patch_btn), ("ml", self._ml_btn),
                          ("tl", self._tl_btn)):
             tag_key, source_key = self._META_KEYS[key]
-            # An offline install (the copy shipped in Patch/) is a real release
-            # but not necessarily the newest, so the row says so.
             self._apply_row_state(btn, states[key], meta.get(tag_key),
                                   meta.get(source_key) == "bundled")
         self._lock_row(self._ml_btn, states["ml"], states["patch"], "Patch")
@@ -198,9 +173,7 @@ class SetupWindow(tk.Toplevel):
         btn._dotlabel.config(fg=color)
         btn.config(text=text)
         note, note_color = self._STATE_NOTE[state]
-        # The installed release tag, so the row says what's installed. Legacy
-        # "bundled:<hash>" markers name no release and are hidden, and a
-        # 'missing' row has no install for a tag to describe.
+        # Upstream's "bundled:<hash>" markers name no release.
         if tag and not tag.startswith("bundled:") and state != "missing":
             shown = f"{tag} · offline copy" if offline else tag
             note = f"{note}  ({shown})" if note else f"({shown})"
@@ -208,10 +181,8 @@ class SetupWindow(tk.Toplevel):
         btn._notelabel.config(fg=note_color)
 
     def _lock_row(self, btn, state, prior_state, prior_name):
-        """Disables a step's button only when it's never been installed AND
-        its prerequisite hasn't either — never blocks updating/reinstalling
-        a step that's already there, no matter what the earlier step is
-        doing right now."""
+        """A fresh install can't skip ahead, but an installed step can always
+        be re-run."""
         locked = state == "missing" and prior_state == "missing"
         if not self._busy:
             btn.config(state="disabled" if locked else "normal")
@@ -223,16 +194,13 @@ class SetupWindow(tk.Toplevel):
     def _set_busy(self, busy, msg=""):
         self._busy = busy
         state = "disabled" if busy else "normal"
-        self._auto_btn.config(state=state)
-        self._patch_btn.config(state=state)
-        self._ml_btn.config(state=state)
-        self._tl_btn.config(state=state)
+        for btn in (self._auto_btn, self._patch_btn, self._ml_btn, self._tl_btn):
+            btn.config(state=state)
         self._status.set(msg)
 
     def _run_install(self, busy_msg, work, fail_prefix, stage):
-        """Runs work(progress) on a worker. work returns (message, changed),
-        changed meaning it wrote something; stage[0] names the component a
-        failure is about, for the Manual Install offer."""
+        """work(progress) returns (message, wrote something); stage[0] names
+        the component a failure is about."""
         self._set_busy(True, busy_msg)
         progress = lambda m: post(self, self._status.set, m)
         owner, on_installed = self.master, self._on_installed
@@ -241,8 +209,6 @@ class SetupWindow(tk.Toplevel):
             if changed and on_installed:
                 post(owner, on_installed)
             return msg
-        # Any Exception, not just RuntimeError: an OSError from a locked file
-        # must still reach _finish_install, or the window stays busy forever.
         run_bg(self, run,
                on_ok=lambda msg: self._finish_install(True, msg),
                on_err=lambda e: self._finish_install(
@@ -256,13 +222,9 @@ class SetupWindow(tk.Toplevel):
             return
         exe = self._exe
         def work(progress):
-            result = apply_patch(exe, progress)
-            messages = {
-                "downloaded": "Downloaded the latest Tavern patch from GitHub and applied it.",
-                "current": "Already up to date — no changes were needed.",
-            }
-            return (messages.get(result, "Root.Township.dll has been replaced with the Tavern patch."),
-                    result != "current")
+            if apply_patch(exe, progress) == "current":
+                return "Already up to date — no changes were needed.", False
+            return "Downloaded the latest Tavern patch from GitHub and applied it.", True
         self._run_install("Checking for the latest patch…", work, "Patch failed", ["Patch"])
 
     def _on_melonloader_click(self):
@@ -304,16 +266,11 @@ class SetupWindow(tk.Toplevel):
                                           "Running setup"):
             return
         exe, game_dir = self._exe, self._game_dir
-        # The rows were checked moments ago; only a click that beat the first
-        # check has to check for itself.
+        # Only a click that beat the first check has to check for itself.
         shown = dict(self._states or {})
         stage = ["Patch"]
 
         def work(progress):
-            # AUTO_SETUP_STATES: what flashes the Setup alert, plus
-            # 'unrecorded', which this reinstall repairs. Not 'unknown': the
-            # update check failed, and reinstalling over an unreachable GitHub
-            # would turn a no-op into a guaranteed download failure.
             changed = False
             if (shown.get("patch") or _patch_status(exe)) in AUTO_SETUP_STATES:
                 progress("Applying patch…")
@@ -340,10 +297,6 @@ class SetupWindow(tk.Toplevel):
                           "Automatic setup failed", stage)
 
     def _finish_install(self, ok, msg, component=None, auto_manual=False):
-        """auto_manual opens the Manual Install window itself rather than
-        just revealing the button: for a download that failed all its retries
-        (DownloadError), where the browser route is the next step. Local
-        failures (blocked writes, wrong paths) only reveal the button."""
         self._set_busy(False, msg)
         if ok:
             self._hide_manual_offer()
@@ -351,17 +304,11 @@ class SetupWindow(tk.Toplevel):
             self._show_manual_offer(component, msg)
             if auto_manual:
                 self._open_manual()
-        # Held across the refresh: on failure this line is the only place the
-        # reason is shown.
         self._refresh_states(keep_status=msg)
 
     # ── Manual install fallback ──────────────────────────────────────────────
 
     def _show_manual_offer(self, component, reason):
-        """Reveals the Manual Install button, bound to whichever component
-        just failed. The reason is carried through so the manual window can
-        repeat what went wrong -- by the time it's open, the status line
-        behind it is no longer readable."""
         self._manual_for = (component, reason)
         self._manual_btn.config(text=f"📄 Install {component} manually…")
         if not self._manual_bar.winfo_ismapped():

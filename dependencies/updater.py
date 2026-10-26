@@ -297,24 +297,15 @@ PARTIAL_UPDATE_MARKER = "partial_update.json"
 
 
 def _marker_path():
-    """Deliberately in AppData, not next to the exe. The marker exists to
-    report that writing next to the exe was blocked, so writing the report
-    itself into that same folder is the one place it is most likely to fail.
-
-    Duplicates tavern_shared.paths._tavern_data_dir rather than importing it:
-    this module is stdlib-only on purpose, because finish_update_if_requested
-    runs from the staging folder before the rest of the app is in place."""
+    """In AppData: it reports that writing next to the exe was blocked. Not
+    paths._tavern_data_dir, since this module stays stdlib-only."""
     base = os.environ.get("APPDATA", os.path.join(os.path.expanduser("~"), "AppData", "Roaming"))
     return os.path.join(base, "TheModdingTavern", PARTIAL_UPDATE_MARKER)
 
 
 def _same_install(a, b):
-    """Whether two install-dir paths name the same folder. One marker path
-    serves both launchers (see _marker_path), so the install_dir recorded
-    inside it is the only thing keeping the client from consuming a report
-    that belongs to the server install, or vice versa. realpath+normcase so
-    a case-only or 8.3-short-name difference in how the two processes
-    spelled the same folder doesn't read as foreign."""
+    """The marker is shared by both launchers, so its install_dir says whose
+    it is."""
     try:
         return (os.path.normcase(os.path.realpath(a)) ==
                 os.path.normcase(os.path.realpath(b)))
@@ -335,15 +326,8 @@ def _write_partial_update_marker(install_dir, failed):
 
 
 def read_partial_update_marker():
-    """What the app calls on startup to find out whether the update it just
-    applied actually replaced everything. Returns the marker dict, or None if
-    the last update was clean. Clearing it is the caller's job (see
-    clear_partial_update_marker) so it survives until it has been shown.
-
-    The marker file is shared by both launchers, so one recorded for a
-    different install dir is the OTHER launcher's still-unshown report:
-    answered with None, and deliberately not cleared, so the launcher it
-    belongs to still finds it on its own next start."""
+    """This install's partial-update report, or None; the caller clears it
+    once shown. Another install's is left for that launcher."""
     try:
         with open(_marker_path(), "r", encoding="utf-8") as f:
             marker = json.load(f)
@@ -356,12 +340,7 @@ def read_partial_update_marker():
 
 
 def clear_partial_update_marker(install_dir=None):
-    """Removes the marker — but only if it belongs to install_dir (default:
-    this process's own install). The path is shared by both launchers, so an
-    unconditional remove would eat the other launcher's still-unshown report;
-    an unreadable marker is removed regardless, since it can't be shown to
-    anyone. finish_update_if_requested passes install_dir explicitly because
-    its own sys.executable still points into the staging folder."""
+    """Only install_dir's marker (default this process's), or an unreadable one."""
     if install_dir is None:
         install_dir = os.path.dirname(sys.executable)
     try:
@@ -379,7 +358,6 @@ def clear_partial_update_marker(install_dir=None):
 
 
 def partial_update_message(files):
-    """The dialog text for a marker's files, shown by the relaunched app."""
     return (f"The launcher itself updated, but {len(files)} file(s) couldn't be "
             "replaced:\n\n" + "\n".join(f"  • {f}" for f in files[:10])
             + ("\n  • …" if len(files) > 10 else "")
@@ -441,8 +419,7 @@ def _download_to_file(url, dest_path, on_progress, max_total_seconds=180):
                                         f"({downloaded//1024//1024:,} / {total//1024//1024:,} MB)")
                         else:
                             on_progress(f"Downloading… {downloaded//1024:,} KB")
-            # read() returning b"" means "no more data", not "complete", so a
-            # connection cut mid-transfer ends the loop like a finished one.
+            # A cut connection ends the loop like a finished download.
             if total is not None and downloaded != total:
                 pct = int(downloaded * 100 / max(1, total))
                 raise RuntimeError(
@@ -601,13 +578,9 @@ def finish_update_if_requested():
     def _sync_folder(src_dir, dst_dir, label):
         """Copies every file from src_dir into dst_dir (preserving the
         relative structure), skipping any file whose destination copy is
-        already identical. Returns the "label/rel" paths that did NOT end up
-        matching the source (a locked or Controlled-Folder-Access-blocked
-        file), so the update can be reported as partial rather than clean.
-        Each copy is verified by reading it back: shutil.copy2 raising nothing
-        doesn't establish that anything was written.
-
-        Deliberately never deletes anything from dst_dir that isn't present in
+        already identical. Returns the "label/rel" paths that don't match the
+        source afterwards, each copy read back since a blocked write raises
+        nothing. Deliberately never deletes anything from dst_dir that isn't present in
         src_dir -- a user's own third-party addon sitting in addons/ (never
         part of any official release) must never be touched by this, same
         reasoning as why this has never deleted anything from Patch/ either."""
@@ -655,8 +628,7 @@ def finish_update_if_requested():
                            os.path.join(install_dir, "addons"), "addons")
 
     if failed:
-        # The exe did update, so this is partial, not failed. This process
-        # has no UI, so the marker is how the relaunched app gets to say so.
+        # No UI here, so the relaunched app reports it.
         _log_update_event(f"PARTIAL UPDATE — {len(failed)} file(s) not replaced: "
                           + ", ".join(failed))
         _write_partial_update_marker(install_dir, failed)

@@ -1,8 +1,6 @@
-"""The fallback when the automated install can't work at all: a proxy Python
-can't negotiate, antivirus or a firewall that only lets the browser through,
-Controlled Folder Access. This window downloads nothing; it names the file,
-the page to fetch it from and the folder it goes in, with buttons for each.
-Every path and URL is imported from the installers, so the two can't drift."""
+"""Step-by-step instructions for installing a Setup component by hand, for
+when something blocks the launcher's own downloads or writes but not the
+browser's."""
 import os
 import webbrowser
 import tkinter as tk
@@ -26,9 +24,7 @@ PATCH_RELEASES_PAGE       = "https://github.com/ModdingTavern/TavernDefaults/rel
 
 
 def _steps_for(component, game_dir, arch):
-    """The per-component instructions. Returns (download_name, direct_url,
-    page_url, dest_dir, [steps]) — dest_dir is what the Open Folder button
-    opens, so it is always the folder the file ends up *in*, never the file."""
+    """(download_name, direct_url, page_url, dest_dir, [steps])."""
     if component == "Patch":
         dest = os.path.join(game_dir, PATCH_TARGET_SUBDIR)
         return (PATCH_SOURCE_FILENAME, PATCH_DOWNLOAD_URL, PATCH_RELEASES_PAGE, dest, [
@@ -62,9 +58,6 @@ def _steps_for(component, game_dir, arch):
 
 
 class ManualInstallWindow(tk.Toplevel):
-    """Instructions and shortcuts for installing one component by hand.
-    on_recheck (Setup's _refresh_states) runs the same status check an
-    automated install would."""
 
     def __init__(self, parent, exe_path, component, reason=None, on_recheck=None):
         super().__init__(parent)
@@ -139,7 +132,7 @@ class ManualInstallWindow(tk.Toplevel):
              font=("Segoe UI", 9), pady=6, padx=14).pack(side="right")
 
     def _path_box(self, label, shown):
-        """A label plus a read-only but selectable path, so it can be copied."""
+        # A read-only Entry, so the path can be selected and copied.
         wrap = tk.Frame(self, bg=BG)
         wrap.pack(fill="x", padx=20, pady=2)
         tk.Label(wrap, text=label, bg=BG, fg=MUTED, font=("Segoe UI", 8),
@@ -164,8 +157,6 @@ class ManualInstallWindow(tk.Toplevel):
         self._status.set("Direct download link copied to the clipboard.")
 
     def _open_dest(self):
-        """Opens the destination, creating it if needed (only Plugins/ can be
-        missing); a missing game folder is reported instead."""
         if not os.path.isdir(self._game_dir):
             self._status.set(
                 f"The game folder doesn't exist: {self._game_dir}\n"
