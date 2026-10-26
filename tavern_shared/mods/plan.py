@@ -95,7 +95,7 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
             manifest = _fetch_manifest(repo_bases, mod_id, version,
                                        _index_source(index, mod_id, repo_bases, version))
             if manifest.artifact_for(CLIENT_TARGET) is None:
-                raise ModManagerError(f"{mod_id} {version} has no PC build.")
+                raise ModManagerError(f"{mod_id} {version} has no Windows build.")
         except ModManagerError:
             if tag == "pinned":
                 unresolved_pins.append((mod_id, version))
@@ -307,7 +307,7 @@ def build_mod_diff(game_dir, server_mods, plan):
             add(m["id"], server_version=m.get("version", ""), client_version="",
                 client_enabled=False, action=ACTION_SERVER_ONLY, reason="",
                 optional=False, source_repo=m.get("source_repo", ""),
-                note="it has no PC build, so the server runs it without you",
+                note="it has no Windows build, so the server runs it without you",
                 name=m.get("name", m["id"]))
     for mod_id, version in plan.missing:
         add(mod_id, server_version=version, action=ACTION_MISSING, reason="required",
@@ -426,7 +426,7 @@ def resolve_missing_mods(missing, index, repo_bases):
         except ModManagerError:
             root = None
         if root is not None and root.artifact_for(CLIENT_TARGET) is None:
-            unresolved.append(f"{mod_id} {version} (it has no PC build)")
+            unresolved.append(f"{mod_id} {version} (it has no Windows build)")
         elif root is not None:
             roots.append(root)
         elif _unadded(entry.get("source_repo"), repo_bases):
