@@ -77,10 +77,7 @@ def _btn(parent, text, cmd, style="normal", **kw):
     }[style]
     return tk.Button(parent, text=text, bg=colors[0], fg=colors[1],
                      activebackground=colors[2], activeforeground=colors[3],
-                     # Tk's default disabled grey is nearly invisible on this
-                     # palette, and SetupWindow disables step buttons until
-                     # their prerequisite is installed -- a state the user has
-                     # to be able to read.
+                     # Tk's default is nearly invisible on this palette.
                      disabledforeground=MUTED,
                      relief="flat", bd=0, cursor="hand2", command=cmd, **kw)
 
@@ -214,8 +211,7 @@ def _mk_tree(parent, cols, widths, height=8, hscroll=False):
 
 
 def _window_header(parent, title, subtitle=None):
-    """The 44px title strip across the top of a dialog. Returns the strip so
-    a caller can pack its own buttons on the right."""
+    """A dialog's title strip, returned for buttons to pack into."""
     h = tk.Frame(parent, bg=SURF, height=44)
     h.pack(fill="x"); h.pack_propagate(False)
     tk.Label(h, text=title, bg=SURF, fg=AMBER,
@@ -228,9 +224,7 @@ def _window_header(parent, title, subtitle=None):
 
 
 def _scroll_stack(parent):
-    """A vertically scrolling stack of row frames, for lists a Treeview can't
-    draw (a control or several lines per row). Returns (canvas, inner); pack
-    rows into inner."""
+    """A scrolling frame to pack rows into, for lists a Treeview can't draw."""
     frame = tk.Frame(parent, bg=BG)
     frame.pack(fill="both", expand=True)
     canvas = tk.Canvas(frame, bg=BG, highlightthickness=0)
@@ -244,11 +238,10 @@ def _scroll_stack(parent):
                lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
     canvas.bind("<Configure>", lambda e: canvas.itemconfig(window, width=e.width))
     def _mousewheel(event):
-        # yview_scroll doesn't check the content height itself, so a short
-        # list would scroll off into empty space.
+        # Or a short list scrolls off into empty space.
         if inner.winfo_height() <= canvas.winfo_height():
             return
         canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
     canvas.bind("<MouseWheel>", _mousewheel)
     inner.bind("<MouseWheel>", _mousewheel)
-    return canvas, inner
+    return inner

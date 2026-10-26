@@ -10,8 +10,7 @@ from tavern_shared.mod_install import NEEDS_ATTENTION, _mods_need_attention
 from tavern_shared.mods.base import load_cfg
 from tavern_shared.mods.install import list_installed_mods, mod_status
 from tavern_shared.mods.repos import fetch_indexes, list_repos
-from tavern_shared.mods.ui.manager_window import ModManagerWindow
-from tavern_shared.mods.ui.shared import record_matches_target
+from tavern_shared.mods.ui import ModManagerWindow, record_matches_target
 from tavern_shared.mods_window import SetupWindow
 from tavern_shared.patch import _patch_needs_attention
 
