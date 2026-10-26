@@ -39,7 +39,7 @@ def record_matches_target(rec, target):
     return has_target(rec, target) or _is_pre_v2(rec)
 
 
-_TARGET_NAMES = {"pc": "PC", "server": "Server", "quest": "Quest"}
+_TARGET_NAMES = {"client_windows": "PC", "server": "Server", "client_android": "Quest"}
 
 
 def target_label(targets):
@@ -232,7 +232,7 @@ class CommunityModsWindow(ModListWindow):
         self._refresh_btn = _btn(bar, "Refresh", lambda: self._load(force=True),
                                  style="dim", font=("Segoe UI",9), pady=5, padx=12)
         self._refresh_btn.pack(side="right")
-        if self._target == "pc":
+        if self._target == "client_windows":
             _btn(bar, "Clear Mod Cache", self._on_clear_cache, style="dim",
                  font=("Segoe UI",9), pady=5, padx=12).pack(side="right", padx=(0,8))
 
@@ -541,7 +541,7 @@ class ModManagerWindow(ModListWindow):
         "unknown":  "Installed",
     }
 
-    def __init__(self, parent, game_dir, target="pc", on_change=None,
+    def __init__(self, parent, game_dir, target="client_windows", on_change=None,
                  is_game_running=None, server_scene=None):
         self._community_win = None
         self._pinned_ids = set()    # client only: pins are a join-time concept
@@ -612,7 +612,7 @@ class ModManagerWindow(ModListWindow):
 
     def _render(self, index, on_disk):
         self._index = index
-        if self._target == "pc":
+        if self._target == "client_windows":
             self._pinned_ids = {_parse_pin_entry(p)[0] for p in list_pinned(load_cfg())}
         self._apply_installed(on_disk)
         self._set_busy(False, "")
@@ -726,7 +726,7 @@ class ModManagerWindow(ModListWindow):
                          state="normal" if managed else "disabled")
         menu.add_command(label="Enable" if not r["enabled"] else "Disable",
                          command=self._on_toggle)
-        if managed and self._target == "pc":
+        if managed and self._target == "client_windows":
             menu.add_separator()
             # Kept on self: a BooleanVar with no Python reference can be
             # collected while the menu is still open.
