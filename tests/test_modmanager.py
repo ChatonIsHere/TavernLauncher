@@ -2053,6 +2053,47 @@ class Parity(_TempDataDirFixture, unittest.TestCase):
         self.assertFalse(rows["p.req"].optional)
         self.assertFalse(rows["p.req"].recommended)
 
+    def _recommended_dependency(self):
+        """p.req requires p.mid, which needs the recommended p.rec: the server
+        lists p.rec itself, so it's a root rather than a dependency."""
+        self._publish("p.rec", "1.0.0", parity_required=False)
+        self._publish("p.mid", "1.0.0", dependencies={"p.rec": "1.0.0"})
+        self._publish("p.req", "1.0.0", dependencies={"p.mid": "1.0.0"})
+        server_mods = [_srv("p.rec", "1.0.0", required=False),
+                       _srv("p.req", "1.0.0", required=True)]
+        index = [summary(m, ["1.0.0"]) for m in ("p.rec", "p.mid", "p.req")]
+        return server_mods, index
+
+    def test_a_recommended_mod_a_required_one_needs_cannot_be_skipped(self):
+        """Skipping it would leave p.req loading without it."""
+        server_mods, index = self._recommended_dependency()
+        plan = self._plan(server_mods, index)
+        rows = {r.mod_id: r for r in mm.build_mod_diff(self.game, server_mods, plan)}
+
+        self.assertEqual({e.mod_id: e.reason for e in plan.entries}["p.rec"], "dependency")
+        self.assertFalse(rows["p.rec"].optional)
+        self.assertFalse(rows["p.rec"].recommended)
+        self.assertIn("needs it", rows["p.rec"].note)
+        self.assertEqual(rows["p.rec"].server_version, "1.0.0")
+
+    def test_a_declined_recommendation_a_required_mod_needs_is_still_planned(self):
+        server_mods, index = self._recommended_dependency()
+        plan = self._plan(server_mods, index, declined=["p.rec"])
+        self.assertIn("p.rec", [e.mod_id for e in plan.entries])
+
+    def test_rows_carry_their_dependencies_for_the_comparison(self):
+        """The window uses them to skip or take recommended mods together."""
+        self._publish("p.lib", "1.0.0", parity_required=False)
+        self._publish("p.rec", "1.0.0", parity_required=False,
+                      dependencies={"p.lib": "1.0.0"})
+        server_mods = [_srv("p.lib", "1.0.0", required=False),
+                       _srv("p.rec", "1.0.0", required=False)]
+        plan = self._plan(server_mods, [summary(m, ["1.0.0"]) for m in ("p.lib", "p.rec")])
+        rows = {r.mod_id: r for r in mm.build_mod_diff(self.game, server_mods, plan)}
+
+        self.assertEqual(rows["p.rec"].requires, ("p.lib",))
+        self.assertTrue(rows["p.lib"].optional)
+
     def test_a_declined_mod_gets_a_row_so_the_choice_can_be_taken_back(self):
         self._publish("p.rec", "1.0.0", parity_required=False)
         server_mods = [_srv("p.rec", "1.0.0", required=False)]
