@@ -175,7 +175,7 @@ class CommunityModsWindow(ModListWindow):
     """Browse the merged index and install from it, as cards with a search box."""
 
     _COL_LABELS = ("Status", "Author", "Mod", "Installed", "Latest", "Source")
-    _WIDTHS     = (90,       110,      160,   74,          64,       110)
+    _WIDTHS     = (86,       100,      220,   66,          60,       104)
     _STATE_STYLE = {    # state -> (status, its colour, button)
         "missing":  ("Available",    PARCH, "Install"),
         "damaged":  ("Damaged",      RED,   "Reinstall"),
@@ -532,7 +532,7 @@ class ModManagerWindow(ModListWindow):
     manager didn't place."""
 
     _COLS   = ("status", "author", "mod", "installed", "latest", "managed", "source")
-    _WIDTHS = (90,       110,      160,   74,          70,       80,        120)
+    _WIDTHS = (86,       96,       220,   66,          62,       78,        110)
     _STATE_WORD = {
         "missing":  "Missing",
         "damaged":  "Damaged",
