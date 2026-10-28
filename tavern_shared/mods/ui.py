@@ -1,4 +1,4 @@
-"""The Mod Manager window and the Community Mods, Mod Sources and Change
+"""The Mod Manager window and the Get Mods, Mod Sources and Change
 Version windows it opens, shared by both launchers."""
 import json
 import os
@@ -74,7 +74,7 @@ class _Dialog(tk.Toplevel):
 
 
 class ModListWindow(_Dialog):
-    """What the Mod Manager and Community Mods windows share. A subclass
+    """What the Mod Manager and Get Mods windows share. A subclass
     builds _refresh_btn and _status in _build and provides _load, _state_ids,
     _apply_states, _read_installed and _apply_installed."""
 
@@ -191,11 +191,11 @@ class CommunityModsWindow(ModListWindow):
         self._deps_pending = set()
         self._filter_job = None
         self._sources_win = None
-        super().__init__(parent, "Community Mods", "860x580", (760, 440), game_dir,
+        super().__init__(parent, "Get Mods", "860x580", (760, 440), game_dir,
                          target, on_change, is_game_running, server_scene)
 
     def _build(self):
-        h = _window_header(self, "Community Mods")
+        h = _window_header(self, "Get Mods")
         _btn(h, "Manage Sources", self._open_sources, style="dim",
              font=("Segoe UI",9), pady=4, padx=10).pack(side="right", padx=12)
 
@@ -236,20 +236,20 @@ class CommunityModsWindow(ModListWindow):
             _btn(bar, "Clear Mod Cache", self._on_clear_cache, style="dim",
                  font=("Segoe UI",9), pady=5, padx=12).pack(side="right", padx=(0,8))
 
-        self._status = tk.StringVar(value="Loading community mods...")
+        self._status = tk.StringVar(value="Loading mods...")
         tk.Label(self, textvariable=self._status, bg=BG, fg=CYAN,
                  font=("Segoe UI",9), wraplength=800, justify="left"
         ).pack(anchor="w", padx=16, pady=(10,10))
 
     def _load(self, force=False):
-        self._set_busy(True, "Loading community mods...")
+        self._set_busy(True, "Loading mods...")
         game_dir, target = self._game_dir, self._target
         def load():
             repos = list_repos(load_cfg())
             index = fetch_indexes(repos, force=force)
             return repos, index, list_mods(index, target), list_installed_mods(game_dir)
         run_bg(self, load, on_ok=lambda r: self._render(*r),
-               on_err=lambda e: self._set_busy(False, f"Couldn't load community mods: {e}"))
+               on_err=lambda e: self._set_busy(False, f"Couldn't load mods: {e}"))
 
     def _render(self, repos, index, available, installed):
         self._repos, self._index = repos, index
@@ -449,7 +449,7 @@ class ModSourcesWindow(_Dialog):
         _window_header(self, "Mod Sources")
 
         tk.Label(self,
-            text="Repositories the launcher fetches community mods from. The "
+            text="Repositories the launcher fetches mods from. The "
                  "Modding Tavern source is always present. You can add your own "
                  "sources, but they are not checked by Modding Tavern; you are "
                  "responsible for what you install from them.",
@@ -550,17 +550,18 @@ class ModManagerWindow(ModListWindow):
 
     def _build(self):
         h = _window_header(self, "Mod Manager")
-        for text, cmd, padx in (("Community Mods", self._open_community, 12),
-                                ("Import Modlist", self._on_import_modlist, (12,0)),
-                                ("Export Modlist", self._on_export_modlist, (12,0))):
+        _btn(h, "🧩 Get Mods", self._open_community, style="badge",
+             font=("Segoe UI",9,"bold"), pady=4, padx=10).pack(side="right", padx=12)
+        for text, cmd in (("Import Modlist", self._on_import_modlist),
+                          ("Export Modlist", self._on_export_modlist)):
             _btn(h, text, cmd, style="dim", font=("Segoe UI",9), pady=4, padx=10
-                 ).pack(side="right", padx=padx)
+                 ).pack(side="right", padx=(12,0))
 
         desc = ("Every mod installed on this machine - the ones this launcher "
                  "manages plus anything dropped into Mods/ by hand (marked "
                  "\"Untracked\"). Select one, then enable/disable, remove, or "
                  "(managed mods only) change its version, or right-click for the "
-                 "same options. To add something new, use Community Mods.")
+                 "same options. To add something new, use Get Mods.")
         tk.Label(self, text=desc, bg=BG, fg=MUTED, font=("Segoe UI",9),
                  wraplength=760, justify="left"
         ).pack(anchor="w", padx=16, pady=(10,6))

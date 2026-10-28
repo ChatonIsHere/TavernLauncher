@@ -74,6 +74,8 @@ def _btn(parent, text, cmd, style="normal", **kw):
         "danger":  ("#3d1010","#e88080","#5a1818","#ffaaaa"),
         "success": ("#1a3d1e","#a8d8a0","#2a5e2e","#c8f0c0"),
         "dim":     (SURF,     MUTED,  SURF2,   PARCH),
+        # as the Discord and Token buttons in the launcher header
+        "badge":   (SURF2,    AMBER,  AMBERDIM, "#ffd080"),
     }[style]
     return tk.Button(parent, text=text, bg=colors[0], fg=colors[1],
                      activebackground=colors[2], activeforeground=colors[3],
