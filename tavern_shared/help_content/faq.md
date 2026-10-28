@@ -26,7 +26,7 @@ Most often this means one of two things:
 Sometimes Windows reports "Success" when you run Setup - even though it didn't actually succeed.
 This is because some machines don't trust the copy/paste operations we're doing automatically.
 
-If a step in the Setup window fails, it offers a "Manual Install…" button with step-by-step instructions for that step.
+If a step in the Setup window fails, it offers an "Install ... manually…" button with step-by-step instructions for that step.
 If your machine reported success but you still end up in the main menu, it's a good idea to manually do the below:
 
 - Open the "Patch" folder that came with the .zip you downloaded
@@ -42,7 +42,7 @@ If your machine reported success but you still end up in the main menu, it's a g
 - You should now have a "MelonLoader" folder inside the same folder as your "A Township Tale.exe" executable
 
 Congratulations, you've now manually done what the Setup window tried to do for you!
-Optional mods like CircuitsVoiceChat aren't part of this: install them from the "Mod Manager" once Setup is done.
+Optional mods aren't part of this. Install them from the "Mod Manager" once Setup is done (see [Mods](page:mods)).
 
 ## Installing MelonLoader/TavernLib takes x time, is this normal?
 
