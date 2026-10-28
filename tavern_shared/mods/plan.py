@@ -50,6 +50,7 @@ class PlanEntry:
     cached: bool
     active: bool       # enabled at this version and intact: nothing to do
     manifest: object
+    needed_by: str = ""     # recommended, but a mod that can't be skipped needs it
 
 
 @dataclass
@@ -150,7 +151,23 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
     for dep in dependencies:
         reason.setdefault(dep.id, "dependency")
 
+    # A recommended root that a required or pinned mod depends on, however
+    # deeply, isn't the user's to skip: that mod would load without it.
+    # resolve_dependencies leaves roots out of its result, so walk it here.
     all_mods = roots + dependencies
+    by_id = {m.id: m for m in all_mods}
+    needed_by = {}
+    stack = [m for m in roots if reason[m.id] != "recommended"]
+    while stack:
+        mod = stack.pop()
+        for dep_id in sorted(mod.dependencies or {}):
+            if dep_id in by_id and dep_id not in needed_by:
+                needed_by[dep_id] = mod.name or mod.id
+                stack.append(by_id[dep_id])
+    needed_by = {mid: by for mid, by in needed_by.items() if reason.get(mid) == "recommended"}
+    for mod_id in needed_by:
+        reason[mod_id] = "dependency"
+
     installed = _client_records(game_dir)
     entries = []
     for mod in all_mods:
@@ -162,7 +179,7 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
                       and verify_mod_files(game_dir, mod.id, CLIENT_TARGET) is not False)
         entries.append(PlanEntry(mod_id=mod.id, version=mod.version, source_repo=mod.source_repo,
                                  reason=reason.get(mod.id, "required"), cached=cached, active=active,
-                                 manifest=mod))
+                                 manifest=mod, needed_by=needed_by.get(mod.id, "")))
 
     active_ids = {e.mod_id for e in entries}
     # Declining is "don't add it", never "take it away".
@@ -215,6 +232,7 @@ class DiffRow:
     note: str = ""
     cached: bool = False
     name: str = ""
+    requires: tuple = ()    # its manifest's dependency ids
 
     @property
     def recommended(self):
@@ -266,6 +284,9 @@ def build_mod_diff(game_dir, server_mods, plan):
         elif recommended:
             note = ("this server recommends it but doesn't require it; skipping "
                     "it won't stop you joining")
+        elif e.needed_by:
+            note = (f"this server only recommends it, but {e.needed_by} needs it, "
+                    f"so it can't be skipped")
         elif damaged:
             note = "the installed copy is damaged; it will be reinstalled"
         else:
@@ -275,7 +296,7 @@ def build_mod_diff(game_dir, server_mods, plan):
             client_version=cv, client_enabled=enabled, action=action,
             reason=e.reason, optional=recommended and not e.active,
             source_repo=e.source_repo, note=note, cached=e.cached,
-            name=e.manifest.name))
+            name=e.manifest.name, requires=tuple(sorted(e.manifest.dependencies or {}))))
 
     seen = {r.mod_id for r in rows}
 

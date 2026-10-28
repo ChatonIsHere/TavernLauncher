@@ -295,22 +295,43 @@ class ModDiffWindow(tk.Toplevel):
             lbl.config(bg=(AMBERDIM if active else SURF),
                       fg=(AMBER if active else MUTED))
 
+    def _linked(self, mod_id, edges):
+        """The optional recommended rows reachable from mod_id along edges
+        (id -> ids), mod_id included."""
+        found, stack = {mod_id}, [mod_id]
+        while stack:
+            for nxt in edges.get(stack.pop(), ()):
+                if nxt in self._rows and nxt not in found:
+                    found.add(nxt)
+                    stack.append(nxt)
+        return {m for m in found if self._rows[m].optional and self._rows[m].recommended}
+
     def _on_choice_changed(self, mod_id, choice):
         r = self._rows[mod_id]
         if r.recommended:
+            # Recommended mods can need each other: skipping one skips what
+            # needs it, and taking one takes what it needs.
             if choice == "Skip":
-                self._skip.add(mod_id)
+                needed_by = {}
+                for row in self._rows.values():
+                    for dep in row.requires:
+                        needed_by.setdefault(dep, []).append(row.mod_id)
+                self._skip |= self._linked(mod_id, needed_by)
             else:
-                self._skip.discard(mod_id)
+                self._skip -= self._linked(mod_id, {m: row.requires for m, row in self._rows.items()})
+            for mid in self._segment_labels:
+                if self._rows[mid].recommended:
+                    self._name_labels[mid].config(fg=self._row_color(mid))
+                    self._paint_toggle(mid, self._choice_options(mid)[1])
+            return
+        if choice in ("Keep", "Pin"):
+            self._keep.add(mod_id)
         else:
-            if choice in ("Keep", "Pin"):
-                self._keep.add(mod_id)
-            else:
-                self._keep.discard(mod_id)
-            if choice == "Pin":
-                self._pin.add(mod_id)
-            else:
-                self._pin.discard(mod_id)
+            self._keep.discard(mod_id)
+        if choice == "Pin":
+            self._pin.add(mod_id)
+        else:
+            self._pin.discard(mod_id)
         self._name_labels[mod_id].config(fg=self._row_color(mod_id))
         self._paint_toggle(mod_id, choice)
 
