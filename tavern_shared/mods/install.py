@@ -400,7 +400,7 @@ def install_library_dependency(game_dir, lib, on_progress):
 
 
 def install_mod_closure(game_dir, mod, index, repo_bases, on_progress, target, version=None):
-    """One Community Mods install: the ModSummary `mod` at `version` (default
+    """One Get Mods install: the ModSummary `mod` at `version` (default
     its highest) and its closure for `target`."""
     root = _fetch_manifest(repo_bases, mod.id, version or mod.highest(), mod.source_repo)
     if root.artifact_for(target) is None:

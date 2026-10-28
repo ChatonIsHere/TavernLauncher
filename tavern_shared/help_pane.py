@@ -24,6 +24,7 @@ PAGES = [
     ("local-server-tldr", "Local Server (TLDR)", "local-server-tldr.md"),
     ("public-server-full", "Public Server (Full Guide)", "public-server-full.md"),
     ("public-server-tldr", "Public Server (TLDR)", "public-server-tldr.md"),
+    ("mods", "Mods", "mods.md"),
     ("faq", "FAQ", "faq.md"),
     ("troubleshooting", "Troubleshooting", "troubleshooting.md"),
     ("technical-docs", "Technical Documentation", "technical-docs.md"),

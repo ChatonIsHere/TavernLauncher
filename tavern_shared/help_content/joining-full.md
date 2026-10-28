@@ -64,8 +64,8 @@ That's it. If the Setup button has stopped flashing you should be on the latest 
 
 ### Optional mods
 
-Install optional mods such as **CircuitsVoiceChat** (voice chat) and **TavernEssentials** (main menu and social features, by Shadow!) from "Mod Manager" → "Community Mods".
-Joining a server offers to match its mods; choose "Pin" to keep one of yours on every server.
+Install optional mods such as **TavernEssentials** (main menu and social features, by Shadow!) from "Mod Manager" → "Get Mods".
+When you join a server, the launcher first matches your mods to the server's. See [Mods](page:mods).
 
 ## Essentials
 

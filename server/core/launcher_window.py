@@ -656,7 +656,8 @@ class ServerLauncher(LauncherCommon, tk.Tk):
                 "/identity_token", identity]
         if not self.v_show_game.get():
             args += ["-batchmode", "-nographics"]
-        args += ["/fly", "/launcherauth", "/start_server", "-1", "false", str(port)]
+        # /tavernlauncher tells mods such as Canary which launcher version started the server
+        args += ["/fly", "/launcherauth", f"/tavernlauncher={APP_VERSION}", "/start_server", "-1", "false", str(port)]
         if self.v_debug_helper.get():
             args.append("/debug_helper")
         if self.v_tutorial_scene.get():
