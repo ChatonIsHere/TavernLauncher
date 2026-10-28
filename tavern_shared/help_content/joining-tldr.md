@@ -27,7 +27,7 @@ If you installed the game in another directory, point it to the .exe in that fol
 Click "Setup", then "Automatic Setup". <br>
 This installs Patch, MelonLoader and TavernLib, in that order.
 
-Optional mods (e.g. TavernEssentials): open "Mod Manager", click "Get Mods" and install them from there.
+Optional mods: open "Mod Manager", click "Get Mods" and install them from there.
 Joining a server matches your mods to the server's first. See [Mods](page:mods).
 
 ## Essentials
