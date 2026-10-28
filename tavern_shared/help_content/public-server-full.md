@@ -65,7 +65,7 @@ That's it. If the Setup button has stopped flashing you should be on the latest 
 
 ### Optional mods
 
-Install optional mods such as **TavernEssentials** (main menu and social features, by Shadow!) from "Mod Manager" → "Get Mods".
+Install optional mods from "Mod Manager" → "Get Mods".
 Players joining through the client launcher are matched against the mods your server runs. See [Mods](page:mods).
 
 ## Essentials
