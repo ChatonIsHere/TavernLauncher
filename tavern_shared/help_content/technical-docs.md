@@ -181,6 +181,17 @@ Since there is no central authentication (we are not linked to Alta), a homebrew
 For people to access your console or TavernKeeper remotely, they need access to your console token.
 Do not share this token lightly as it will essentially make someone admin over your server!
 
+### Setup button
+
+Installs Patch, MelonLoader and TavernLib, in that order. "Automatic Setup" does all three, or you can install, update or repair each row yourself.
+The button flashes while one of them is missing, outdated or damaged.
+If a download keeps failing, Setup uses the copy in the "Patch" folder when it can, and offers step-by-step instructions to install it by hand.
+
+### Mod Manager button
+
+Opens the Mod Manager, where you install, update, disable and remove mods. The button shows a count when installed mods have updates or are damaged.
+See [Mods](page:mods).
+
 ### Archive log button
 
 This button will clear the active tracked log in your AppData folder and immediately start a fresh log file.
@@ -194,7 +205,8 @@ Be very careful enabling any addons that don't come preshipped with the official
 
 ### Wipe Cache button
 
-TavernLauncher tracks certain data on what you've already clicked and read. If you're having severe trouble you can click this to start fresh.
+Deletes the launcher's saved settings (game path, username, last server, toggles) and closes it, so it starts fresh. If you're having severe trouble you can click this.
+Your added mod sources and pinned mods are saved there too, so they are lost. Tokens, the patch and installed mods are not touched.
 
 ### Enhanced Debugging
 
@@ -220,8 +232,9 @@ Enabling this check will load the gameworld as the tutorial scene when the serve
 ### Check Server button
 
 This button can be clicked to probe the status of a server to make sure it's up and to see whether it has a password/whitelist or not.
+It also shows how many mods the server runs, with a "Sync Mods" button that matches your mods to the server without joining. See [Mods](page:mods).
 
 
 ### Main Menu button
 
-This button shows up once TavernEssentials is installed (from the Mod Manager's Community Mods). It launches the game into its own main menu instead of joining a server, and the TavernEssentials server boards there let you browse and join servers from inside the game. It uses your username and platform the same way Join Server does.
+This button shows up once TavernEssentials is installed (Mod Manager → Get Mods). It launches the game into its own main menu instead of joining a server, and the TavernEssentials server boards there let you browse and join servers from inside the game. It uses your username and platform the same way Join Server does.

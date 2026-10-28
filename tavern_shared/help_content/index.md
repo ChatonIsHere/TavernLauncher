@@ -19,6 +19,8 @@ Please choose your desired outcome, or read the TLDR versions if you are a techn
 - [Setting up a local server for yourself](page:local-server-full) -> [TLDR](page:local-server-tldr) <br>
 - [Setting up a public server for yourself](page:public-server-full) -> [TLDR](page:public-server-tldr)
 
+For installing mods and joining modded servers, see [Mods](page:mods).
+
 If you believe you've gone through all the setup steps and are still unable to join/host a server, please
 visit the [FAQ](page:faq) or attempt to [troubleshoot](page:troubleshooting) the problem yourself.
 

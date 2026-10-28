@@ -30,7 +30,8 @@ If this is the first time: <br>
 Click "Setup", then "Automatic Setup". <br>
 This installs Patch, MelonLoader and TavernLib, in that order.
 
-Optional mods (CircuitsVoiceChat, TavernEssentials): open "Mod Manager", click "Community Mods" and install them from there.
+Optional mods (e.g. TavernEssentials): open "Mod Manager", click "Get Mods" and install them from there.
+Mod changes take effect after a server restart. See [Mods](page:mods).
 
 ## Essentials
 
