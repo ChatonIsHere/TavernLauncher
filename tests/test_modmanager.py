@@ -644,7 +644,7 @@ class _FakeInstallFixture:
         return self._sha_for(lib_dep(name)["download_url"])
 
     def _closure(self, mod_id, version="1.0.0", target=None):
-        """Closure-install one already-published mod, as Community Mods does."""
+        """Closure-install one already-published mod, as Get Mods does."""
         mm.install_mod_closure(self.game, summary(mod_id, [version]),
                                [summary(mod_id, [version])], [self.BASE],
                                self.progress.append, target or self.TARGET)
