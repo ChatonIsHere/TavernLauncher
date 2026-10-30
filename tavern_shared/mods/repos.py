@@ -45,6 +45,21 @@ def _repo_shorthand(url):
     return "/".join(path[:2]) if len(path) >= 2 else _norm(url)
 
 
+def _repo_owner(url):
+    """The GitHub owner a source belongs to ("ModdingTavern"), or None off GitHub."""
+    if urlparse(_norm(url)).netloc.lower() not in ("raw.githubusercontent.com", "github.com"):
+        return None
+    path = urlparse(_norm(url)).path.strip("/").split("/")
+    return path[0] if path and path[0] else None
+
+
+def is_own_mod(mod_id, source_repo):
+    """Whether a mod is by the owner of the source it comes from: its id's
+    owner part ("ModdingTavern.TavernEssentials") is the source's GitHub owner."""
+    owner = _repo_owner(source_repo)
+    return bool(owner) and mod_id.split(".", 1)[0].lower() == owner.lower()
+
+
 def _source_display(url):
     """"Author/Repo" on a GitHub host, the full URL anywhere else."""
     if urlparse(_norm(url)).netloc.lower() in ("raw.githubusercontent.com", "github.com"):
