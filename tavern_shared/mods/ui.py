@@ -28,7 +28,7 @@ from tavern_shared.mods.modlist import (
 )
 from tavern_shared.mods.pins import _parse_pin_entry, add_pin, list_pinned, remove_pin
 from tavern_shared.mods.repos import (
-    _is_default, _source_display, add_repo, fetch_indexes, list_repos, remove_repo,
+    _is_default, _source_display, add_repo, fetch_indexes, is_own_mod, list_repos, remove_repo,
 )
 from tavern_shared.mods.resolve import _fetch_manifest, resolve_mod_by_id
 
@@ -259,6 +259,7 @@ class CommunityModsWindow(ModListWindow):
             "description": s.description or "",
             "latest": s.highest(), "summary": s,
             "installed": installed_by_id.get(s.id), "state": "missing",
+            "own": is_own_mod(s.id, s.source_repo),
         } for s in available}
         for child in self._cards_frame.winfo_children():
             child.destroy()
@@ -275,7 +276,8 @@ class CommunityModsWindow(ModListWindow):
                 if m.get("id") and record_matches_target(m, self._target)}
 
     def _sorted_ids(self):
-        return sorted(self._rows, key=lambda i: self._rows[i]["name"].lower())
+        """A source's own mods first (see is_own_mod), then by name."""
+        return sorted(self._rows, key=lambda i: (not self._rows[i]["own"], self._rows[i]["name"].lower()))
 
     def _schedule_filter(self):
         if self._filter_job:
@@ -283,7 +285,7 @@ class CommunityModsWindow(ModListWindow):
         self._filter_job = self.after(150, self._apply_filter)
 
     def _apply_filter(self):
-        """Shows the matching cards in name order. A re-packed card lands at
+        """Shows the matching cards in list order. A re-packed card lands at
         the end, so when the set changes all of them go and come back."""
         self._filter_job = None
         query = self.v_search.get().strip().lower()
@@ -305,8 +307,10 @@ class CommunityModsWindow(ModListWindow):
     def _mk_card(self, mod_id):
         r = self._rows[mod_id]
         s = r["summary"]
+        # The source's own mods get an amber edge and a star.
         card = tk.Frame(self._cards_frame, bg=SURF,
-                        highlightbackground=BORDER, highlightthickness=1)
+                        highlightbackground=AMBER if r["own"] else BORDER,
+                        highlightthickness=2 if r["own"] else 1)
 
         top = tk.Frame(card, bg=SURF)
         top.pack(fill="x", pady=(8,0))
@@ -320,7 +324,7 @@ class CommunityModsWindow(ModListWindow):
         status_lbl.pack(fill="both", padx=6)
         installed_var = tk.StringVar(value=r["installed"] or "-")
         for cell, text, bold in ((cells[1], r["author"] or "-", False),
-                                 (cells[2], r["name"], True),
+                                 (cells[2], ("★ " if r["own"] else "") + r["name"], True),
                                  (cells[3], installed_var, False),
                                  (cells[4], r["latest"], False),
                                  (cells[5], source_label(s.source_repo), False)):
