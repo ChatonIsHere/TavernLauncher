@@ -128,7 +128,8 @@ class ModListWindow(_Dialog):
             self._on_change()
 
     def _install(self, mod, version=None):
-        """Installs `mod`'s closure at `version`, default its highest. The
+        """Installs `mod` at `version`, default its highest, asking first about
+        dependencies not yet installed (_confirm_install). The
         game-running guard comes last, right before the write it protects:
         accepting its risk for an install that is then refused anyway teaches
         players to click through it."""
