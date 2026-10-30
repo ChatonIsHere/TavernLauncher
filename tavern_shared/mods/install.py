@@ -7,6 +7,7 @@ import os
 import shutil
 import tempfile
 import zipfile
+from types import SimpleNamespace
 
 from tavern_shared.mod_install import _download_with_progress
 from tavern_shared.paths import _sha256_file
@@ -399,15 +400,59 @@ def install_library_dependency(game_dir, lib, on_progress):
     })
 
 
-def install_mod_closure(game_dir, mod, index, repo_bases, on_progress, target, version=None):
-    """One Get Mods install: the ModSummary `mod` at `version` (default
-    its highest) and its closure for `target`."""
+def plan_mod_install(game_dir, mod, index, repo_bases, target, version=None):
+    """One Get Mods install, before anything is written: (the ModSummary `mod`'s
+    manifest at `version`, default its highest; its closure for `target`; the
+    part of that closure not already installed as resolved)."""
     root = _fetch_manifest(repo_bases, mod.id, version or mod.highest(), mod.source_repo)
     if root.artifact_for(target) is None:
         raise ModManagerError(f"{root.name} {root.version} has no {target} build, "
                               f"so it can't be installed here.")
     deps = resolve_dependencies([root], index, repo_bases, target)
+    return root, deps, [d for d in deps if not _already_installed(game_dir, d, target)]
+
+
+def install_mod_closure(game_dir, mod, index, repo_bases, on_progress, target, version=None):
+    """One Get Mods install: `mod` and its closure for `target`."""
+    root, deps, _ = plan_mod_install(game_dir, mod, index, repo_bases, target, version)
     install_mod_set(game_dir, deps + [root], target, on_progress)
+
+
+def missing_dependencies(rec, installed, index, target):
+    """What an installed mod's record depends on that isn't met in this game
+    folder: [(id, minimum, why)], why "missing", "disabled" or "too old". A
+    dependency the index lists with no `target` build is left out, as the
+    resolver skips it."""
+    have = {r["id"]: r for r in installed if r.get("id") and has_target(r, target)}
+    listed = {s.id for s in index}
+    buildable = {s.id for s in index if target in s.targets}
+    missing = []
+    for dep_id, min_v in sorted((rec.get("dependencies") or {}).items()):
+        if dep_id in listed and dep_id not in buildable:
+            continue
+        r = have.get(dep_id)
+        if r is None:
+            missing.append((dep_id, min_v, "missing"))
+        elif not r.get("enabled", True):
+            missing.append((dep_id, min_v, "disabled"))
+        else:
+            try:
+                want, got = _parse_version(min_v), _parse_version(r.get("version", ""))
+            except ModManagerError:
+                continue
+            if got[0] != want[0] or got < want:
+                missing.append((dep_id, min_v, "too old"))
+    return missing
+
+
+def install_dependencies(game_dir, rec, index, repo_bases, target, on_progress):
+    """Installs the closure an installed mod's record asks for, leaving the mod
+    itself alone. The record stands in for its manifest, so this works for a
+    version its source no longer lists."""
+    root = SimpleNamespace(id=rec["id"], name=rec.get("name") or rec["id"],
+                           dependencies=rec.get("dependencies") or {})
+    deps = resolve_dependencies([root], index, repo_bases, target)
+    return install_mod_set(game_dir, deps, target, on_progress)
 
 
 def _already_installed(game_dir, mod, target):

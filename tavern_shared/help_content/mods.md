@@ -2,7 +2,7 @@
 
 Open the "Mod Manager" (next to "Setup") to see every mod in your game folder, including ones copied in by hand (marked "Untracked"). Select a mod to disable, enable or uninstall it, or right-click it to change its version. Disabling keeps the files.
 
-Click "Get Mods" to browse and install mods. Mods made by the owner of a source (the Modding Tavern's own, in its list) come first, marked with a star. Anything a mod depends on is installed with it. "Details" on a mod shows which builds it has (Windows, server), whether a server needs its exact version, and what it requires. When an update is out, the Mod Manager button shows a count, and "Update" appears on the mod in Get Mods. A mod marked "Damaged" no longer matches its files; reinstall it.
+Click "Get Mods" to browse and install mods. Mods made by the owner of a source (the Modding Tavern's own, in its list) come first, with a star by their source. If a mod needs other mods, Get Mods lists them and asks whether to install them too. A mod installed without them reads "Needs mods" until you add them with "Install deps" (or Install Dependencies in the Mod Manager). "Details" on a mod shows which builds it has (Windows, server), whether a server needs its exact version, and what it requires. When an update is out, the Mod Manager button shows a count, and "Update" appears on the mod in Get Mods. A mod marked "Damaged" no longer matches its files; reinstall it.
 
 On the client, close the game before changing mods.
 
