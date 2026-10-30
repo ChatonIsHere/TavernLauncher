@@ -181,6 +181,27 @@ def _resolve_ip_for_game(host):
         return host
 
 
+def split_host_port(text):
+    """(host, port) from what's in a server field: "1.2.3.4:1757" and
+    "[::1]:1757" carry a game port (an int), a plain host or a bare IPv6
+    address doesn't (None). The auth port is always AUTH_PORT, so a host
+    that kept its ":port" would be looked up as one name, and fail."""
+    text = (text or "").strip()
+    if text.startswith("["):
+        host, sep, rest = text[1:].partition("]")
+        if not sep:
+            return text, None
+        port = rest[1:] if rest.startswith(":") else ""
+    elif text.count(":") == 1:
+        host, _, port = text.partition(":")
+    else:
+        return text, None
+    port = port.strip()
+    if port.isdigit() and 1 <= int(port) <= 65535:
+        return host.strip(), int(port)
+    return host.strip(), None
+
+
 def _valid_port(value, default=1757):
     """Coerces whatever's in the port field to a sane integer, falling back
     to the game's own default if it's empty, non-numeric, or out of range."""

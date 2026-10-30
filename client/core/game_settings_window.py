@@ -11,7 +11,7 @@ from tkinter import ttk, messagebox
 
 from tavern_shared.theme import (
     BG, SURF, SURF2, BORDER, AMBER, AMBERDIM, PARCH, MUTED, GREEN, RED, CYAN,
-    _btn, _section_label, _mk_scrollbar, _mk_combobox,
+    _btn, _section_label, _mk_scrollbar, _mk_combobox, _wheel_scroll, _wheel_scrolls,
 )
 from tavern_shared.window_chrome import _start_hidden, _finish_dark_window, _set_window_icon
 
@@ -161,12 +161,7 @@ class GameSettingsWindow(tk.Toplevel):
         self._form.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
 
         self._canvas = canvas
-
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        self._on_mousewheel = _on_mousewheel
-        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        _wheel_scrolls(canvas, self._form)
 
         self._render_form()
 
@@ -227,12 +222,12 @@ class GameSettingsWindow(tk.Toplevel):
                 var = tk.StringVar(value=current if current in extra else extra[0])
                 combo = _mk_combobox(row, var, extra)
                 # ttk.Combobox's own class binding for MouseWheel (cycles
-                # the selected value) fires before bind_all -- rebinding
+                # the selected value) fires before the page's -- rebinding
                 # directly on the widget intercepts it first, redirects
                 # the scroll to the page instead, and "break" stops the
                 # combobox's own handler from also firing.
-                def _combo_wheel(event, handler=self._on_mousewheel):
-                    handler(event)
+                def _combo_wheel(event, row=row):
+                    _wheel_scroll(event, start=row)
                     return "break"
                 combo.bind("<MouseWheel>", _combo_wheel)
                 self._widgets[field] = ("enum", var)
