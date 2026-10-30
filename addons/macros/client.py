@@ -13,7 +13,7 @@ from tkinter import messagebox
 
 from tavern_shared.theme import (
     BG, SURF, BORDER, AMBER, PARCH, MUTED, MONO,
-    _btn, _mk_scrollbar,
+    _btn, _mk_scrollbar, _wheel_scrolls,
 )
 from tavern_shared.window_chrome import _set_window_icon, _start_hidden, _finish_dark_window
 from tavern_shared.paths import _tavern_data_dir
@@ -114,6 +114,7 @@ def _build_macros_tab(parent, window):
             window._macro_canvas.configure(scrollregion=bbox)
 
     window._macro_list_host.bind("<Configure>", _sync_scrollregion)
+    _wheel_scrolls(window._macro_canvas, window._macro_list_host)
     window._macro_canvas.bind(
         "<Configure>",
         lambda e: window._macro_canvas.itemconfig(window._macro_window, width=e.width),

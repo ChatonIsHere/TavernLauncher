@@ -10,7 +10,7 @@ from tavern_shared.theme import (
 from tavern_shared.window_chrome import _start_hidden, _finish_dark_window, _set_window_icon
 
 from client.core.config import load_cfg, save_cfg, _mark_tickets_seen, _remember_ticket_state, _get_last_ticket_state
-from client.core.auth import ticket_request, _resolve_ip_for_game, AUTH_PORT
+from client.core.auth import ticket_request, _resolve_ip_for_game, AUTH_PORT, split_host_port
 from client.core.config import _get_or_create_token
 from client.core.server_list_panel import ServerListPanel
 
@@ -150,7 +150,8 @@ class TicketsWindow(tk.Toplevel):
              font=("Segoe UI",9), pady=6, padx=8).pack(side="left", padx=(6,0))
 
     def _current_host_username(self, silent=False):
-        host = self.v_host.get().strip()
+        # Tickets go to the auth port: a game port typed with it is dropped.
+        host = split_host_port(self.v_host.get())[0]
         username = self.v_username.get().strip()
         if not host or not username:
             if not silent:
@@ -161,7 +162,7 @@ class TicketsWindow(tk.Toplevel):
 
     def _pick_saved_server(self):
         def on_select(ip, name, port="1757"):
-            self.v_host.set(ip)
+            self.v_host.set(split_host_port(ip)[0])
             self._refresh(silent=True)
         ServerListPanel(self, on_select)
 

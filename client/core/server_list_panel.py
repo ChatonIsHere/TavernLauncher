@@ -10,6 +10,7 @@ from tavern_shared.theme import (
 from tavern_shared.window_chrome import _start_hidden, _finish_dark_window, _set_window_icon
 
 from client.core.config import load_cfg, save_cfg
+from client.core.auth import split_host_port
 
 class ServerListPanel(tk.Toplevel):
     def __init__(self, parent, on_select):
@@ -83,10 +84,12 @@ class ServerListPanel(tk.Toplevel):
             ip = simpledialog.askstring("Add Server",
                 "Server IP:", parent=self)
             if not ip: return
-            ip = ip.strip()
+            ip, typed_port = split_host_port(ip)
+            if not ip: return
             label = simpledialog.askstring("Add Server",
                 "Label for this server:", parent=self) or ip
-            port = simpledialog.askstring("Add Server",
+            # Not asked again when it came with the IP ("1.2.3.4:1757").
+            port = str(typed_port) if typed_port else simpledialog.askstring("Add Server",
                 "Port (leave blank for 1757):", parent=self) or "1757"
             cfg = load_cfg()
             saved = cfg.get("saved_servers", [])

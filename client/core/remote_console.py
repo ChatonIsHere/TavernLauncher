@@ -10,6 +10,7 @@ from tavern_shared.theme import (
 from tavern_shared.window_chrome import _start_hidden, _finish_dark_window, _set_window_icon
 
 from tavern_shared.ws_console_client import WsConsoleClient
+from client.core.auth import split_host_port
 from tavern_shared.console_commands import CONSOLE_COMMANDS
 
 class RemoteConsoleWindow(tk.Toplevel):
@@ -88,7 +89,8 @@ class RemoteConsoleWindow(tk.Toplevel):
         self.geometry(f"420x{self.winfo_reqheight()}")
 
     def _attempt_connect(self):
-        host = self.v_host.get().strip() or "127.0.0.1"
+        # The console has its own port: a game port typed with the host is dropped.
+        host = split_host_port(self.v_host.get())[0] or "127.0.0.1"
         token = self.v_token.get().strip()
         if not token:
             self._connect_status.set("Enter the console token.")

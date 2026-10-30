@@ -47,7 +47,7 @@ from client.core.config import (
 )
 from tavern_shared.flashing import start_flashing_button
 from client.core.auth import (
-    AUTH_PORT, authenticate, ping_server, _resolve_ip_for_game, _valid_port,
+    AUTH_PORT, authenticate, ping_server, _resolve_ip_for_game, _valid_port, split_host_port,
     build_tokens, _headless_user_id, register_whitelist_application, ticket_request,
     fetch_server_mods,
 )
@@ -163,9 +163,12 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         sf = _field(self)
         self.v_ip = tk.StringVar()
         self.v_ip.trace_add("write", self._on_ip_changed)
-        tk.Entry(sf, textvariable=self.v_ip, bg=SURF, fg=PARCH,
+        ip_entry = tk.Entry(sf, textvariable=self.v_ip, bg=SURF, fg=PARCH,
                  insertbackground=AMBER, relief="flat", font=("Consolas",10),
-                 bd=6).pack(side="left", fill="x", expand=True)
+                 bd=6)
+        ip_entry.pack(side="left", fill="x", expand=True)
+        # A typed or pasted "host:port" splits as the field is left.
+        ip_entry.bind("<FocusOut>", lambda e: self._take_host())
         self.v_port = tk.StringVar(value="1757")
         tk.Entry(sf, textvariable=self.v_port, bg=SURF, fg=PARCH,
                  insertbackground=AMBER, relief="flat", font=("Consolas",10),
@@ -441,6 +444,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         self.v_platform.set(saved_platform if saved_platform in ("SteamVR", "Quest", "Fly") else "SteamVR")
         self.v_ip.set(cfg.get("last_ip",""))
         self.v_port.set(cfg.get("last_port","1757"))
+        self._take_host()   # a "host:port" saved before they were split
         self.v_debug_helper.set(cfg.get("debug_helper", False))
         self.v_show_melonloader.set(cfg.get("show_melonloader", False))
         self._print("Ready. Enter a server IP, then Check Server (optional) or Join Server.", "dim")
@@ -523,18 +527,20 @@ class ClientLauncher(LauncherCommon, tk.Tk):
 
     def _open_server_list(self):
         def on_select(ip, name, port="1757"):
-            self.v_ip.set(ip); self.v_port.set(str(port))
+            host, typed_port = split_host_port(ip)
+            self.v_ip.set(host); self.v_port.set(str(typed_port or port))
             self._selected_kind = "official"; self._save()
         ServerListPanel(self, on_select)
 
     def _open_community(self):
         def on_select(ip, name, kind, port="1757"):
-            self.v_ip.set(ip); self.v_port.set(str(port))
+            host, typed_port = split_host_port(ip)
+            self.v_ip.set(host); self.v_port.set(str(typed_port or port))
             self._selected_kind = kind; self._save()
         CommunityBrowser(self, on_select)
 
     def _open_tickets(self):
-        TicketsWindow(self, default_host=self.v_ip.get().strip(),
+        TicketsWindow(self, default_host=split_host_port(self.v_ip.get())[0],
                      default_username=self.v_username.get().strip())
 
     def _poll_ticket_replies_loop(self):
@@ -565,13 +571,13 @@ class ClientLauncher(LauncherCommon, tk.Tk):
 
     def _open_remote_console(self):
         win = RemoteConsoleWindow(self)
-        host = self.v_ip.get().strip()
+        host = split_host_port(self.v_ip.get())[0]
         if host:
             win.v_host.set(host)
 
     def _open_tavernkeeper(self):
         win = TavernKeeperWindow(self)
-        host = self.v_ip.get().strip()
+        host = split_host_port(self.v_ip.get())[0]
         if host:
             win.v_host.set(host)
 
@@ -589,6 +595,17 @@ class ClientLauncher(LauncherCommon, tk.Tk):
     def _current_game_dir(self):
         exe = self.v_exe.get().strip()
         return os.path.dirname(exe) if exe and os.path.isfile(exe) else None
+
+    def _take_host(self):
+        """The destination field's host. A ":port" typed or pasted onto it
+        moves to the port field first (see split_host_port)."""
+        host, port = split_host_port(self.v_ip.get())
+        if port is not None:
+            kind = self._selected_kind      # the field's trace resets it
+            self.v_ip.set(host)
+            self.v_port.set(str(port))
+            self._selected_kind = kind
+        return host
 
     def _on_ip_changed(self, *_):
         """Clear the stale check-status line whenever the IP field changes —
@@ -720,7 +737,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
             try: self._check_label.config(fg=MUTED)
             except: pass
             return
-        ip   = self.v_ip.get().strip()
+        ip   = self._take_host()
         host = ip if ip else "127.0.0.1"
         self._check_btn.config(state="disabled")
         self._check_status.set(f"Checking {host}…")
@@ -1176,7 +1193,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         username = self.v_username.get().strip()
         platform = self.v_platform.get()
         platform = PLATFORM_DISPLAY_TO_BACKEND.get(platform, platform)
-        ip       = self.v_ip.get().strip()
+        ip       = self._take_host()
         display_host = ip if ip else "127.0.0.1"
         # Resolved once and used everywhere identity-sensitive matters (token
         # lookup, the auth handshake, and the game's own launch arg) — a
@@ -1431,7 +1448,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         username = self.v_username.get().strip()
         platform = self.v_platform.get()
         platform = PLATFORM_DISPLAY_TO_BACKEND.get(platform, platform)
-        ip       = self.v_ip.get().strip()
+        ip       = self._take_host()
         host     = ip if ip else "127.0.0.1"
 
         if not exe or not os.path.isfile(exe):

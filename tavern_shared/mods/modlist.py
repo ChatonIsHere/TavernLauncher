@@ -1,7 +1,7 @@
 """Portable modlists: {schema, repos, mods, untracked}. `untracked` is display
 only and kept out of `mods`, which TavernLib's headless config resolves on
 every boot."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from tavern_shared.mods.base import ModManagerError, _warn
 from tavern_shared.mods.install import (
@@ -9,7 +9,9 @@ from tavern_shared.mods.install import (
     disable_mod, has_target, install_mod_set, list_installed_mods,
 )
 from tavern_shared.mods.pins import _parse_pin_entry
-from tavern_shared.mods.repos import DEFAULT_REPO, _repo_shorthand, _user_repos
+from tavern_shared.mods.repos import (
+    DEFAULT_REPO, _repo_shorthand, _user_repos, replacement_of_unlisted,
+)
 from tavern_shared.mods.resolve import (
     _fetch_manifest, _index_source, resolve_dependencies, resolve_mod_by_id,
 )
@@ -44,6 +46,7 @@ class ImportPlan:
     untracked: list         # the file's `untracked`, display only
     target: str
     no_build: list          # [(mod_id, version)] left out: no build for target
+    replaced: list = field(default_factory=list)   # [(old id, new id)] swapped in
 
     @property
     def blocking(self):
@@ -53,16 +56,20 @@ class ImportPlan:
 def import_modlist(modlist, index, repo_bases, target, game_dir=None):
     """Resolves `mods` through the importer's own repos only; the file's
     `repos` is never fetched from. An entry with no `target` build is left
-    out, so a server can import a client's list. Library conflicts surface
-    here, before anything is confirmed."""
+    out, so a server can import a client's list. An entry for a replaced mod
+    takes its replacement's latest. Library conflicts surface here, before
+    anything is confirmed."""
     if modlist.get("schema") != MODLIST_SCHEMA:
         raise ModManagerError(
             f"This modlist is schema {modlist.get('schema')!r}; this launcher "
             f"only understands schema {MODLIST_SCHEMA}.")
 
-    roots, unresolved, no_build = [], [], []
+    roots, unresolved, no_build, replaced = [], [], [], []
     for entry in modlist.get("mods", []):
         mod_id, version = _parse_pin_entry(entry)
+        if (rep := replacement_of_unlisted(index, mod_id)) is not None:
+            replaced.append((mod_id, rep.by))
+            mod_id, version = rep.by, None
         prefer = _index_source(index, mod_id, repo_bases, version)
         try:
             root = (_fetch_manifest(repo_bases, mod_id, version, prefer) if version
@@ -86,7 +93,7 @@ def import_modlist(modlist, index, repo_bases, target, game_dir=None):
     return ImportPlan(roots=roots, dependencies=dependencies, unresolved=unresolved,
                       hinted_repos=list(modlist.get("repos", [])),
                       untracked=[u for u in (modlist.get("untracked") or []) if u.get("name")],
-                      target=target, no_build=no_build)
+                      target=target, no_build=no_build, replaced=replaced)
 
 
 def modlist_import_disables(game_dir, plan):
@@ -99,7 +106,8 @@ def modlist_import_disables(game_dir, plan):
 
 
 def apply_import(game_dir, plan, on_progress):
-    """Installs the plan's closure, then disables every other enabled mod."""
+    """Installs the plan's closure, then disables every other enabled mod,
+    which includes any old mod a replacement in it stands in for."""
     if plan.blocking:
         raise ModManagerError(
             "This modlist has mods that couldn't be resolved from any "

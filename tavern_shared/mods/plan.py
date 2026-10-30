@@ -18,7 +18,9 @@ from tavern_shared.mods.layout import (
 )
 from tavern_shared.mods.manifest import parity_required, runs_in_scene
 from tavern_shared.mods.pins import _parse_pin_entry
-from tavern_shared.mods.repos import _norm, _repo_shorthand
+from tavern_shared.mods.repos import (
+    _norm, _repo_shorthand, replacement_for, replacement_of_unlisted,
+)
 from tavern_shared.mods.resolve import (
     _fetch_manifest, _index_source, resolve_dependencies,
 )
@@ -123,8 +125,20 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
     for mod_id, version in recommended.items():
         if mod_id not in declined:
             resolve_root(mod_id, version, "recommended")
+    # The mods a server-run id has been replaced by: a pin on one of those
+    # would load alongside the old mod the server asks for.
+    replacing_server = {rep.by: mod_id for mod_id in reason
+                        if (rep := replacement_for(index, mod_id)) is not None}
     for entry in pinned:
         mod_id, version = _parse_pin_entry(entry)
+        if (rep := replacement_of_unlisted(index, mod_id)) is not None:
+            _warn(f"pinned mod '{mod_id}' has been replaced by '{rep.by}'; pinning that "
+                  f"instead.")
+            mod_id, version = rep.by, None
+        if mod_id in replacing_server:
+            _warn(f"pinned mod '{mod_id}' replaces '{replacing_server[mod_id]}', which "
+                  f"this server runs, so it's left out of this join.")
+            continue
         exact_pin[mod_id] = version
         if mod_id in reason:
             continue
