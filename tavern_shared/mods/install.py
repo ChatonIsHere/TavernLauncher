@@ -21,6 +21,7 @@ from tavern_shared.mods.layout import (
 from tavern_shared.mods.manifest import (
     SUPPORTED_MANIFEST_MAJOR, _artifacts_from_list, parity_required,
 )
+from tavern_shared.mods.repos import replacement_for
 from tavern_shared.mods.resolve import _fetch_manifest, resolve_dependencies
 
 
@@ -453,6 +454,30 @@ def install_dependencies(game_dir, rec, index, repo_bases, target, on_progress):
                            dependencies=rec.get("dependencies") or {})
     deps = resolve_dependencies([root], index, repo_bases, target)
     return install_mod_set(game_dir, deps, target, on_progress)
+
+
+def replaced_by(index, rec):
+    """The Replacement that retires an installed record: only the one its own
+    source declared, so another source can't take it over."""
+    return replacement_for(index, rec.get("id"), rec.get("source_repo") or "")
+
+
+def retire_replaced(game_dir, index, on_progress):
+    """Uninstalls each installed mod its source has replaced, once the
+    replacement is installed and enabled for every target the old one is, so
+    the two never both load. Returns [(old id, new id)] for each removed."""
+    recs = {r["id"]: r for r in list_installed_mods(game_dir)}
+    removed = []
+    for old_id, rec in sorted(recs.items()):
+        rep = replaced_by(index, rec)
+        new = recs.get(rep.by) if rep else None
+        if not new or not new.get("enabled", True):
+            continue
+        if all(has_target(new, t) for t in installed_targets(rec)):
+            on_progress(f"Removing {rec.get('name') or old_id}: {rep.by} replaces it.")
+            uninstall_mod(game_dir, old_id)
+            removed.append((old_id, rep.by))
+    return removed
 
 
 def _already_installed(game_dir, mod, target):

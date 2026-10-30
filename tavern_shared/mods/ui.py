@@ -20,7 +20,7 @@ from tavern_shared.mods.install import (
     _highest_by_id, _is_pre_v2, _verify_memo, disable_mod, disable_untracked_dll, enable_mod,
     enable_untracked_dll, has_target, install_dependencies, install_mod_set, installed_targets,
     list_installed_mods, list_mods, list_untracked_mods, missing_dependencies, mod_status,
-    plan_mod_install, uninstall_mod,
+    plan_mod_install, replaced_by, retire_replaced, uninstall_mod,
 )
 from tavern_shared.mods.manifest import runs_in_scene
 from tavern_shared.mods.modlist import (
@@ -184,16 +184,43 @@ class ModListWindow(_Dialog):
         done = f"{label} installed."
         if skipped:
             done += f" It still needs {len(skipped)} other mod(s)."
-        run_bg(self, lambda: install_mod_set(game_dir, mods, target,
-                                             lambda m: post(self, self._status.set, m)),
-               on_ok=lambda _: self._finish(done),
+        def install():
+            progress = lambda m: post(self, self._status.set, m)
+            install_mod_set(game_dir, mods, target, progress)
+            return self._retire(progress)
+        run_bg(self, install,
+               on_ok=lambda removed: self._finish(done + removed),
                on_err=lambda e: self._finish(f"Install failed: {e}"))
+
+    def _retire(self, progress):
+        """In the worker after an install: removes the mods it replaced (see
+        retire_replaced) and moves their pins on. Returns text for the
+        status line."""
+        removed = retire_replaced(self._game_dir, self._index, progress)
+        if removed and self._target == "client_windows":
+            cfg = load_cfg()
+            pinned = {_parse_pin_entry(p)[0] for p in list_pinned(cfg)}
+            for old_id, new_id in removed:
+                if old_id in pinned:
+                    remove_pin(cfg, old_id)
+                    if new_id not in pinned:
+                        add_pin(cfg, new_id)
+        return "".join(f" Removed {old_id}, which it replaces." for old_id, _new in removed)
 
     def _record(self, mod_id):
         return next((r for r in self._installed_recs if r.get("id") == mod_id), None)
 
     def _mod_name(self, mod_id):
         return next((s.name for s in self._index if s.id == mod_id), mod_id)
+
+    def _name_by(self, mod_id):
+        """"Name by Author", from the index, else the install record: a
+        replacement often keeps its old mod's name."""
+        s = next((s for s in self._index if s.id == mod_id), None)
+        rec = self._record(mod_id) or {}
+        name = s.name if s else rec.get("name") or mod_id
+        author = s.author if s else rec.get("author") or mod_id.split(".", 1)[0]
+        return f"{name} by {author}"
 
     def _dep_line(self, dep):
         """(title, note, description) for one row of the dependency prompt."""
@@ -235,9 +262,12 @@ class ModListWindow(_Dialog):
             return
         self._set_busy(True, f"Installing what {name} needs...")
         rec, index, game_dir, target = self._record(mod_id), self._index, self._game_dir, self._target
-        run_bg(self, lambda: install_dependencies(game_dir, rec, index, list_repos(load_cfg()), target,
-                                                  lambda m: post(self, self._status.set, m)),
-               on_ok=lambda _: self._finish(f"Installed what {name} needs."),
+        def install():
+            progress = lambda m: post(self, self._status.set, m)
+            install_dependencies(game_dir, rec, index, list_repos(load_cfg()), target, progress)
+            return self._retire(progress)
+        run_bg(self, install,
+               on_ok=lambda removed: self._finish(f"Installed what {name} needs.{removed}"),
                on_err=lambda e: self._finish(f"Install failed: {e}"))
 
 
@@ -714,6 +744,7 @@ class ModManagerWindow(ModListWindow):
         "outdated": "Update ready",
         "unknown":  "Installed",
         "needs":    "Needs mods",
+        "replaced": "Replaced",
     }
 
     def __init__(self, parent, game_dir, target="client_windows", on_change=None,
@@ -744,6 +775,7 @@ class ModManagerWindow(ModListWindow):
         self._tree = _mk_tree(table_wrap, self._COLS, self._WIDTHS, height=10)
         for tag, color in (("missing", PARCH), ("damaged", RED), ("current", GREEN),
                            ("outdated", AMBER), ("unknown", MUTED), ("needs", AMBER),
+                           ("replaced", AMBER),
                            ("untracked", PARCH), ("disabled", MUTED)):
             self._tree.tag_configure(tag, foreground=color)
         self._tree.bind("<<TreeviewSelect>>", lambda e: self._on_select())
@@ -757,9 +789,10 @@ class ModManagerWindow(ModListWindow):
         self._toggle_btn = _btn(bar, "Disable", self._on_toggle, style="normal",
                                 font=("Segoe UI",9), pady=5, padx=14)
         self._toggle_btn.pack(side="left", padx=8)
-        self._deps_btn = _btn(bar, "Install Dependencies", self._on_install_deps, style="normal",
-                              font=("Segoe UI",9), pady=5, padx=14)
-        self._deps_btn.pack(side="left")
+        # Switch to a replacement, or install missing dependencies.
+        self._fix_btn = _btn(bar, "Install Dependencies", self._on_fix, style="normal",
+                             font=("Segoe UI",9), pady=5, padx=14)
+        self._fix_btn.pack(side="left")
         self._refresh_btn = _btn(bar, "Refresh", lambda: self._load(force=True),
                                  style="dim", font=("Segoe UI",9), pady=5, padx=12)
         self._refresh_btn.pack(side="right")
@@ -814,18 +847,21 @@ class ModManagerWindow(ModListWindow):
             if not mod_id or not record_matches_target(meta, self._target):
                 continue
             s = summaries.get(mod_id)
+            # A mod no source lists any more (a replaced one) is named from its record.
+            source = s.source_repo if s else meta.get("source_repo")
             rows[f"m:{mod_id}"] = {
                 "kind": "managed", "key": mod_id,
-                "name": s.name if s else mod_id,
-                "author": s.author if s else "",
+                "name": s.name if s else meta.get("name") or mod_id,
+                "author": s.author if s else meta.get("author") or "",
                 "installed": meta.get("version", "?"),
                 "latest": s.highest() if s else "-",
                 "managed": "Managed",
-                "source": source_label(s.source_repo) if s else "-",
+                "source": source_label(source) if source else "-",
                 "summary": s, "state": "unknown",
                 "enabled": meta.get("enabled", True),
                 "targets": installed_targets(meta),
                 "missing": self._missing_for(mod_id),
+                "replaced": replaced_by(self._index, meta),
             }
         for u in untracked:
             rows[f"u:{u['kind']}:{u['name']}"] = {
@@ -850,8 +886,11 @@ class ModManagerWindow(ModListWindow):
             return "disabled"
         if r["kind"] != "managed":
             return "untracked"
-        if r["missing"] and r["state"] != "damaged":
-            return "needs"
+        if r["state"] != "damaged":
+            if r["replaced"]:
+                return "replaced"
+            if r["missing"]:
+                return "needs"
         return r["state"] or "current"
 
     def _row_values(self, row_id):
@@ -884,14 +923,17 @@ class ModManagerWindow(ModListWindow):
 
     def _sync_buttons(self):
         r = self._selected_row()
+        rep = r.get("replaced") if r else None
+        self._fix_btn.config(text=f"Switch to {self._name_by(rep.by)}" if rep
+                             else "Install Dependencies")
         if self._busy or r is None:
             self._uninstall_btn.config(state="disabled")
             self._toggle_btn.config(state="disabled")
-            self._deps_btn.config(state="disabled")
+            self._fix_btn.config(state="disabled")
             return
         self._uninstall_btn.config(state="normal" if r["kind"] == "managed" else "disabled")
         self._toggle_btn.config(text="Enable" if not r["enabled"] else "Disable", state="normal")
-        self._deps_btn.config(state="normal" if r.get("missing") else "disabled")
+        self._fix_btn.config(state="normal" if rep or r.get("missing") else "disabled")
 
     def _on_right_click(self, event):
         row = self._tree.identify_row(event.y)
@@ -909,8 +951,11 @@ class ModManagerWindow(ModListWindow):
                          state="normal" if managed else "disabled")
         menu.add_command(label="Enable" if not r["enabled"] else "Disable",
                          command=self._on_toggle)
-        if r.get("missing"):
-            menu.add_command(label="Install Dependencies", command=self._on_install_deps)
+        if r.get("replaced"):
+            menu.add_command(label=f"Switch to {self._name_by(r['replaced'].by)}",
+                             command=self._on_fix)
+        elif r.get("missing"):
+            menu.add_command(label="Install Dependencies", command=self._on_fix)
         if managed and self._target == "client_windows":
             menu.add_separator()
             # Kept on self: a BooleanVar with no Python reference can be
@@ -960,13 +1005,42 @@ class ModManagerWindow(ModListWindow):
     def _on_select(self):
         self._sync_buttons()
         r = self._selected_row()
-        if r and r.get("missing") and not self._busy:
+        if not r or self._busy:
+            return
+        if r.get("replaced"):
+            rep = r["replaced"]
+            self._status.set(f"{self._name_by(r['key'])} has been replaced by "
+                             f"{self._name_by(rep.by)}."
+                             + (f" {rep.note}" if rep.note else ""))
+        elif r.get("missing"):
             self._status.set(f"{r['name']} needs {self._missing_text(r['missing'])}.")
 
-    def _on_install_deps(self):
+    def _on_fix(self):
         r = self._selected_row()
-        if r and r.get("missing"):
+        if not r or self._busy:
+            return
+        if r.get("replaced"):
+            self._switch(r)
+        elif r.get("missing"):
             self._install_deps(r["key"], r["name"])
+
+    def _switch(self, r):
+        """Installs the replacement, through the usual install and its
+        dependency prompt; the install then removes the old mod."""
+        rep = r["replaced"]
+        new = _highest_by_id(self._index).get(rep.by)
+        if new is None:
+            self._status.set(f"{rep.by} isn't available from your sources right now. "
+                             f"Try Refresh.")
+            return
+        note = f"\n\n{rep.note}" if rep.note else ""
+        old_label, new_label = self._name_by(r["key"]), self._name_by(rep.by)
+        if not messagebox.askokcancel(f"Switch to {new.name}",
+                f"{old_label} has been replaced by {new_label} in "
+                f"{source_label(rep.source_repo)}.{note}\n\n"
+                f"Switching installs {new_label}, then removes {old_label}.", parent=self):
+            return
+        self._install(new)
 
     def _on_toggle(self):
         if self._busy:
@@ -1079,6 +1153,9 @@ class ModManagerWindow(ModListWindow):
         if all_mods:
             lines.append("Will install:")
             lines += [f"  • {m.id} {m.version}" for m in all_mods]
+        if plan.replaced:
+            lines.append("Replaced since this modlist was made, so the new mod is used:")
+            lines += [f"  • {old_id} → {new_id}" for old_id, new_id in plan.replaced]
         if to_disable:
             lines.append("Will disable (not in this modlist):")
             lines += [f"  • {mid}" for mid in to_disable]

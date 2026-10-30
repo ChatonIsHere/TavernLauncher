@@ -3,6 +3,7 @@ import json
 import time
 import urllib.request
 import urllib.error
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
 from tavern_shared.mods.base import ModManagerError, _parse_version, _warn, save_cfg
@@ -119,12 +120,61 @@ def remove_repo(cfg, ref):
     save_cfg(cfg)
 
 
-_index_cache = {}   # base -> (fetched_at, list[ModSummary])
+@dataclass
+class Replacement:
+    """One entry of a source's `replaced`: old_id is retired in favour of by."""
+    old_id: str
+    by: str
+    note: str
+    source_repo: str
+
+
+class ModIndex(list):
+    """fetch_indexes' ModSummaries, with every source's replacements."""
+
+    def __init__(self, summaries=(), replaced=()):
+        super().__init__(summaries)
+        self.replaced = list(replaced)
+
+
+def replacement_for(index, mod_id, source_repo=None):
+    """The Replacement of mod_id. With source_repo, only that source's counts:
+    a source can retire only what it served. Without, DEFAULT_REPO's wins,
+    then the first source's."""
+    reps = [r for r in getattr(index, "replaced", ()) if r.old_id == mod_id]
+    if source_repo is not None:
+        return next((r for r in reps if _norm(r.source_repo) == _norm(source_repo)), None)
+    return next((r for r in reps if _is_default(r.source_repo)), reps[0] if reps else None)
+
+
+def replacement_of_unlisted(index, mod_id):
+    """The Replacement to use for an id named without a source (a dependency,
+    a pin, a modlist entry): only when no source lists the id and one lists
+    its replacement."""
+    listed = {s.id for s in index}
+    if mod_id in listed:
+        return None
+    rep = replacement_for(index, mod_id)
+    return rep if rep and rep.by in listed else None
+
+
+def _replacements_from(index, base):
+    raw = index.get("replaced")
+    out = []
+    for old_id, entry in (raw.items() if isinstance(raw, dict) else ()):
+        if isinstance(entry, dict) and isinstance(entry.get("by"), str) and entry["by"] != old_id:
+            note = entry.get("note")
+            out.append(Replacement(old_id, entry["by"], note if isinstance(note, str) else "", base))
+    return out
+
+
+_index_cache = {}   # base -> (fetched_at, (list[ModSummary], list[Replacement]))
 
 
 def _fetch_repo_index(base, force):
-    """One repo's ModSummaries, cached for _INDEX_TTL_SECONDS. A failed fetch
-    or unsupported index warns and yields the stale cache or []."""
+    """One repo's (ModSummaries, Replacements), cached for _INDEX_TTL_SECONDS.
+    A failed fetch or unsupported index warns and yields the stale cache or
+    nothing."""
     base = _norm(base)
     now = time.time()
     hit = _index_cache.get(base)
@@ -138,28 +188,32 @@ def _fetch_repo_index(base, force):
                                   f"v{SUPPORTED_INDEX_MAJOR}")
     except ModManagerError as e:
         _warn(f"skipping repo {base}: {e}")
-        return hit[1] if hit else []
+        return hit[1] if hit else ([], [])
 
     out = []
     for mod_id, by_major in index.get("mods", {}).items():
         if isinstance(by_major, dict):
             out += [s for s in (_summary_from_dict(e, mod_id, base) for e in by_major.values())
                     if s is not None]
-    _index_cache[base] = (now, out)
-    return out
+    _index_cache[base] = (now, (out, _replacements_from(index, base)))
+    return _index_cache[base][1]
 
 
 def fetch_indexes(repo_bases, force=False):
     """Every repo's index merged to one entry per (id, major): DEFAULT_REPO
-    wins a collision, otherwise the highest version does."""
+    wins a collision, otherwise the highest version does. Carries every
+    repo's replacements."""
     merged = {}   # (id, major) -> (ModSummary, from_default)
+    replaced = []
     for base in repo_bases:
         from_default = _is_default(base)
-        for s in _fetch_repo_index(base, force):
+        summaries, reps = _fetch_repo_index(base, force)
+        replaced += reps
+        for s in summaries:
             key = (s.id, s.major)
             cur = merged.get(key)
             if (cur is None or (from_default and not cur[1])
                     or (from_default == cur[1]
                         and _parse_version(s.highest()) > _parse_version(cur[0].highest()))):
                 merged[key] = (s, from_default)
-    return [s for s, _default in merged.values()]
+    return ModIndex((s for s, _default in merged.values()), replaced)

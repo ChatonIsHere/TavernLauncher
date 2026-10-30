@@ -7,7 +7,7 @@ from tavern_shared.bg import post, run_bg
 from tavern_shared.flashing import start_flashing_button
 from tavern_shared.mod_install import NEEDS_ATTENTION, _mods_need_attention
 from tavern_shared.mods.base import load_cfg
-from tavern_shared.mods.install import list_installed_mods, mod_status
+from tavern_shared.mods.install import list_installed_mods, mod_status, replaced_by
 from tavern_shared.mods.repos import fetch_indexes, list_repos
 from tavern_shared.mods.ui import ModManagerWindow, record_matches_target
 from tavern_shared.mods_window import SetupWindow
@@ -16,7 +16,8 @@ from tavern_shared.theme import SURF2, _btn
 
 
 def count_mods_needing_attention(game_dir, target):
-    """Outdated or damaged community mods; 0 on any failure. Workers only."""
+    """Outdated, damaged or replaced community mods; 0 on any failure.
+    Workers only."""
     try:
         installed = [r for r in list_installed_mods(game_dir)
                      if record_matches_target(r, target)]
@@ -24,7 +25,8 @@ def count_mods_needing_attention(game_dir, target):
             return 0
         index = fetch_indexes(list_repos(load_cfg()))
         return sum(1 for r in installed
-                   if mod_status(game_dir, r["id"], index, target) in ("outdated", "damaged"))
+                   if replaced_by(index, r) is not None
+                   or mod_status(game_dir, r["id"], index, target) in ("outdated", "damaged"))
     except Exception:
         return 0
 
