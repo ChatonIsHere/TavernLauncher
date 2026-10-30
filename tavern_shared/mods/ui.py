@@ -18,9 +18,9 @@ from tavern_shared.mods.base import ModManagerError, _parse_version, load_cfg
 from tavern_shared.mods.cache import clear_mod_cache, ensure_mod_libraries
 from tavern_shared.mods.install import (
     _highest_by_id, _is_pre_v2, _verify_memo, disable_mod, disable_untracked_dll, enable_mod,
-    enable_untracked_dll, has_target, install_mod_closure, installed_targets,
-    list_installed_mods, list_mods, list_untracked_mods, mod_status,
-    uninstall_mod,
+    enable_untracked_dll, has_target, install_dependencies, install_mod_set, installed_targets,
+    list_installed_mods, list_mods, list_untracked_mods, missing_dependencies, mod_status,
+    plan_mod_install, uninstall_mod,
 )
 from tavern_shared.mods.manifest import runs_in_scene
 from tavern_shared.mods.modlist import (
@@ -86,6 +86,7 @@ class ModListWindow(_Dialog):
         self._is_game_running = is_game_running     # see game_guard
         self._server_scene = server_scene           # server only: () -> its scene
         self._index = []
+        self._installed_recs = []   # install records, enabled or not
         self._rows = {}
         self._busy = False
         super().__init__(parent, title, size, minsize)
@@ -156,15 +157,133 @@ class ModListWindow(_Dialog):
                                           f"Installing {mod.name}"):
             return
         label = f"{mod.name} {version}" if version else mod.name
-        self._set_busy(True, f"Installing {label}...")
+        self._set_busy(True, f"Checking what {label} needs...")
         index, game_dir, target = self._index, self._game_dir, self._target
-        def install():
-            install_mod_closure(game_dir, mod, index, list_repos(load_cfg()),
-                                lambda m: post(self, self._status.set, m),
-                                target, version=version)
-        run_bg(self, install,
-               on_ok=lambda _: self._finish(f"{label} installed."),
+        run_bg(self, lambda: plan_mod_install(game_dir, mod, index, list_repos(load_cfg()),
+                                              target, version),
+               on_ok=lambda planned: self._confirm_install(label, *planned),
+               on_err=lambda e: self._set_busy(False, f"Install failed: {e}"))
+
+    def _confirm_install(self, label, root, deps, needed):
+        """Asks about the dependencies not installed yet, which the player may
+        leave out, then installs."""
+        self._set_busy(False)
+        mods, skipped = deps + [root], []
+        if needed:
+            choice = _DependencyPrompt(self, root.name, [self._dep_line(d) for d in needed]).choice
+            if choice is None:
+                self._status.set("Install cancelled.")
+                return
+            if choice == "alone":
+                mods, skipped = [root], needed
+        if not confirm_while_game_running(self, self._is_game_running,
+                                          f"Installing {root.name}"):
+            return
+        self._set_busy(True, f"Installing {label}...")
+        game_dir, target = self._game_dir, self._target
+        done = f"{label} installed."
+        if skipped:
+            done += f" It still needs {len(skipped)} other mod(s)."
+        run_bg(self, lambda: install_mod_set(game_dir, mods, target,
+                                             lambda m: post(self, self._status.set, m)),
+               on_ok=lambda _: self._finish(done),
                on_err=lambda e: self._finish(f"Install failed: {e}"))
+
+    def _record(self, mod_id):
+        return next((r for r in self._installed_recs if r.get("id") == mod_id), None)
+
+    def _mod_name(self, mod_id):
+        return next((s.name for s in self._index if s.id == mod_id), mod_id)
+
+    def _dep_line(self, dep):
+        """(title, note, description) for one row of the dependency prompt."""
+        title = f"{dep.name} {dep.version}" + (f"  ·  {dep.author}" if dep.author else "")
+        rec = self._record(dep.id)
+        if rec is None:
+            note = ""
+        elif not rec.get("enabled", True):
+            note = "Installed but turned off. This turns it back on."
+        else:
+            note = f"Updates the {rec.get('version', '?')} you have."
+        desc = dep.description or ""
+        return title, note, desc if len(desc) <= 160 else desc[:157].rstrip() + "..."
+
+    def _missing_for(self, mod_id):
+        """An installed, enabled mod's unmet dependencies (see missing_dependencies)."""
+        rec = self._record(mod_id)
+        if rec is None or not rec.get("enabled", True) or not has_target(rec, self._target):
+            return []
+        return missing_dependencies(rec, self._installed_recs, self._index, self._target)
+
+    def _missing_text(self, missing):
+        notes = {"missing": "not installed", "disabled": "turned off"}
+        return ", ".join(f"{self._mod_name(dep_id)} ({notes.get(why, f'older than {min_v}')})"
+                         for dep_id, min_v, why in missing)
+
+    def _install_deps(self, mod_id, name):
+        if self._busy:
+            return
+        missing = self._missing_for(mod_id)
+        if not missing:
+            return
+        if not messagebox.askokcancel("Install dependencies",
+                f"{name} needs: {self._missing_text(missing)}.\n\n"
+                f"Install them now? Anything they need comes too.", parent=self):
+            return
+        if not confirm_while_game_running(self, self._is_game_running,
+                                          f"Installing what {name} needs"):
+            return
+        self._set_busy(True, f"Installing what {name} needs...")
+        rec, index, game_dir, target = self._record(mod_id), self._index, self._game_dir, self._target
+        run_bg(self, lambda: install_dependencies(game_dir, rec, index, list_repos(load_cfg()), target,
+                                                  lambda m: post(self, self._status.set, m)),
+               on_ok=lambda _: self._finish(f"Installed what {name} needs."),
+               on_err=lambda e: self._finish(f"Install failed: {e}"))
+
+
+class _DependencyPrompt(_Dialog):
+    """Lists the mods an install would add and asks whether to add them. Once
+    it closes, .choice is "all", "alone" or None (cancelled)."""
+
+    def __init__(self, parent, name, deps):
+        self.choice = None
+        self._mod, self._deps = name, deps
+        super().__init__(parent, "Install dependencies", "")
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.grab_set()
+        parent.wait_window(self)
+
+    def _build(self):
+        _window_header(self, f"{self._mod} needs other mods")
+        tk.Label(self, text=f"{self._mod} uses these mods and may not load without them.",
+                 bg=BG, fg=PARCH, font=("Segoe UI",9), wraplength=480, justify="left"
+        ).pack(anchor="w", padx=16, pady=(12,8))
+        for title, note, desc in self._deps:
+            row = tk.Frame(self, bg=SURF, highlightbackground=BORDER, highlightthickness=1)
+            row.pack(fill="x", padx=16, pady=(0,6))
+            tk.Label(row, text=title, bg=SURF, fg=PARCH, font=("Segoe UI",9,"bold"),
+                     anchor="w").pack(fill="x", padx=8, pady=(6,0))
+            for text, color in ((note, AMBER), (desc, MUTED)):
+                if text:
+                    tk.Label(row, text=text, bg=SURF, fg=color, font=("Segoe UI",8),
+                             wraplength=460, justify="left", anchor="w").pack(fill="x", padx=8)
+            tk.Frame(row, bg=SURF, height=6).pack()
+        tk.Label(self, text=f"If you leave them out, {self._mod} is marked in Get Mods and "
+                            f"the Mod Manager until they're installed.",
+                 bg=BG, fg=MUTED, font=("Segoe UI",8), wraplength=480, justify="left"
+        ).pack(anchor="w", padx=16, pady=(4,10))
+        bar = tk.Frame(self, bg=BG)
+        bar.pack(fill="x", padx=16, pady=(0,14))
+        _btn(bar, "Install all", lambda: self._pick("all"), style="primary",
+             font=("Segoe UI",9), pady=5, padx=14).pack(side="left")
+        _btn(bar, f"Only {self._mod}", lambda: self._pick("alone"),
+             font=("Segoe UI",9), pady=5, padx=14).pack(side="left", padx=8)
+        _btn(bar, "Cancel", self.destroy, style="dim",
+             font=("Segoe UI",9), pady=5, padx=14).pack(side="right")
+
+    def _pick(self, choice):
+        self.choice = choice
+        self.destroy()
 
 
 # (id, version) -> "Requires: ..." text, kept across windows.
@@ -175,7 +294,7 @@ class CommunityModsWindow(ModListWindow):
     """Browse the merged index and install from it, as cards with a search box."""
 
     _COL_LABELS = ("Status", "Author", "Mod", "Installed", "Latest", "Source")
-    _WIDTHS     = (86,       100,      220,   66,          60,       104)
+    _WIDTHS     = (86,       100,      208,   66,          60,       116)
     _STATE_STYLE = {    # state -> (status, its colour, button)
         "missing":  ("Available",    PARCH, "Install"),
         "damaged":  ("Damaged",      RED,   "Reinstall"),
@@ -252,7 +371,7 @@ class CommunityModsWindow(ModListWindow):
                on_err=lambda e: self._set_busy(False, f"Couldn't load mods: {e}"))
 
     def _render(self, repos, index, available, installed):
-        self._repos, self._index = repos, index
+        self._repos, self._index, self._installed_recs = repos, index, installed
         installed_by_id = self._installed_versions(installed)
         self._rows = {s.id: {
             "id": s.id, "name": s.name, "author": s.author or "",
@@ -260,6 +379,7 @@ class CommunityModsWindow(ModListWindow):
             "latest": s.highest(), "summary": s,
             "installed": installed_by_id.get(s.id), "state": "missing",
             "own": is_own_mod(s.id, s.source_repo),
+            "missing": self._missing_for(s.id),
         } for s in available}
         for child in self._cards_frame.winfo_children():
             child.destroy()
@@ -307,10 +427,8 @@ class CommunityModsWindow(ModListWindow):
     def _mk_card(self, mod_id):
         r = self._rows[mod_id]
         s = r["summary"]
-        # The source's own mods get an amber edge and a star.
         card = tk.Frame(self._cards_frame, bg=SURF,
-                        highlightbackground=AMBER if r["own"] else BORDER,
-                        highlightthickness=2 if r["own"] else 1)
+                        highlightbackground=BORDER, highlightthickness=1)
 
         top = tk.Frame(card, bg=SURF)
         top.pack(fill="x", pady=(8,0))
@@ -323,13 +441,15 @@ class CommunityModsWindow(ModListWindow):
         status_lbl = tk.Label(cells[0], bg=SURF, font=("Segoe UI",9), anchor="w")
         status_lbl.pack(fill="both", padx=6)
         installed_var = tk.StringVar(value=r["installed"] or "-")
-        for cell, text, bold in ((cells[1], r["author"] or "-", False),
-                                 (cells[2], ("★ " if r["own"] else "") + r["name"], True),
-                                 (cells[3], installed_var, False),
-                                 (cells[4], r["latest"], False),
-                                 (cells[5], source_label(s.source_repo), False)):
+        # The source's own mods carry a star in the Source column.
+        source = source_label(s.source_repo) + (" ★" if r["own"] else "")
+        for cell, text, bold, color in ((cells[1], r["author"] or "-", False, PARCH),
+                                        (cells[2], r["name"], True, PARCH),
+                                        (cells[3], installed_var, False, PARCH),
+                                        (cells[4], r["latest"], False, PARCH),
+                                        (cells[5], source, False, AMBER if r["own"] else PARCH)):
             opts = {"textvariable": text} if isinstance(text, tk.StringVar) else {"text": text}
-            tk.Label(cell, **opts, bg=SURF, fg=PARCH, anchor="w",
+            tk.Label(cell, **opts, bg=SURF, fg=color, anchor="w",
                      font=("Segoe UI",9,"bold") if bold else ("Segoe UI",9)
             ).pack(fill="both", padx=6)
 
@@ -348,6 +468,16 @@ class CommunityModsWindow(ModListWindow):
                  bg=SURF, fg=PARCH, font=("Segoe UI",8), wraplength=680,
                  justify="left", anchor="w"
         ).pack(side="left", fill="x", expand=True)
+
+        # Unmet dependencies of an installed copy, shown only while there are some.
+        needs_row = tk.Frame(card, bg=SURF)
+        needs_var = tk.StringVar()
+        tk.Label(needs_row, textvariable=needs_var, bg=SURF, fg=AMBER, font=("Segoe UI",8),
+                 wraplength=600, justify="left", anchor="w"
+        ).pack(side="left", fill="x", expand=True)
+        deps_btn = _btn(needs_row, "Install deps", lambda: self._install_deps(mod_id, r["name"]),
+                        font=("Segoe UI",8), pady=2, padx=8)
+        deps_btn.pack(side="right")
 
         # Builds, parity, scenes and requires: collapsed until asked for.
         details = tk.Frame(card, bg=SURF)
@@ -369,6 +499,7 @@ class CommunityModsWindow(ModListWindow):
             "card": card, "status_lbl": status_lbl, "installed_var": installed_var,
             "btn": btn, "requires_var": requires_var,
             "desc_row": desc_row, "details": details, "toggle": toggle, "expanded": False,
+            "needs_row": needs_row, "needs_var": needs_var, "deps_btn": deps_btn,
         }
         self._apply_card_state(mod_id)
 
@@ -386,10 +517,20 @@ class CommunityModsWindow(ModListWindow):
             w["toggle"].config(text="Details ▸")
 
     def _apply_card_state(self, mod_id):
-        word, color, label = self._STATE_STYLE[self._rows[mod_id]["state"]]
+        r = self._rows[mod_id]
+        word, color, label = self._STATE_STYLE[r["state"]]
         w = self._card_widgets[mod_id]
+        if r["missing"] and r["state"] != "missing":
+            word, color = "Needs mods", AMBER
         w["status_lbl"].config(text=word, fg=color)
         w["btn"].config(text=label, state="disabled" if self._busy else "normal")
+        w["deps_btn"].config(state="disabled" if self._busy else "normal")
+        if r["missing"]:
+            w["needs_var"].set("Needs " + self._missing_text(r["missing"]))
+            if not w["needs_row"].winfo_manager():
+                w["needs_row"].pack(fill="x", padx=10, pady=(0,8), after=w["desc_row"])
+        else:
+            w["needs_row"].pack_forget()
 
     def _busy_changed(self):
         for mod_id in self._card_widgets:
@@ -408,10 +549,13 @@ class CommunityModsWindow(ModListWindow):
         return list_installed_mods(self._game_dir)
 
     def _apply_installed(self, installed):
+        self._installed_recs = installed
         versions = self._installed_versions(installed)
         for mod_id, r in self._rows.items():
             r["installed"] = versions.get(mod_id)
+            r["missing"] = self._missing_for(mod_id)
             self._card_widgets[mod_id]["installed_var"].set(r["installed"] or "-")
+            self._apply_card_state(mod_id)
 
     def _queue_dep_fetches(self):
         """Requires lines, for the cards on show with their details open."""
@@ -569,6 +713,7 @@ class ModManagerWindow(ModListWindow):
         "current":  "Up to date",
         "outdated": "Update ready",
         "unknown":  "Installed",
+        "needs":    "Needs mods",
     }
 
     def __init__(self, parent, game_dir, target="client_windows", on_change=None,
@@ -598,10 +743,10 @@ class ModManagerWindow(ModListWindow):
         table_wrap.pack(fill="both", expand=True, padx=16)
         self._tree = _mk_tree(table_wrap, self._COLS, self._WIDTHS, height=10)
         for tag, color in (("missing", PARCH), ("damaged", RED), ("current", GREEN),
-                           ("outdated", AMBER), ("unknown", MUTED),
+                           ("outdated", AMBER), ("unknown", MUTED), ("needs", AMBER),
                            ("untracked", PARCH), ("disabled", MUTED)):
             self._tree.tag_configure(tag, foreground=color)
-        self._tree.bind("<<TreeviewSelect>>", lambda e: self._sync_buttons())
+        self._tree.bind("<<TreeviewSelect>>", lambda e: self._on_select())
         self._tree.bind("<Button-3>", self._on_right_click)
 
         bar = tk.Frame(self, bg=BG)
@@ -612,6 +757,9 @@ class ModManagerWindow(ModListWindow):
         self._toggle_btn = _btn(bar, "Disable", self._on_toggle, style="normal",
                                 font=("Segoe UI",9), pady=5, padx=14)
         self._toggle_btn.pack(side="left", padx=8)
+        self._deps_btn = _btn(bar, "Install Dependencies", self._on_install_deps, style="normal",
+                              font=("Segoe UI",9), pady=5, padx=14)
+        self._deps_btn.pack(side="left")
         self._refresh_btn = _btn(bar, "Refresh", lambda: self._load(force=True),
                                  style="dim", font=("Segoe UI",9), pady=5, padx=12)
         self._refresh_btn.pack(side="right")
@@ -658,6 +806,7 @@ class ModManagerWindow(ModListWindow):
 
     def _apply_installed(self, on_disk):
         installed, untracked = on_disk
+        self._installed_recs = installed
         summaries = _highest_by_id(self._index)
         rows = {}
         for meta in installed:
@@ -676,6 +825,7 @@ class ModManagerWindow(ModListWindow):
                 "summary": s, "state": "unknown",
                 "enabled": meta.get("enabled", True),
                 "targets": installed_targets(meta),
+                "missing": self._missing_for(mod_id),
             }
         for u in untracked:
             rows[f"u:{u['kind']}:{u['name']}"] = {
@@ -700,6 +850,8 @@ class ModManagerWindow(ModListWindow):
             return "disabled"
         if r["kind"] != "managed":
             return "untracked"
+        if r["missing"] and r["state"] != "damaged":
+            return "needs"
         return r["state"] or "current"
 
     def _row_values(self, row_id):
@@ -709,7 +861,7 @@ class ModManagerWindow(ModListWindow):
         elif r.get("enabled") is False:
             status = "Disabled"
         else:
-            status = self._STATE_WORD.get(r["state"], "")
+            status = self._STATE_WORD.get(self._row_tag(r), "")
         return (status, r["author"], r["name"],
                 r["installed"], r["latest"], r["managed"], r["source"])
 
@@ -735,9 +887,11 @@ class ModManagerWindow(ModListWindow):
         if self._busy or r is None:
             self._uninstall_btn.config(state="disabled")
             self._toggle_btn.config(state="disabled")
+            self._deps_btn.config(state="disabled")
             return
         self._uninstall_btn.config(state="normal" if r["kind"] == "managed" else "disabled")
         self._toggle_btn.config(text="Enable" if not r["enabled"] else "Disable", state="normal")
+        self._deps_btn.config(state="normal" if r.get("missing") else "disabled")
 
     def _on_right_click(self, event):
         row = self._tree.identify_row(event.y)
@@ -755,6 +909,8 @@ class ModManagerWindow(ModListWindow):
                          state="normal" if managed else "disabled")
         menu.add_command(label="Enable" if not r["enabled"] else "Disable",
                          command=self._on_toggle)
+        if r.get("missing"):
+            menu.add_command(label="Install Dependencies", command=self._on_install_deps)
         if managed and self._target == "client_windows":
             menu.add_separator()
             # Kept on self: a BooleanVar with no Python reference can be
@@ -800,6 +956,17 @@ class ModManagerWindow(ModListWindow):
                on_ok=lambda removed: self._finish(
                    f"{name} removed." if removed else f"{name} was not installed."),
                on_err=lambda e: self._finish(f"Remove failed: {e}"))
+
+    def _on_select(self):
+        self._sync_buttons()
+        r = self._selected_row()
+        if r and r.get("missing") and not self._busy:
+            self._status.set(f"{r['name']} needs {self._missing_text(r['missing'])}.")
+
+    def _on_install_deps(self):
+        r = self._selected_row()
+        if r and r.get("missing"):
+            self._install_deps(r["key"], r["name"])
 
     def _on_toggle(self):
         if self._busy:
