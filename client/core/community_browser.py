@@ -10,7 +10,7 @@ from tavern_shared.theme import (
 from tavern_shared.window_chrome import _start_hidden, _finish_dark_window, _set_window_icon
 
 from client.core.config import load_cfg, save_cfg, COMMUNITY_API, CONFIG_FILE
-from client.core.auth import ping_server
+from client.core.auth import ping_server, split_host_port
 
 def _scene_label(s):
     # Tutorial wins over quest, same as the server launcher and TavernLib.
@@ -209,8 +209,7 @@ class CommunityBrowser(tk.Toplevel):
         in place -- no full re-populate, so an in-progress search/sort
         never gets disturbed by a ping landing mid-typing."""
         for srv in self._servers:
-            address = srv.get("address","")
-            host = address.split(":")[0]
+            host = split_host_port(srv.get("address",""))[0]
             if not host:
                 continue
             threading.Thread(target=self._ping_one, args=(srv, host), daemon=True).start()
@@ -387,9 +386,8 @@ class CommunityBrowser(tk.Toplevel):
         srv = self._selected_server()
         if not srv: return
         kind = srv.get("kind", "official")
-        address = srv.get("address","")
-        host = address.split(":")[0]
-        port = address.split(":")[1] if ":" in address else "1757"
+        host, port = split_host_port(srv.get("address",""))
+        port = str(port or 1757)
         # "address" is "ip:port" for display — only the host is meaningful to
         # the auth handshake / headless join today, but the port still gets
         # passed through so Join Server can hand it to the game itself.
@@ -399,9 +397,8 @@ class CommunityBrowser(tk.Toplevel):
     def _save_favorite(self):
         srv = self._selected_server()
         if not srv: return
-        address = srv.get("address","")
-        host = address.split(":")[0]
-        port = address.split(":")[1] if ":" in address else "1757"
+        host, port = split_host_port(srv.get("address",""))
+        port = str(port or 1757)
         name = srv.get("name") or host
         cfg = load_cfg()
         saved = cfg.get("saved_servers", [])

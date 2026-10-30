@@ -1,7 +1,9 @@
 """Floating help tab + docked help panel. Both are separate windows that
 track the main window's position - neither touches the main window's own
 size or widget tree at all."""
+import ctypes
 import os
+import sys
 import tkinter as tk
 import webbrowser
 
@@ -61,6 +63,27 @@ td, th {{ border: 1px solid {border}; padding: 5px 8px; font-size: 11px; }}
 </body></html>"""
 
 
+def _own_by(window, anchor):
+    """Keeps a borderless window stacked with anchor. On Windows,
+    transient() on an overrideredirect window makes it a child of the
+    desktop, stacked apart from anchor - keeping it above anchor then took
+    a lift(), which put it over every other window too, the Mod Manager
+    included. Owned by anchor instead (set once it's mapped, so the frame
+    exists), Windows keeps it above anchor and under anchor's dialogs,
+    and minimizes it with anchor."""
+    if sys.platform != "win32":
+        window.transient(anchor)
+        return
+    try:
+        window.update_idletasks()
+        GWLP_HWNDPARENT = -8    # the owner, for a top-level window
+        ctypes.windll.user32.SetWindowLongPtrW(
+            ctypes.c_void_p(int(window.wm_frame(), 16)), GWLP_HWNDPARENT,
+            ctypes.c_void_p(int(anchor.wm_frame(), 16)))
+    except Exception:
+        pass
+
+
 def _render_html(slug):
     title, filename = PAGE_LOOKUP[slug]
     path = os.path.join(HELP_CONTENT_DIR, filename)
@@ -87,12 +110,12 @@ class HelpDockWindow(tk.Toplevel):
         self._anchor = anchor
         _start_hidden(self)
         self.overrideredirect(True)
-        self.transient(anchor)
         self.configure(bg=BG, highlightbackground=BORDER, highlightthickness=1)
         self._nav_buttons = {}
         self._build()
         self._reposition()
         _finish_dark_window(self)
+        _own_by(self, anchor)
         self.show("index")
 
     def _build(self):
@@ -160,7 +183,6 @@ class HelpTab(tk.Toplevel):
         self._dock = None
         _start_hidden(self)
         self.overrideredirect(True)
-        self.transient(anchor)
         self.configure(bg=SURF2, highlightbackground=BORDER, highlightthickness=1)
 
         tk.Button(self, text="📖", bg=SURF2, fg=AMBER,
@@ -170,6 +192,7 @@ class HelpTab(tk.Toplevel):
 
         self._reposition()
         _finish_dark_window(self)
+        _own_by(self, anchor)
 
         anchor.bind("<Configure>", self._on_anchor_configure, add="+")
         anchor.bind("<Destroy>", self._on_anchor_destroy, add="+")
@@ -194,7 +217,7 @@ class HelpTab(tk.Toplevel):
             y = self._anchor.winfo_rooty() + 70
             self.geometry(f"+{base_x}+{y}")
             self.update_idletasks()
-            self.lift()
+            self._keep_above_anchor()
         except tk.TclError:
             pass
 
@@ -205,7 +228,12 @@ class HelpTab(tk.Toplevel):
         else:
             self._dock = HelpDockWindow(self._anchor)
         self._reposition()
-        self.lift()
+
+    def _keep_above_anchor(self):
+        # Ownership does this on Windows; a lift() there would also put
+        # the tab over the launcher's other windows (see _own_by).
+        if sys.platform != "win32":
+            self.lift()
 
 
 def attach_help_tab(root):

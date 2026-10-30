@@ -19,9 +19,11 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 from tavern_shared.theme import (
     BG, SURF, SURF2, BORDER, AMBER, AMBERDIM, PARCH, MUTED, GREEN, RED, CYAN, MONO,
     _btn, _field, _hint, _section_label, _mk_tree, _mk_scrollbar, _fix_combobox_popdown_colors,
+    _wheel_scrolls,
 )
 from tavern_shared.window_chrome import _start_hidden, _finish_dark_window, _set_window_icon
 from tavern_shared.ws_console_client import WsConsoleClient
+from client.core.auth import split_host_port
 from tavern_shared.paths import _tavern_data_dir
 from client.core.tavernkeeper.registry import register_tab, ordered_tabs, registry
 from tavern_shared.reorder_dialog import ReorderDialog
@@ -104,7 +106,8 @@ class TavernKeeperWindow(tk.Toplevel):
         self.geometry(f"420x{self.winfo_reqheight()}")
 
     def _attempt_connect(self):
-        host = self.v_host.get().strip() or "127.0.0.1"
+        # The console has its own port: a game port typed with the host is dropped.
+        host = split_host_port(self.v_host.get())[0] or "127.0.0.1"
         token = self.v_token.get().strip()
         if not token:
             self._connect_status.set("Enter the console token.")
@@ -616,12 +619,7 @@ class TavernKeeperWindow(tk.Toplevel):
         ))
         self._nearby_canvas.bind("<Configure>", lambda e:
             self._nearby_canvas.itemconfig(self._nearby_canvas_window, width=e.width))
-
-        def _nearby_mousewheel(event):
-            self._nearby_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        self._nearby_canvas.bind("<MouseWheel>", _nearby_mousewheel)
-        self._nearby_inner.bind("<MouseWheel>", _nearby_mousewheel)
-        self._nearby_mousewheel = _nearby_mousewheel
+        _wheel_scrolls(self._nearby_canvas, self._nearby_inner)
 
         # ── Right: Selection history ──────────────────────────────────────
         right = tk.Frame(cols, bg=BG)
@@ -640,8 +638,6 @@ class TavernKeeperWindow(tk.Toplevel):
         hsb.pack(side="right", fill="y")
         self._history_listbox.config(yscrollcommand=hsb.set)
         self._history_listbox.pack(side="left", fill="both", expand=True, padx=2, pady=2)
-        self._history_listbox.bind("<MouseWheel>",
-            lambda e: self._history_listbox.yview_scroll(int(-1*(e.delta/120)), "units"))
         # Click history entry to re-select that entity
         self._history_listbox.bind("<<ListboxSelect>>", self._on_history_select)
         _btn(right, "Clear", self._on_history_clear,
@@ -734,12 +730,6 @@ class TavernKeeperWindow(tk.Toplevel):
                 self._send(f"select {eid}")
                 self._add_to_history(eid, name)
             lbl.bind("<Button-1>", on_click)
-            # Mousewheel on each row and its children
-            mwh = getattr(self, "_nearby_mousewheel", None)
-            if mwh:
-                row.bind("<MouseWheel>", mwh)
-                cb.bind("<MouseWheel>", mwh)
-                lbl.bind("<MouseWheel>", mwh)
             self._nearby_items.append((eid, name, var))
         self._nearby_canvas.update_idletasks()
         self._nearby_canvas.configure(scrollregion=self._nearby_canvas.bbox("all"))
@@ -1138,11 +1128,7 @@ class TavernKeeperWindow(tk.Toplevel):
         inner = tk.Frame(canvas, bg=BG)
         canvas.create_window((0,0), window=inner, anchor="nw")
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-
-        def _settings_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind("<MouseWheel>", _settings_mousewheel)
-        inner.bind("<MouseWheel>", _settings_mousewheel)
+        _wheel_scrolls(canvas, inner)
 
         _section_label(inner, "SERVER CLOCK")
         row = tk.Frame(inner, bg=BG)
@@ -1363,11 +1349,7 @@ class TavernKeeperWindow(tk.Toplevel):
         canvas.create_window((0,0), window=inner, anchor="nw")
         inner.bind("<Configure>", lambda e: canvas.configure(
             scrollregion=canvas.bbox("all")))
-
-        def _admin_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind("<MouseWheel>", _admin_mousewheel)
-        inner.bind("<MouseWheel>", _admin_mousewheel)
+        _wheel_scrolls(canvas, inner)
 
         tk.Label(inner, text="Acts on the target player selected above.",
                  bg=BG, fg=MUTED, font=("Segoe UI",9), wraplength=680, justify="left"

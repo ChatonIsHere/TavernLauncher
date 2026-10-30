@@ -239,11 +239,63 @@ def _scroll_stack(parent):
     inner.bind("<Configure>",
                lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
     canvas.bind("<Configure>", lambda e: canvas.itemconfig(window, width=e.width))
-    def _mousewheel(event):
-        # Or a short list scrolls off into empty space.
-        if inner.winfo_height() <= canvas.winfo_height():
-            return
-        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-    canvas.bind("<MouseWheel>", _mousewheel)
-    inner.bind("<MouseWheel>", _mousewheel)
+    _wheel_scrolls(canvas, inner)
     return inner
+
+
+# Widgets whose own class bindings already scroll them on the wheel.
+_NATIVE_WHEEL = ("Text", "Listbox", "Treeview")
+
+
+def _wheel_steps(event):
+    """Units to scroll for one wheel event: Windows' delta is a multiple of
+    120 (less from some touchpads, still one step); X11 sends buttons 4/5."""
+    if getattr(event, "num", None) == 4:
+        return -1
+    if getattr(event, "num", None) == 5:
+        return 1
+    return int(-event.delta / 120) or (-1 if event.delta > 0 else 1)
+
+
+def _wheel_scroll(event, start=None):
+    """Scrolls the innermost area under the pointer that can scroll. Tk
+    sends the wheel to the widget under the pointer, and a row's labels and
+    buttons sit on top of its canvas, so this walks up from that widget
+    (or from `start`)."""
+    w = start if start is not None else event.widget
+    if isinstance(w, str):   # Tk-internal, e.g. a combobox's dropdown list
+        return
+    steps = _wheel_steps(event)
+    while w is not None:
+        inner = getattr(w, "_tav_wheel_inner", None)
+        try:
+            if inner is not None:
+                # Or a short list scrolls off into empty space.
+                if inner.winfo_height() > w.winfo_height():
+                    w.yview_scroll(steps, "units")
+                    return
+            elif w.winfo_class() == "TCombobox":
+                return       # its own binding stepped the value
+            elif w.winfo_class() in _NATIVE_WHEEL and tuple(w.yview()) != (0.0, 1.0):
+                return       # it scrolled itself
+        except tk.TclError:
+            return
+        w = w.master
+
+
+def _wheel_scrolls(canvas, inner):
+    """Makes the wheel scroll `canvas` anywhere over `inner`, the frame it
+    scrolls, rows added later included. One handler on the "all" tag looks
+    up the area under the pointer (_wheel_scroll), so in nested lists the
+    one the pointer is over scrolls. Don't bind_all the wheel anywhere
+    else: without add="+" that replaces this handler app-wide."""
+    canvas._tav_wheel_inner = inner
+    root = canvas._root()
+    if not getattr(root, "_tav_wheel_bound", False):
+        root._tav_wheel_bound = True
+        root.bind_all("<MouseWheel>", _wheel_scroll, add="+")
+        # Only X11 sends the wheel as buttons; Tk 8.6 on Windows reports a
+        # mouse's back/forward side buttons as 4/5.
+        if root.tk.call("tk", "windowingsystem") == "x11":
+            root.bind_all("<Button-4>", _wheel_scroll, add="+")
+            root.bind_all("<Button-5>", _wheel_scroll, add="+")
