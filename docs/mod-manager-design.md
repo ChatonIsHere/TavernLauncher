@@ -65,8 +65,26 @@ lists, verifies, exports and claims only its own target.
   enabling re-runs a library pass (`ensure_mod_libraries` covers the Mod
   Manager's bare enable). Both count every target, so a client join never
   prunes the host's server-build libraries.
+- **Dependencies are asked about, not assumed.** A Get Mods install plans
+  first (`install.plan_mod_install`) and lists the dependencies not yet
+  installed; the player may take the mod alone. `missing_dependencies` reads
+  only install records, so "Needs mods" costs no network, and "Install deps"
+  resolves from the record (`install_dependencies`), so it works for a
+  version the source no longer lists.
+- **Replaced mods** (the spec's `replaced`). `fetch_indexes` returns a
+  `repos.ModIndex`, a list of summaries carrying every source's
+  replacements, so no signature that takes an index changed. Only the source
+  in an installed record's `source_repo` can retire it (`install.replaced_by`),
+  so another source can't take a mod over. An id named without a source goes
+  through `replacement_of_unlisted`, used by the resolver, pins and modlist
+  import. Nothing switches by itself: the Mod Manager offers it, and any
+  install from these windows ends with `retire_replaced`, which uninstalls
+  the old mod once the new one covers its targets and moves its pin on.
+  TavernLib's reconcile does the same for a modlist entry, but disables
+  rather than uninstalls, as it does any unlisted mod.
 - **Alerts.** Setup flashes for its three components; community mod updates
-  are only a count on the Mod Manager button, since joins correct them.
+  and replaced mods are only a count on the Mod Manager button, since joins
+  correct them.
 - **Server side.** The auth service caches the handshake snapshot for 5 s per
   game folder, as TavernLib does, and only writes from Setup or the Mod
   Manager invalidate it. A running server loaded its mods at startup, so the
@@ -96,5 +114,8 @@ lists, verifies, exports and claims only its own target.
   using comments or trailing commas is ours to TavernLib and foreign here.
 - Disabling is one switch for the whole folder, so on a machine that plays and
   hosts it affects both launchers' builds; uninstall's confirmation says so.
+- For the same reason, switching from a replaced mod installed for both
+  targets keeps the old one until the other launcher installs the
+  replacement too, and it stays marked "Replaced" until then.
 - TavernEssentials' in-game board joins carry no `TavernMods` claim, so a
   server that requires mods refuses them. Only TavernEssentials can fix that.

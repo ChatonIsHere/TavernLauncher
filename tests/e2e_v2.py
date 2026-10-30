@@ -27,7 +27,7 @@ HARNESS = sys.argv[1]
 LAUNCHER = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURES = os.path.join(LAUNCHER, "tests", "fixtures", "v2")
 sys.path.insert(0, LAUNCHER)
-from tavern_shared.mods import install, plan, repos  # noqa: E402
+from tavern_shared.mods import install, modlist, plan, repos  # noqa: E402
 
 with socket.socket() as _probe:
     _serving = _probe.connect_ex(("127.0.0.1", 8765)) == 0
@@ -223,6 +223,33 @@ cs_server_install(game, EXAMPLE, SPLIT)
 check(record(game, SPLIT) == expected("SplitMod.client_windows+server"), "after C# repair: record bytes still golden")
 check(install.verify_mod_files(game, SPLIT, "server") is True, "after C# repair: server build verifies")
 check(install.verify_mod_files(game, SPLIT, "client_windows") is True, "after C# repair: client_windows build untouched")
+
+print("\n== a replaced mod (the fixture repo retires ExampleDev.OldSplit for SplitMod)")
+OLD = "ExampleDev.OldSplit"
+g4 = new_game(); games.append(g4)
+cs_server_install(g4, OLD)
+ids = sorted(r["id"] for r in install.list_installed_mods(g4))
+check(ids == [SPLIT], f"C# reconcile: a modlist entry for a replaced mod installs its replacement ({ids})")
+index = repos.fetch_indexes([BASE], force=True)
+check([(r.old_id, r.by) for r in index.replaced] == [(OLD, SPLIT)], "python: the index carries the replacement")
+with contextlib.redirect_stderr(io.StringIO()):
+    imported = modlist.import_modlist({"schema": 1, "mods": [OLD]}, index, [BASE], "server")
+check([m.id for m in imported.roots] == [SPLIT] and imported.replaced == [(OLD, SPLIT)],
+      "python import: the same swap")
+
+rdir = tempfile.mkdtemp(prefix="v2rep_"); games.append(rdir)
+with open(os.path.join(FIXTURES, "repo", "repository.json"), encoding="utf-8") as f:
+    served = json.load(f)
+with open(os.path.join(FIXTURES, "repo", "manifests", "ExampleDev", "SplitMod", "1.0.0.json"), encoding="utf-8") as f:
+    split = json.load(f)
+root = dict(split, id="ExampleDev.Root", dependencies={OLD: "1.0.0"})
+for rel, obj in (("index.json", {SPLIT: served["mods"][SPLIT]}), ("replaced.json", served["replaced"]),
+                 (f"{SPLIT}/1.0.0.json", split), ("ExampleDev.Root/1.0.0.json", root)):
+    os.makedirs(os.path.dirname(os.path.join(rdir, rel)), exist_ok=True)
+    with open(os.path.join(rdir, rel), "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+resolved = harness("resolve", rdir, "ExampleDev.Root@1.0.0", "server").strip().splitlines()[-1]
+check(resolved == f"ok {SPLIT}@1.0.0", f"C# resolver: a dependency on a replaced mod gets its replacement ({resolved})")
 
 for g in games:
     shutil.rmtree(g, ignore_errors=True)
