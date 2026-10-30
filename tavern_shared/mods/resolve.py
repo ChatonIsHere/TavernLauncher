@@ -17,7 +17,9 @@ def resolve_dependencies(roots, summary_index, repo_bases, target):
     """The closure of `roots` for `target`, roots excluded: per dependency, the
     highest indexed version in the required major at or above the running
     minimum. A dependency with no `target` build is pruned, with everything
-    only it needed, before its constraints count. Raises on a cycle, a chain
+    only it needed, before its constraints count. A dependency no source
+    lists any more that a source has replaced resolves to its replacement
+    (repos.replacement_of_unlisted). Raises on a cycle, a chain
     deeper than MAX_DEPENDENCY_DEPTH, a cross-major conflict or a missing
     version."""
     summ = {(s.id, s.major): s for s in summary_index}
@@ -29,6 +31,13 @@ def resolve_dependencies(roots, summary_index, repo_bases, target):
     pruned = set()
 
     def add_requirement(dep_id, min_v, requirer, chain):
+        rep = repos.replacement_of_unlisted(summary_index, dep_id)
+        if rep is not None:
+            # Any version of the replacement will do; its newest major is taken.
+            major = max(s.major for s in summary_index if s.id == rep.by)
+            _warn(f"{requirer} depends on '{dep_id}', which has been replaced by "
+                  f"'{rep.by}'; using that instead.")
+            dep_id, min_v = rep.by, f"{major}.0.0"
         if dep_id in pruned:
             _warn(f"{requirer} depends on '{dep_id}', which has no {target} "
                   f"build; skipped.")
