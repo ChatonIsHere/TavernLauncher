@@ -301,6 +301,13 @@ class RepoSourcesConfig(unittest.TestCase):
         url = "https://example.com/mods/someone/theirmods"
         self.assertEqual(mm._source_display(url), url)
 
+    def test_own_mod_matches_source_owner(self):
+        self.assertTrue(mm.is_own_mod("ModdingTavern.TavernEssentials", mm.DEFAULT_REPO))
+        self.assertTrue(mm.is_own_mod("moddingtavern.TavernVoice", mm.DEFAULT_REPO))
+        self.assertFalse(mm.is_own_mod("Nyx12012.CookingLib", mm.DEFAULT_REPO))
+        self.assertTrue(mm.is_own_mod("someone.Thing", OTHER))
+        self.assertFalse(mm.is_own_mod("someone.Thing", "https://example.com/someone/theirmods"))
+
     def test_add_repo_stores_by_shorthand(self):
         cfg = {}
         mm.add_repo(cfg, OTHER)
@@ -888,6 +895,152 @@ class InstallModSet(_FakeInstallFixture, unittest.TestCase):
         mm.install_mod_set(self.game, self._set("a.m", "b.m"), "client_windows", lines.append)
         self.assertEqual(sorted({l.split("]")[0] + "]" for l in lines}),
                          ["[1/3]", "[2/3]", "[3/3]"])
+
+
+class MissingDependencies(_FakeInstallFixture, unittest.TestCase):
+    """Get Mods asks before adding dependencies; a mod installed without them
+    is marked until Install deps adds them."""
+
+    def _publish_pair(self, dep_versions=("1.0.0",), dep_targets=("client_windows", "server")):
+        for v in dep_versions:
+            self._publish("dep.k", v, targets=dep_targets)
+        self._publish("root.m", "1.0.0", dependencies={"dep.k": "1.0.0"})
+        return [summary("dep.k", list(dep_versions), targets=dep_targets),
+                summary("root.m", ["1.0.0"])]
+
+    def _root_alone(self):
+        mm.install_mod_set(self.game, [mm._fetch_manifest([self.BASE], "root.m", "1.0.0")],
+                           self.TARGET, noop)
+
+    def _missing(self, index):
+        installed = mm.list_installed_mods(self.game)
+        rec = next(r for r in installed if r["id"] == "root.m")
+        return mm.missing_dependencies(rec, installed, index, self.TARGET)
+
+    def test_plan_lists_only_dependencies_not_yet_installed(self):
+        index = self._publish_pair()
+        root, deps, needed = mm.plan_mod_install(self.game, index[1], index, [self.BASE], self.TARGET)
+        self.assertEqual((root.id, [d.id for d in deps], [d.id for d in needed]),
+                         ("root.m", ["dep.k"], ["dep.k"]))
+        self._closure("dep.k")
+        self.assertEqual(mm.plan_mod_install(self.game, index[1], index, [self.BASE], self.TARGET)[2], [])
+
+    def test_a_mod_installed_alone_is_marked_until_install_dependencies(self):
+        index = self._publish_pair()
+        self._root_alone()
+        self.assertEqual(self._missing(index), [("dep.k", "1.0.0", "missing")])
+        rec = next(r for r in mm.list_installed_mods(self.game) if r["id"] == "root.m")
+        self.assertEqual(mm.install_dependencies(self.game, rec, index, [self.BASE], self.TARGET, noop),
+                         ["dep.k"])
+        self.assertEqual(self._missing(index), [])
+
+    def test_a_disabled_dependency_counts_as_missing(self):
+        index = self._publish_pair()
+        mm.install_mod_closure(self.game, index[1], index, [self.BASE], noop, self.TARGET)
+        mm.disable_mod(self.game, "dep.k")
+        self.assertEqual(self._missing(index), [("dep.k", "1.0.0", "disabled")])
+
+    def test_an_old_dependency_counts_as_missing(self):
+        index = self._publish_pair(dep_versions=("0.9.0", "1.0.0"))
+        self._root_alone()
+        mm.install_mod_closure(self.game, index[0], index, [self.BASE], noop, self.TARGET,
+                               version="0.9.0")
+        self.assertEqual(self._missing(index), [("dep.k", "1.0.0", "too old")])
+
+    def test_a_dependency_with_no_build_here_is_not_missing(self):
+        index = self._publish_pair(dep_targets=("server",))
+        mm.install_mod_closure(self.game, index[1], index, [self.BASE], noop, self.TARGET)
+        self.assertEqual(self._missing(index), [])
+
+
+class Replacements(_TempDataDirFixture, unittest.TestCase):
+    """A source's `replaced`: old.m is retired in favour of new.m. Only the
+    source an installed mod came from can retire it."""
+
+    def _index(self, source=DEFAULT, new_versions=("2.0.0",), extra=()):
+        return mm.ModIndex([summary("new.m", list(new_versions)), *extra],
+                           [mm.Replacement("old.m", "new.m", "Moved.", source)])
+
+    def _ids(self):
+        return sorted(r["id"] for r in mm.list_installed_mods(self.game))
+
+    def test_fetch_indexes_carries_valid_replacements_only(self):
+        mm._index_cache.clear()
+        self.manifests[f"{self.BASE}/repository.json"] = dict(
+            slim_index({"new.m": {"2": slim_entry(["2.0.0"])}}),
+            replaced={"old.m": {"by": "new.m", "note": "Moved."}, "bad.m": "new.m",
+                      "self.m": {"by": "self.m"}, "nonote.m": {"by": "new.m", "note": 3}})
+        index = mm.fetch_indexes([self.BASE], force=True)
+        mm._index_cache.clear()
+        self.assertEqual([s.id for s in index], ["new.m"])
+        self.assertEqual(index.replaced, [
+            mm.Replacement("old.m", "new.m", "Moved.", self.BASE),
+            mm.Replacement("nonote.m", "new.m", "", self.BASE)])
+
+    def test_without_a_source_the_default_sources_replacement_wins(self):
+        index = mm.ModIndex([summary("new.m", ["2.0.0"]), summary("theirs.m", ["1.0.0"])],
+                            [mm.Replacement("old.m", "theirs.m", "", OTHER),
+                             mm.Replacement("old.m", "new.m", "", DEFAULT)])
+        self.assertEqual(mm.replacement_of_unlisted(index, "old.m").by, "new.m")
+        self.assertEqual(mm.replacement_for(index, "old.m", OTHER).by, "theirs.m")
+
+    def test_a_listed_id_or_an_unlisted_replacement_is_left_alone(self):
+        self.assertIsNone(mm.replacement_of_unlisted(self._index(extra=[summary("old.m", ["1.0.0"])]),
+                                                     "old.m"))
+        self.assertIsNone(mm.replacement_of_unlisted(
+            mm.ModIndex([], [mm.Replacement("old.m", "new.m", "", DEFAULT)]), "old.m"))
+
+    def test_installing_the_replacement_retires_the_old_mod(self):
+        self._install("old.m", "1.0.0")
+        self._install("new.m", "2.0.0")
+        self.assertEqual(mm.retire_replaced(self.game, self._index(), noop), [("old.m", "new.m")])
+        self.assertEqual(self._ids(), ["new.m"])
+
+    def test_another_source_cant_retire_a_mod(self):
+        self._install("old.m", "1.0.0")
+        self._install("new.m", "2.0.0")
+        self.assertIsNone(mm.replaced_by(self._index(OTHER), mm.list_installed_mods(self.game)[0]))
+        self.assertEqual(mm.retire_replaced(self.game, self._index(OTHER), noop), [])
+        self.assertEqual(self._ids(), ["new.m", "old.m"])
+
+    def test_the_old_mod_stays_until_the_replacement_covers_it(self):
+        self._install("old.m", "1.0.0")
+        self._closure("old.m", "1.0.0", target="server")
+        self._install("new.m", "2.0.0")
+        self.assertEqual(mm.retire_replaced(self.game, self._index(), noop), [])   # no server build yet
+        self._closure("new.m", "2.0.0", target="server")
+        mm.disable_mod(self.game, "new.m")
+        self.assertEqual(mm.retire_replaced(self.game, self._index(), noop), [])   # turned off
+        mm.enable_mod(self.game, "new.m")
+        self.assertEqual(mm.retire_replaced(self.game, self._index(), noop), [("old.m", "new.m")])
+
+    def test_a_dependency_on_the_old_mod_resolves_to_the_replacement(self):
+        self._publish("new.m", "2.0.0")
+        self._publish("root.m", "1.0.0", dependencies={"old.m": "1.0.0"})
+        index = self._index(extra=[summary("root.m", ["1.0.0"])])
+        _root, deps, _needed = mm.plan_mod_install(self.game, summary("root.m", ["1.0.0"]), index,
+                                                   [self.BASE], "client_windows")
+        self.assertEqual([(d.id, d.version) for d in deps], [("new.m", "2.0.0")])
+
+    def test_a_pin_on_the_old_mod_pins_the_replacement(self):
+        self._publish("new.m", "2.0.0")
+        plan = self._plan([], self._index(), pinned=["old.m@1.0.0"])
+        self.assertEqual([(e.mod_id, e.version, e.reason) for e in plan.entries],
+                         [("new.m", "2.0.0", "pinned")])
+
+    def test_a_server_on_the_old_mod_leaves_out_a_pinned_replacement(self):
+        self._publish("old.m", "1.0.0")
+        self._publish("new.m", "2.0.0")
+        plan = self._plan([_srv("old.m", "1.0.0")], self._index(), pinned=["new.m"])
+        self.assertEqual([e.mod_id for e in plan.entries], ["old.m"])
+
+    def test_a_modlist_entry_for_the_old_mod_imports_the_replacement(self):
+        d = self._publish("new.m", "2.0.0")
+        self.manifests[f"{self.BASE}/manifests/new/m/latest.json"] = d
+        plan = mm.import_modlist({"schema": 1, "repos": [], "mods": ["old.m@1.0.0"]},
+                                 self._index(), [self.BASE], target="client_windows")
+        self.assertEqual([(m.id, m.version) for m in plan.roots], [("new.m", "2.0.0")])
+        self.assertEqual(plan.replaced, [("old.m", "new.m")])
 
 
 class UntrackedMods(_FakeInstallFixture, unittest.TestCase):

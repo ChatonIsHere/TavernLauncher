@@ -19,6 +19,8 @@ Mods:
   ExampleDev.PcHelper 1.0.0    client_windows only, so a server install prunes it
   ExampleDev.SplitMod 1.0.0    separate client_windows dll and server zip (nested files,
                                mixed case, to pin the ordinal sort of `files`)
+
+repository.json also retires ExampleDev.OldSplit (never published) in favour of SplitMod.
 """
 import hashlib
 import io
@@ -150,6 +152,7 @@ for (author, repo, version), m in manifests.items():
         entry["scenes"] = m["scenes"]
     entry["versions"] = [version]
     index["mods"][m["id"]] = {version.split(".")[0]: entry}
+index["replaced"] = {"ExampleDev.OldSplit": {"by": "ExampleDev.SplitMod", "note": "Renamed."}}
 write_bytes("repository.json", json.dumps(index, indent=2, ensure_ascii=False).encode("utf-8"))
 
 

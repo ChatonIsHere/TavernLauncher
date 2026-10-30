@@ -40,15 +40,17 @@ def bind(ns, *names):
 
 class SceneReachesTheLaunchArgs(unittest.TestCase):
 
-    def _join(self, scene_arg):
+    def _join(self, scene_arg, ip="", port="1757"):
         launched = []
         self.planned_scene = []
+        self.resolved = []
         ns = types.SimpleNamespace(
             v_exe=FakeVar(r"C:\game\A Township Tale.exe"),
             v_username=FakeVar("Tester"),
             v_platform=FakeVar("fly"),
-            v_ip=FakeVar(""),
-            v_port=FakeVar("1757"),
+            v_ip=FakeVar(ip),
+            v_port=FakeVar(port),
+            _selected_kind="official",
             v_debug_helper=FakeVar(False),
             _check_status=FakeVar(""),
             _action_btn=FakeWidget(),
@@ -62,7 +64,8 @@ class SceneReachesTheLaunchArgs(unittest.TestCase):
             _reconcile_mods=lambda host, exe, go, scene=None: (
                 self.planned_scene.append(scene), go(None)),
         )
-        bind(ns, "_do_launch", "_launch_game", "_mods_claim")
+        bind(ns, "_do_launch", "_launch_game", "_mods_claim", "_take_host")
+        self.ns = ns
         fake_mods = types.SimpleNamespace(
             list_installed_mods=lambda game_dir: [],
             scene_from_arg=scene_from_arg)
@@ -72,7 +75,8 @@ class SceneReachesTheLaunchArgs(unittest.TestCase):
             return FakeProc()
 
         with mock.patch.object(lw.os.path, "isfile", lambda p: True), \
-             mock.patch.object(lw, "_resolve_ip_for_game", lambda h: "127.0.0.1"), \
+             mock.patch.object(lw, "_resolve_ip_for_game",
+                               lambda h: (self.resolved.append(h), "127.0.0.1")[1]), \
              mock.patch.object(lw, "_any_token_files_exist", lambda: True), \
              mock.patch.object(lw, "_get_or_create_token", lambda h, u: ("tok", False)), \
              mock.patch.object(lw, "authenticate",
@@ -103,6 +107,35 @@ class SceneReachesTheLaunchArgs(unittest.TestCase):
         self.assertNotIn("/tutorialScene", args)
         self.assertNotIn("/questScene", args)
         self.assertEqual(self.planned_scene, ["normal"])
+
+    def test_a_port_typed_with_the_address_moves_to_the_port_field(self):
+        # "100.66.236.126:1757" was looked up whole, with the auth port on.
+        args = self._join(None, ip="100.66.236.126:1757", port="1758")
+        self.assertEqual(self.resolved, ["100.66.236.126"])
+        self.assertEqual(self.ns.v_ip.get(), "100.66.236.126")
+        self.assertEqual(self.ns.v_port.get(), "1757")
+        self.assertEqual(args[args.index("/dev_server_port") + 1], "1757")
+
+
+class SplitHostPort(unittest.TestCase):
+    """What the server fields take: a host, optionally with its game port."""
+
+    def test_cases(self):
+        cases = {
+            "100.66.236.126:1757":  ("100.66.236.126", 1757),
+            " play.example.com:1760 ": ("play.example.com", 1760),
+            "100.66.236.126":       ("100.66.236.126", None),
+            "":                     ("", None),
+            "host:":                ("host", None),
+            "host:99999":           ("host", None),
+            "[::1]:1757":           ("::1", 1757),
+            "[::1]":                ("::1", None),
+            "::1":                  ("::1", None),
+            "fe80::1":              ("fe80::1", None),
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(lw.split_host_port(text), expected)
 
 
 class MainMenuLaunch(unittest.TestCase):
