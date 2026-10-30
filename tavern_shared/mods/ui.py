@@ -333,30 +333,53 @@ class CommunityModsWindow(ModListWindow):
                    style="primary", font=("Segoe UI",9), pady=4, padx=10, width=11)
         btn.pack(side="right", padx=(6,10))
 
+        desc_row = tk.Frame(card, bg=SURF)
+        desc_row.pack(fill="x", padx=10, pady=(4,8))
+        toggle = tk.Button(desc_row, text="Details ▸", bg=SURF, fg=MUTED,
+                           activebackground=SURF, activeforeground=AMBER,
+                           relief="flat", bd=0, cursor="hand2", font=("Segoe UI",8),
+                           command=lambda: self._toggle_details(mod_id))
+        toggle.pack(side="right", anchor="n")
+        tk.Label(desc_row, text=r["description"] or "No description provided.",
+                 bg=SURF, fg=PARCH, font=("Segoe UI",8), wraplength=680,
+                 justify="left", anchor="w"
+        ).pack(side="left", fill="x", expand=True)
+
+        # Builds, parity, scenes and requires: collapsed until asked for.
+        details = tk.Frame(card, bg=SURF)
         parity_text = "Exact version required" if s.parity_required else "Any compatible version"
         tag_text = f"{target_label(s.targets)}  ·  {parity_text}"
         if s.scenes:
             tag_text += "  ·  " + ", ".join(x.capitalize() for x in s.scenes) + " scene" \
                 + ("s" if len(s.scenes) > 1 else "") + " only"
-        tk.Label(card, text=tag_text, bg=SURF, fg=CYAN,
+        tk.Label(details, text=tag_text, bg=SURF, fg=CYAN,
                  font=("Segoe UI",8), anchor="w"
-        ).pack(fill="x", padx=10, pady=(4,2))
-
-        tk.Label(card, text=r["description"] or "No description provided.",
-                 bg=SURF, fg=PARCH, font=("Segoe UI",8), wraplength=760,
-                 justify="left", anchor="w"
-        ).pack(fill="x", padx=10, pady=(0,2))
+        ).pack(fill="x", pady=(0,2))
 
         requires_var = tk.StringVar(value="Loading dependencies…")
-        tk.Label(card, textvariable=requires_var, bg=SURF, fg=PARCH,
+        tk.Label(details, textvariable=requires_var, bg=SURF, fg=PARCH,
                  font=("Segoe UI",8,"italic"), wraplength=760, justify="left", anchor="w"
-        ).pack(fill="x", padx=10, pady=(0,8))
+        ).pack(fill="x")
 
         self._card_widgets[mod_id] = {
             "card": card, "status_lbl": status_lbl, "installed_var": installed_var,
             "btn": btn, "requires_var": requires_var,
+            "desc_row": desc_row, "details": details, "toggle": toggle, "expanded": False,
         }
         self._apply_card_state(mod_id)
+
+    def _toggle_details(self, mod_id):
+        w = self._card_widgets[mod_id]
+        w["expanded"] = not w["expanded"]
+        if w["expanded"]:
+            w["details"].pack(fill="x", padx=10, pady=(0,8), after=w["desc_row"])
+            w["desc_row"].pack_configure(pady=(4,4))
+            w["toggle"].config(text="Details ▾")
+            self._queue_dep_fetches()
+        else:
+            w["details"].pack_forget()
+            w["desc_row"].pack_configure(pady=(4,8))
+            w["toggle"].config(text="Details ▸")
 
     def _apply_card_state(self, mod_id):
         word, color, label = self._STATE_STYLE[self._rows[mod_id]["state"]]
@@ -387,8 +410,11 @@ class CommunityModsWindow(ModListWindow):
             self._card_widgets[mod_id]["installed_var"].set(r["installed"] or "-")
 
     def _queue_dep_fetches(self):
+        """Requires lines, for the cards on show with their details open."""
         to_fetch = []
         for mod_id in self._visible_ids:
+            if not self._card_widgets[mod_id]["expanded"]:
+                continue
             r = self._rows[mod_id]
             key = (mod_id, r["latest"])
             if key in _DEPS_CACHE:
@@ -557,11 +583,9 @@ class ModManagerWindow(ModListWindow):
             _btn(h, text, cmd, style="dim", font=("Segoe UI",9), pady=4, padx=10
                  ).pack(side="right", padx=(12,0))
 
-        desc = ("Every mod installed on this machine - the ones this launcher "
-                 "manages plus anything dropped into Mods/ by hand (marked "
-                 "\"Untracked\"). Select one, then enable/disable, remove, or "
-                 "(managed mods only) change its version, or right-click for the "
-                 "same options. To add something new, use Get Mods.")
+        desc = ("Every mod in your game folder, including ones copied in by hand "
+                "(marked \"Untracked\"). Select one to disable or uninstall it; "
+                "right-click for more, such as changing its version.")
         tk.Label(self, text=desc, bg=BG, fg=MUTED, font=("Segoe UI",9),
                  wraplength=760, justify="left"
         ).pack(anchor="w", padx=16, pady=(10,6))
