@@ -457,7 +457,8 @@ class ServerLauncher(LauncherCommon, tk.Tk):
         self._console_win = ConsoleWindow(self)
 
     def _mod_manager_kwargs(self):
-        return {"server_scene": self._server_scene}
+        return {"server_scene": self._server_scene,
+                "is_game_running": lambda: game_is_running(self._proc)}
 
     def _server_scene(self):
         """Tutorial wins over quest, as in the launch arguments and TavernLib."""
@@ -489,11 +490,21 @@ class ServerLauncher(LauncherCommon, tk.Tk):
         mods at startup, and nothing here can restart it safely."""
         invalidate_mods_snapshot()
         if game_is_running(self._proc):
-            self._print("Mods changed while the server is running: the changes "
-                        "take effect after a server restart. Until then, joining "
-                        "players are matched against the NEW mod set while the "
-                        "running session still has the old one - restart soon.",
+            self._print("Mods changed while the server is running. Restart it soon: "
+                        "joining players are matched against the new set already.",
                         "warn")
+
+    def _refresh_mod_metadata(self, game_dir):
+        """On a thread at start, as TavernLib's reconcile does on a headless one."""
+        try:
+            changed = mods.refresh_metadata(game_dir, mods.list_repos(load_cfg()), "server")
+        except Exception as e:
+            self._print(f"Couldn't check installed mods against their sources: {e}", "warn")
+            return
+        if changed:
+            invalidate_mods_snapshot()
+            self._print(f"Updated {', '.join(changed)}: its source changed whether "
+                        f"players need it or the scenes it supports.", "dim")
 
     def _open_addons(self):
         from server.core import addon_loader
@@ -665,6 +676,8 @@ class ServerLauncher(LauncherCommon, tk.Tk):
         elif self.v_quest_scene.get():
             args.append("/questScene")
         self._warn_mods_outside_scene(os.path.dirname(exe))
+        threading.Thread(target=self._refresh_mod_metadata, args=(os.path.dirname(exe),),
+                         daemon=True).start()
         self._print(f"Opening server on port {port}…", "warn")
         try:
             # Whether MelonLoader's console shows up is controlled by the

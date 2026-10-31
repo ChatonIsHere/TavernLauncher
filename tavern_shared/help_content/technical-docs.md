@@ -189,7 +189,7 @@ If a download keeps failing, Setup uses the copy in the "Patch" folder when it c
 
 ### Mod Manager button
 
-Opens the Mod Manager, where you install, update, disable and remove mods. The button shows a count when installed mods have updates or are damaged.
+Opens the Mod Manager, where you install, update, disable and remove mods. The button shows a count when installed mods have updates, are damaged or have been replaced.
 See [Mods](page:mods).
 
 ### Archive log button

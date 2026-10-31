@@ -1,4 +1,5 @@
 """The mod manager's error type, warn channel, version grammar and host config."""
+import os
 import re
 import sys
 
@@ -7,9 +8,23 @@ class ModManagerError(Exception):
     """Raised with a message the UI can show verbatim."""
 
 
+_LOG_MAX = 1 << 20
+
+
 def _warn(msg):
+    """To stderr, or to modmanager.log in the data folder when there is none
+    (the windowed build)."""
+    line = f"[modmanager] {msg}"
     try:
-        print(f"[modmanager] {msg}", file=sys.stderr)
+        if sys.stderr is not None:
+            print(line, file=sys.stderr)
+            return
+        from tavern_shared.paths import _tavern_data_dir
+        path = os.path.join(_tavern_data_dir(), "modmanager.log")
+        if os.path.isfile(path) and os.path.getsize(path) > _LOG_MAX:
+            os.replace(path, path + ".1")
+        with open(path, "a", encoding="utf-8") as f:
+            print(line, file=f)
     except Exception:
         pass
 

@@ -98,11 +98,12 @@ def import_modlist(modlist, index, repo_bases, target, game_dir=None):
 
 def modlist_import_disables(game_dir, plan):
     """The enabled mods installed for the plan's target that apply_import
-    will disable."""
+    will disable; a client import leaves on what this folder's server runs."""
     keep_ids = {mod.id for mod in plan.roots + plan.dependencies}
     return [rec["id"] for rec in list_installed_mods(game_dir)
             if rec["id"] not in keep_ids and rec.get("enabled")
-            and has_target(rec, plan.target)]
+            and has_target(rec, plan.target)
+            and (plan.target == "server" or not has_target(rec, "server"))]
 
 
 def apply_import(game_dir, plan, on_progress):

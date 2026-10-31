@@ -177,7 +177,7 @@ class SetupWindow(tk.Toplevel):
         btn._dotlabel.config(fg=color)
         btn.config(text=text)
         note, note_color = self._STATE_NOTE[state]
-        # Upstream's "bundled:<hash>" markers name no release.
+        # A "bundled:<hash>" marker names no release.
         if tag and not tag.startswith("bundled:") and state != "missing":
             shown = f"{tag} · offline copy" if offline else tag
             note = f"{note}  ({shown})" if note else f"({shown})"
