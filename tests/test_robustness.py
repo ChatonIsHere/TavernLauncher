@@ -91,6 +91,19 @@ class Placement(_TempDataDirFixture, unittest.TestCase):
         self.assertEqual([r["id"] for r in installed], ["a.m"])
         self.assertEqual([u["name"] for u in untracked], ["a.m - Copy"])
 
+    def test_an_unusable_record_is_warned_about_once(self):
+        write_record(self.game, "old.m")
+        rec = os.path.join(self.game, "Mods", "old.m", "manifest.json")
+        with open(rec, encoding="utf-8") as f:
+            data = json.load(f)
+        del data["parity_required"]
+        with open(rec, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        with quiet() as err:
+            for _ in range(3):
+                mm._scan_mods(self.game)
+        self.assertEqual(err.getvalue().count("unusable record"), 1)
+
     def test_an_unreadable_record_is_listed_but_never_displaced(self):
         self._install("a.m")
         with mock.patch.object(install, "open", side_effect=PermissionError(13, "locked"),
