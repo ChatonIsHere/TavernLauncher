@@ -4,7 +4,7 @@ TavernLib's manifest parser."""
 import os
 import re
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from tavern_shared.mods.base import ModManagerError, _major, _parse_version, _warn
 from tavern_shared.mods.layout import _safe_basename
@@ -29,8 +29,7 @@ class LibraryDependency:
 
 def parity_required(d):
     """Read off a manifest, record, index or handshake entry. Absent or not a
-    real boolean raises rather than defaults, as TavernLib's
-    ModParityField.Read does."""
+    real boolean raises rather than defaults, as TavernLib's ReadParity does."""
     meaning = ("true if a client joining a server running this mod must have this "
                "exact version, false if the server shouldn't block the join over it")
     if "parity_required" not in d:
@@ -47,7 +46,7 @@ def parity_required(d):
 
 def mod_scenes(d):
     """None (every scene), or the listed scenes, unknown names kept. Twin of
-    TavernLib's ModScenesField.Read."""
+    TavernLib's ReadScenes."""
     value = d.get("scenes")
     if value is None:
         return None
@@ -78,9 +77,10 @@ class Artifact:
     library_dependencies: list      # list[LibraryDependency]
 
     def install_name(self, mod_id):
-        """A dll build's name in its target folder: the published basename if
-        safe and a .dll, else f"{mod_id}.dll"."""
-        base = os.path.basename(urlparse(self.download_url).path)
+        """A dll build's name in its target folder: the published basename,
+        percent-decoded as TavernLib's Uri.LocalPath does, if safe and a .dll,
+        else f"{mod_id}.dll"."""
+        base = os.path.basename(unquote(urlparse(self.download_url).path))
         try:
             safe = _safe_basename(base)
         except ModManagerError:
@@ -131,24 +131,33 @@ _SHA256 = re.compile(r"[0-9a-fA-F]{64}")
 
 
 def _sha256_field(d, where):
-    """Twin of TavernLib's ModDataModel.Sha256Field, message included."""
+    """Twin of TavernLib's ModManifest.Sha256Field, message included."""
     value = d.get("sha256")
     if not (isinstance(value, str) and _SHA256.fullmatch(value)):
         raise ModManagerError(f"{where} has an invalid sha256 (expected 64 hex characters).")
     return value.lower()
 
 
+def _text(d, key, default=None, where="manifest"):
+    """A string field; absent or null takes `default` (required when None).
+    Anything else raises, as in TavernLib, so no reader stringifies it."""
+    value = d.get(key)
+    if value is None and default is not None:
+        return default
+    if not isinstance(value, str):
+        raise ModManagerError(f"{where}'s '{key}' must be a string.")
+    return value
+
+
 def _library_from_dict(d):
     if not isinstance(d, dict):
         raise ModManagerError(f"library_dependencies entry {d!r} isn't an object.")
-    for k in _LIBRARY_KEYS:
-        if k not in d:
-            raise ModManagerError(f"library_dependencies entry is missing '{k}'.")
+    where = "library_dependencies entry"
     return LibraryDependency(
-        name=str(d["name"]),
-        download_url=str(d["download_url"]),
-        sha256=_sha256_field(d, "library_dependencies entry"),
-        filename=str(d["filename"]),
+        name=_text(d, "name", where=where),
+        download_url=_text(d, "download_url", where=where),
+        sha256=_sha256_field(d, where),
+        filename=_text(d, "filename", where=where),
     )
 
 
@@ -209,7 +218,10 @@ def _artifacts_from_list(raw, mod_id, warn=True):
 
 
 def _manifest_from_dict(d, source_repo):
-    """None (with a warning) for an unsupported schema major."""
+    """None (with a warning) for an unsupported schema major or a non-object."""
+    if not isinstance(d, dict):
+        _warn(f"{source_repo} served a manifest that isn't a JSON object, skipped.")
+        return None
     mv = d.get("manifest_version")
     if not isinstance(mv, int):
         _warn(f"manifest for {d.get('id', '?')} has no integer manifest_version, skipped.")
@@ -219,24 +231,28 @@ def _manifest_from_dict(d, source_repo):
               f"supports v{SUPPORTED_MANIFEST_MAJOR}, skipped.")
         return None
 
-    try:
-        mod_id = str(d["id"])
-        artifacts, kept = _artifacts_from_list(d.get("artifacts"), mod_id)
-        return ModManifest(
-            id=mod_id,
-            name=str(d.get("name", mod_id)),
-            version=str(d["version"]),
-            author=str(d.get("author", mod_id.split(".", 1)[0])),
-            description=str(d.get("description", "")),
-            dependencies=dict(d.get("dependencies", {}) or {}),
-            artifacts=artifacts,
-            source_repo=source_repo,
-            parity_required=parity_required(d),
-            scenes=mod_scenes(d),
-            record_artifacts=kept,
-        )
-    except KeyError as e:
-        raise ModManagerError(f"manifest for {d.get('id', '?')} is missing field {e}.")
+    mod_id = _text(d, "id")
+    if not mod_id:
+        raise ModManagerError("manifest has an empty 'id'.")
+    where = f"manifest for {mod_id}"
+    deps = d.get("dependencies") or {}
+    if not (isinstance(deps, dict) and all(isinstance(v, str) for v in deps.values())):
+        raise ModManagerError(f"{where} has a dependencies value that isn't an object of "
+                              f"mod id to minimum version.")
+    artifacts, kept = _artifacts_from_list(d.get("artifacts"), mod_id)
+    return ModManifest(
+        id=mod_id,
+        name=_text(d, "name", mod_id, where),
+        version=_text(d, "version", where=where),
+        author=_text(d, "author", mod_id.split(".", 1)[0], where),
+        description=_text(d, "description", "", where),
+        dependencies=dict(deps),
+        artifacts=artifacts,
+        source_repo=source_repo,
+        parity_required=parity_required(d),
+        scenes=mod_scenes(d),
+        record_artifacts=kept,
+    )
 
 
 def _summary_from_dict(d, mod_id, source_repo):

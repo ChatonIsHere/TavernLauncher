@@ -6,7 +6,7 @@ from tavern_shared.mods.manifest import (
 )
 from tavern_shared.mods.repos import fetch_indexes, list_repos
 from tavern_shared.mods.install import (
-    handshake_snapshot, has_target, install_mod_set, list_installed_mods,
+    handshake_snapshot, has_target, install_mod_set, list_installed_mods, refresh_metadata,
 )
 from tavern_shared.mods.cache import adopt_installed_mods
 from tavern_shared.mods.pins import add_pin, list_declined, list_pinned, set_declined

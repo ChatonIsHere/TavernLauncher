@@ -1,5 +1,5 @@
 """Verified installs into Mods/<id>/.<target>/ and reading back what is
-there (REPO_STRUCTURE.md "Sidecar files"); twin of TavernLib's ModInstaller."""
+there (REPO_STRUCTURE.md "Install record"); twin of TavernLib's ModInstaller."""
 import contextlib
 import hashlib
 import json
@@ -14,14 +14,14 @@ from tavern_shared.paths import _sha256_file
 
 from tavern_shared.mods.base import ModManagerError, _parse_version, _warn
 from tavern_shared.mods.layout import (
-    DISABLED_RECORD_NAME, RECORD_NAME, _disabled_record_path, _displaced_base,
+    DISABLED_RECORD_NAME, RECORD_NAME, _aside_path, _disabled_record_path, _displaced_base,
     _library_sidecar_path, _mod_dir_path, _mod_record_path, _mods_base,
     _safe_basename, _staging_path, _target_dir_path, _userlibs_dir,
 )
 from tavern_shared.mods.manifest import (
     SUPPORTED_MANIFEST_MAJOR, _artifacts_from_list, parity_required,
 )
-from tavern_shared.mods.repos import replacement_for
+from tavern_shared.mods.repos import replacement_for, replacement_of_unlisted
 from tavern_shared.mods.resolve import _fetch_manifest, resolve_dependencies
 
 
@@ -62,9 +62,10 @@ def _verified_download(url, sha256, work_dir, on_progress):
                 f"was installed.")
         yield tmp
     finally:
+        # A zip's temp sits in the staged tree, so one left behind would be installed.
         try:
             os.remove(tmp)
-        except OSError:
+        except FileNotFoundError:
             pass
 
 
@@ -83,8 +84,7 @@ def _safe_extract_zip(zip_path, dest_dir):
             raise ModManagerError(
                 f"This mod archive has {len(infos)} entries, over the "
                 f"{_ZIP_MAX_ENTRIES} limit; refusing to extract it.")
-        # Written after the tree is hashed, so an archive's own copy would
-        # read as damage forever. Twin of TavernLib's SafeExtractZip.
+        # The spec's root-record skip. Twin of TavernLib's SafeExtractZip.
         record_paths = {os.path.normcase(os.path.join(dest_root, n))
                         for n in (RECORD_NAME, DISABLED_RECORD_NAME)}
         written = 0
@@ -103,6 +103,10 @@ def _safe_extract_zip(zip_path, dest_dir):
                 raise ModManagerError(
                     f"Unsafe archive entry {name!r}: symlink.")
             rel = name.replace("/", os.sep).replace("\\", os.sep)
+            # Windows drops these, so the two installers could hash different trees.
+            if any(p != p.rstrip(". ") for p in rel.split(os.sep) if p not in ("", ".", "..")):
+                raise ModManagerError(
+                    f"Unsafe archive entry {name!r}: a name ends in a dot or space.")
             target = os.path.realpath(os.path.join(dest_root, rel))
             if target != dest_root and not target.startswith(dest_root + os.sep):
                 raise ModManagerError(
@@ -170,8 +174,9 @@ _verify_memo = {}
 
 def _invalidate_verify_memo(game_dir, mod_id):
     mod_dir = _mod_dir_path(game_dir, mod_id)
-    for key in [k for k in _verify_memo if k[0] == mod_dir]:
-        del _verify_memo[key]
+    # list() copies under the GIL; other workers write the memo meanwhile.
+    for key in [k for k in list(_verify_memo) if k[0] == mod_dir]:
+        _verify_memo.pop(key, None)
 
 
 def _files_intact(base, files):
@@ -185,7 +190,7 @@ def _files_intact(base, files):
 
 def verify_mod_files(game_dir, mod_id, target):
     """True if intact, False if damaged, None when there's no `files` to check
-    (no evidence is not damage). Twin of TavernLib's VerifyModFiles."""
+    (no evidence is not damage). Twin of TavernLib's VerifyTarget."""
     rec = _read_mod_record(game_dir, mod_id)
     entry = _installed_entry(rec, target)
     files = entry.get("files") if entry else None
@@ -248,21 +253,11 @@ def _displace_foreign(game_dir, mod_id):
           f"deleting it. Nothing loads from there.")
 
 
-def _remove_best_effort(path):
-    """Whether path is gone; whatever a running game holds open stays."""
-    if os.path.isdir(path) and not os.path.islink(path):
-        shutil.rmtree(path, ignore_errors=True)
-    else:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-    return not os.path.lexists(path)
-
-
 def _place_target(game_dir, base, target, staging, entry):
     """The one write path for a target folder: swaps the staged tree in, then
-    writes the record (enabled) last, per the spec's one-version rule."""
+    writes the record (enabled) last, per the spec's one-version rule. What
+    it replaces is moved aside first, so a folder a running game or server
+    holds open refuses the install before anything is lost."""
     mod_id = base["id"]
     _displace_foreign(game_dir, mod_id)
     rec = _owned_mod_record(game_dir, mod_id)
@@ -271,18 +266,23 @@ def _place_target(game_dir, base, target, staging, entry):
         keep = {t: e for t, e in rec["installed"].items() if t != target}
 
     mod_dir = _mod_dir_path(game_dir, mod_id)
-    target_dir = _target_dir_path(game_dir, mod_id, target)
     os.makedirs(mod_dir, exist_ok=True)
-    if os.path.isdir(target_dir):
-        shutil.rmtree(target_dir)       # this target's own: failing fails the install
-    os.replace(staging, target_dir)
-
-    wanted = {RECORD_NAME, DISABLED_RECORD_NAME, os.path.basename(target_dir)}
-    wanted |= {f".{t}" for t in keep}
-    for name in sorted(os.listdir(mod_dir)):
-        if name not in wanted and not _remove_best_effort(os.path.join(mod_dir, name)):
-            _warn(f"Mods/{mod_id}/{name} couldn't be removed (is the game running?). "
-                  f"It's no longer listed in the record, so nothing loads it.")
+    aside = _aside_path(game_dir, mod_id)
+    shutil.rmtree(aside, ignore_errors=True)
+    os.makedirs(aside)
+    wanted = {RECORD_NAME, DISABLED_RECORD_NAME} | {f".{t}" for t in keep}
+    moved = []
+    try:
+        for name in sorted(set(os.listdir(mod_dir)) - wanted):
+            os.replace(os.path.join(mod_dir, name), os.path.join(aside, name))
+            moved.append(name)
+    except OSError as e:
+        for name in moved:
+            os.replace(os.path.join(aside, name), os.path.join(mod_dir, name))
+        raise ModManagerError(f"Mods/{mod_id}/ is in use ({e}). Close the game or "
+                              f"server running from this folder, then try again.")
+    os.replace(staging, _target_dir_path(game_dir, mod_id, target))
+    shutil.rmtree(aside, ignore_errors=True)
 
     installed = {**keep, target: entry}
     record = dict(base, installed={t: installed[t] for t in sorted(installed)})
@@ -319,8 +319,8 @@ def install_mod(game_dir, mod, target, on_progress):
 
 def _disable_shadowed_loose_dlls(game_dir, mod_id, target_dir):
     """Disables a loose Mods/<name>.dll that a DLL just placed at the top of
-    the target folder shadows (upstream 1.8.5's TavernEssentials.dll), so
-    MelonLoader doesn't load the mod twice. Twin of TavernLib's InstallMod."""
+    the target folder shadows, so MelonLoader doesn't load the mod twice.
+    Twin of TavernLib's DisableShadowedLooseDlls."""
     for name in sorted(os.listdir(target_dir)):
         if not name.lower().endswith(".dll") or not os.path.isfile(os.path.join(target_dir, name)):
             continue
@@ -355,12 +355,21 @@ def collect_library_dependencies(mods, target):
     return [lib for lib, _owner in by_filename.values()]
 
 
+def _record_artifacts(rec):
+    """A record's usable artifacts, each parsed alone so a bad one costs only
+    itself, as TavernLib's ModRecord reads them."""
+    raw = rec.get("artifacts")
+    out = []
+    for a in raw if isinstance(raw, list) else []:
+        try:
+            out += _artifacts_from_list([a], rec["id"], warn=False)[0]
+        except ModManagerError:
+            pass
+    return out
+
+
 def _record_target_libraries(rec, target):
-    try:
-        artifacts, _kept = _artifacts_from_list(rec.get("artifacts"), rec["id"], warn=False)
-    except ModManagerError:
-        return []
-    art = next((a for a in artifacts if target in a.targets), None)
+    art = next((a for a in _record_artifacts(rec) if target in a.targets), None)
     return art.library_dependencies if art else []
 
 
@@ -413,22 +422,19 @@ def plan_mod_install(game_dir, mod, index, repo_bases, target, version=None):
     return root, deps, [d for d in deps if not _already_installed(game_dir, d, target)]
 
 
-def install_mod_closure(game_dir, mod, index, repo_bases, on_progress, target, version=None):
-    """One Get Mods install: `mod` and its closure for `target`."""
-    root, deps, _ = plan_mod_install(game_dir, mod, index, repo_bases, target, version)
-    install_mod_set(game_dir, deps + [root], target, on_progress)
-
-
 def missing_dependencies(rec, installed, index, target):
     """What an installed mod's record depends on that isn't met in this game
-    folder: [(id, minimum, why)], why "missing", "disabled" or "too old". A
-    dependency the index lists with no `target` build is left out, as the
-    resolver skips it."""
+    folder: [(id, minimum, why)], why "missing", "disabled", "too old" or
+    "wrong major". As the resolver reads them, a dependency the index lists
+    with no `target` build is left out, and a replaced one means its
+    replacement at any version."""
     have = {r["id"]: r for r in installed if r.get("id") and has_target(r, target)}
     listed = {s.id for s in index}
     buildable = {s.id for s in index if target in s.targets}
     missing = []
     for dep_id, min_v in sorted((rec.get("dependencies") or {}).items()):
+        if (rep := replacement_of_unlisted(index, dep_id)) is not None:
+            dep_id, min_v = rep.by, None
         if dep_id in listed and dep_id not in buildable:
             continue
         r = have.get(dep_id)
@@ -436,12 +442,14 @@ def missing_dependencies(rec, installed, index, target):
             missing.append((dep_id, min_v, "missing"))
         elif not r.get("enabled", True):
             missing.append((dep_id, min_v, "disabled"))
-        else:
+        elif min_v is not None:
             try:
                 want, got = _parse_version(min_v), _parse_version(r.get("version", ""))
             except ModManagerError:
                 continue
-            if got[0] != want[0] or got < want:
+            if got[0] != want[0]:
+                missing.append((dep_id, min_v, "wrong major"))
+            elif got < want:
                 missing.append((dep_id, min_v, "too old"))
     return missing
 
@@ -465,19 +473,49 @@ def replaced_by(index, rec):
 def retire_replaced(game_dir, index, on_progress):
     """Uninstalls each installed mod its source has replaced, once the
     replacement is installed and enabled for every target the old one is, so
-    the two never both load. Returns [(old id, new id)] for each removed."""
+    the two never both load. A replacement that is replaced too retires
+    nothing, so a cycle can't remove both. Returns [(old id, new id)]."""
     recs = {r["id"]: r for r in list_installed_mods(game_dir)}
     removed = []
     for old_id, rec in sorted(recs.items()):
         rep = replaced_by(index, rec)
         new = recs.get(rep.by) if rep else None
-        if not new or not new.get("enabled", True):
+        if not new or not new.get("enabled", True) or replaced_by(index, new):
             continue
-        if all(has_target(new, t) for t in installed_targets(rec)):
+        targets = installed_targets(rec)
+        if targets and all(has_target(new, t) for t in targets):
             on_progress(f"Removing {rec.get('name') or old_id}: {rep.by} replaces it.")
             uninstall_mod(game_dir, old_id)
             removed.append((old_id, rep.by))
     return removed
+
+
+def refresh_metadata(game_dir, repo_bases, target):
+    """Catches each enabled `target` record's parity_required and scenes up
+    with its version's manifest, which can change them without a version
+    bump, as TavernLib's reconcile does. Patched in place, keeping key order.
+    Returns the ids rewritten."""
+    changed = []
+    for rec in list_installed_mods(game_dir):
+        if not rec.get("enabled") or not has_target(rec, target):
+            continue
+        try:
+            m = _fetch_manifest(repo_bases, rec["id"], rec.get("version"), rec.get("source_repo"))
+        except ModManagerError:
+            continue
+        path = _mod_record_path(game_dir, rec["id"])
+        raw = _read_sidecar(path)
+        if not raw or (raw.get("parity_required"), raw.get("scenes")) == (m.parity_required, m.scenes):
+            continue
+        out = {}
+        for k, v in raw.items():
+            if k != "scenes":
+                out[k] = m.parity_required if k == "parity_required" else v
+            if k == "parity_required" and m.scenes is not None:
+                out["scenes"] = m.scenes
+        _write_sidecar(path, out)
+        changed.append(rec["id"])
+    return changed
 
 
 def _already_installed(game_dir, mod, target):
@@ -554,8 +592,7 @@ def uninstall_mod(game_dir, mod_id):
         removed = True
 
     if libs:
-        # Disabled mods count too, unlike the join's prune: no library pass
-        # follows an uninstall, so their next enable would lack them.
+        # Disabled mods count too: see _prune_orphaned_libraries.
         still_needed = set()
         for other in list_installed_mods(game_dir):
             still_needed |= _record_libraries(other)
@@ -576,11 +613,12 @@ def _remove_library(game_dir, filename):
 
 
 def _read_sidecar(path):
-    """The file's JSON object, else None, as TavernLib's ModRecord.ParseObject."""
+    """The file's JSON object, else None, as TavernLib's ModRecord.ParseObject.
+    Other read errors raise: a locked record of ours mustn't read as foreign."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except Exception:
+    except (FileNotFoundError, NotADirectoryError, ValueError, RecursionError):
         return None
     return data if isinstance(data, dict) else None
 
@@ -610,9 +648,10 @@ def _read_mod_record(game_dir, mod_id):
 
 def _folder_record(folder, warn=False):
     """(record, enabled) if the folder is ours, else None: the spec's
-    ownership predicate, twin of TavernLib's ModRecord.Read."""
+    ownership predicate, twin of TavernLib's ModRecord.ReadOwned. The id must
+    be the folder's name, so a copied folder isn't a second install."""
     def has_id(r):
-        return r is not None and isinstance(r.get("id"), str) and r["id"] != ""
+        return r is not None and r.get("id") == os.path.basename(folder) != ""
 
     rec, enabled = _read_sidecar(os.path.join(folder, RECORD_NAME)), True
     if not has_id(rec):
@@ -692,7 +731,7 @@ def _scan_mods(game_dir):
     """(installed records, each with an in-memory "enabled"; untracked
     {"name", "kind", "enabled"}). An untracked folder counts on its record
     file existing, as MelonLoader's marker does. Twin of TavernLib's
-    ListUntrackedMods."""
+    ScanMods."""
     installed, untracked = {}, []
     mods_dir = _mods_base(game_dir)
     if not os.path.isdir(mods_dir):
@@ -709,7 +748,10 @@ def _scan_mods(game_dir):
                 untracked.append({"name": name[:-len(".disabled")], "kind": "file",
                                   "enabled": False})
         elif os.path.isdir(full):
-            found = _folder_record(full, warn=True)
+            try:
+                found = _folder_record(full, warn=True)
+            except OSError:
+                found = None    # unreadable: listed, never owned
             if found is not None:
                 rec, enabled = found
                 rec["enabled"] = enabled
@@ -730,7 +772,7 @@ def list_untracked_mods(game_dir):
 
 
 def _move_untracked_dll(src, dest):
-    # Refuses rather than clobber, as TavernLib's DisableUntrackedDll does.
+    # Refuses rather than clobber, as TavernLib's DisableShadowedLooseDlls does.
     if os.path.isfile(src) and os.path.exists(dest):
         raise ModManagerError(f"{os.path.basename(dest)!r} already exists; "
                               f"remove or rename it first.")
@@ -751,34 +793,32 @@ def _untracked_stamp(game_dir, entry):
     """Whole-second mtime, "?" if unreadable. Twin of TavernLib's
     UntrackedStamp."""
     try:
-        return str(int(os.stat(os.path.join(_mods_base(game_dir),
-                                            entry["name"])).st_mtime))
+        return str(os.stat(os.path.join(_mods_base(game_dir),
+                                        entry["name"])).st_mtime_ns // 10**9)
     except OSError:
         return "?"
 
 
 def _record_targets(rec):
-    """(targets, {target: sha256}) from a record's artifacts, known targets only."""
-    try:
-        artifacts, _kept = _artifacts_from_list(rec.get("artifacts"), rec["id"], warn=False)
-    except ModManagerError as e:
-        _warn(f"installed mod {rec['id']} has unreadable artifacts ({e}); "
-              f"advertised with no targets.")
-        return [], {}
-    shas = {t: a.sha256 for a in artifacts for t in a.targets}
+    """(targets, {target: sha256}) from a record's usable artifacts, the first
+    to list a target winning, as TavernLib's ArtifactTargets."""
+    shas = {}
+    for a in _record_artifacts(rec):
+        for t in a.targets:
+            shas.setdefault(t, a.sha256)
     return sorted(shas), {t: shas[t] for t in sorted(shas)}
 
 
 def handshake_snapshot(game_dir, target="server"):
     """(mods_hash, mods_count, mods_list, untracked_list) for the mods this
-    folder runs as `target`, per REPO_STRUCTURE.md "What a server advertises".
+    folder runs as `target`, per REPO_STRUCTURE.md "Joining a server".
     Twin of TavernLib's ModHandshake: any change to the hash breaks every join
     against the other side."""
     installed, untracked = _scan_mods(game_dir)
     mods = sorted((m for m in installed if m.get("enabled") and has_target(m, target)),
-                  key=lambda m: m["id"])
+                  key=lambda m: _ordinal_key(m["id"]))
     untracked = sorted((u for u in untracked if u["enabled"]),
-                       key=lambda u: u["name"].lower())
+                       key=lambda u: _ordinal_key(u["name"].lower()))
     lines = [f"{m['id']}@{m.get('version', '')}@{'req' if parity_required(m) else 'opt'}"
              for m in mods]
     lines += [f"untracked:{u['name']}@{_untracked_stamp(game_dir, u)}"
