@@ -235,7 +235,7 @@ def _manifest_from_dict(d, source_repo):
     if not mod_id:
         raise ModManagerError("manifest has an empty 'id'.")
     where = f"manifest for {mod_id}"
-    deps = d.get("dependencies") or {}
+    deps = {} if d.get("dependencies") is None else d["dependencies"]
     if not (isinstance(deps, dict) and all(isinstance(v, str) for v in deps.values())):
         raise ModManagerError(f"{where} has a dependencies value that isn't an object of "
                               f"mod id to minimum version.")
