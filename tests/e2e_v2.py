@@ -228,7 +228,12 @@ with open(victim, "rb"):         # a running server holding its build open
 check(record(game, SPLIT) == before and install.verify_mod_files(game, SPLIT, "server") is False,
       "C# repair while .server is in use: refused, record untouched")
 install._verify_memo.clear()
+kept = os.path.join(game, "Mods", SPLIT, "UserData", "key.xml")
+os.makedirs(os.path.dirname(kept))
+open(kept, "wb").close()
 cs_server_install(game, EXAMPLE, SPLIT)
+check(os.path.isfile(kept), "C# repair keeps data the mod wrote beside its build")
+shutil.rmtree(os.path.dirname(kept))
 check(record(game, SPLIT) == expected("SplitMod.client_windows+server"), "after C# repair: record bytes still golden")
 check(install.verify_mod_files(game, SPLIT, "server") is True, "after C# repair: server build verifies")
 check(install.verify_mod_files(game, SPLIT, "client_windows") is True, "after C# repair: client_windows build untouched")
