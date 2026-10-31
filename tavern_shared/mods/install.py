@@ -329,7 +329,7 @@ def _disable_shadowed_loose_dlls(game_dir, mod_id, target_dir):
                 _warn(f"Mods/{name} was a loose copy of a DLL that {mod_id} just installed; "
                       f"disabled it so MelonLoader doesn't load it twice. It's still listed "
                       f"under untracked mods if you want it back.")
-        except ModManagerError as e:
+        except (ModManagerError, OSError) as e:
             _warn(f"Mods/{name} looks like a loose copy of {mod_id}, but couldn't be "
                   f"disabled ({e}); MelonLoader may load it twice until it's removed.")
 
