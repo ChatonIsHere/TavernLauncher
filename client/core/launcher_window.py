@@ -979,11 +979,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
 
         cfg = load_cfg()
         repo_bases = mods.list_repos(cfg)
-        try:
-            index = mods.fetch_indexes(repo_bases)
-        except Exception as e:
-            self._print(f"Could not check the community mod index: {e}", "warn")
-            return "skip", f"Couldn't reach the mod index: {e}"
+        index = mods.fetch_indexes(repo_bases)
 
         pinned = mods.list_pinned(cfg)
         declined = mods.list_declined(cfg, host)
@@ -1002,7 +998,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
 
     def _verify_mod_parity(self, server_mods, installed):
         """(id, needed, have) per required mod `installed` doesn't match;
-        ModParity.ValidateClient's rule."""
+        TavernLib's ModParity.CheckJoin rule."""
         required = {m["id"]: m.get("version") for m in server_mods
                     if CLIENT_TARGET in (m.get("targets") or [])
                     and mods.parity_required(m)}
@@ -1093,6 +1089,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
             self._report_server_untracked()
             if kind == "skip":
                 if joining:
+                    self._print(payload, "warn")
                     self._set_sync_busy(False)
                     then(installed)               # fail open, never block a join
                 else:
@@ -1550,8 +1547,8 @@ def _enabled_mods(game_dir):
 
 
 def _tavernessentials_installed(game_dir):
-    """An enabled TavernEssentials.dll, loose in Mods/ (as upstream 1.8.5
-    installed it) or in an enabled mod's .client_windows/, whatever its id."""
+    """An enabled TavernEssentials.dll, loose in Mods/ or in an enabled mod's
+    .client_windows/, whatever its id."""
     mods_dir = os.path.join(game_dir, "Mods")
     try:
         entries = os.listdir(mods_dir)

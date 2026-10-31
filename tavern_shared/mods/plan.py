@@ -16,7 +16,7 @@ from tavern_shared.mods.install import (
 from tavern_shared.mods.layout import (
     _disabled_record_path, _safe_basename, _userlibs_dir,
 )
-from tavern_shared.mods.manifest import parity_required, runs_in_scene
+from tavern_shared.mods.manifest import _manifest_from_dict, parity_required, runs_in_scene
 from tavern_shared.mods.pins import _parse_pin_entry
 from tavern_shared.mods.repos import (
     _norm, _repo_shorthand, replacement_for, replacement_of_unlisted,
@@ -65,6 +65,8 @@ class JoinPlan:
     pin_conflicts: list         # [(id, pinned version, server version)]
     declined: list = field(default_factory=list)          # [(id, version)]
     unresolved_pins: list = field(default_factory=list)   # [(id, version or "latest")]
+    shared: list = field(default_factory=list)            # ids left on: this folder's server runs them
+    forced_off: dict = field(default_factory=dict)        # pinned id -> the server's mod it replaces
 
     @property
     def blocking(self):
@@ -89,9 +91,11 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
     hinted_repo = {m["id"]: m.get("source_repo") for m in server_mods if m.get("source_repo")}
     skipped = [(mid, ver) for mid, ver in recommended.items() if mid in declined]
 
+    installed = _client_records(game_dir)
     roots, missing, needs_repo, unresolved_pins = [], [], [], []
     reason = {}         # mod_id -> tag, first wins
     exact_pin = {}      # mod_id -> pinned version, None for latest
+    forced_off = {}
 
     def resolve_root(mod_id, version, tag):
         try:
@@ -100,6 +104,8 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
             if manifest.artifact_for(CLIENT_TARGET) is None:
                 raise ModManagerError(f"{mod_id} {version} has no Windows build.")
         except ModManagerError:
+            manifest = _from_record(game_dir, installed.get(mod_id), version)
+        if manifest is None:
             if tag == "pinned":
                 unresolved_pins.append((mod_id, version))
                 _warn(f"pinned mod '{mod_id}' {version} isn't available from any "
@@ -138,6 +144,7 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
         if mod_id in replacing_server:
             _warn(f"pinned mod '{mod_id}' replaces '{replacing_server[mod_id]}', which "
                   f"this server runs, so it's left out of this join.")
+            forced_off[mod_id] = replacing_server[mod_id]
             continue
         exact_pin[mod_id] = version
         if mod_id in reason:
@@ -152,6 +159,22 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
             version = max((v for s in matches for v in s.versions), key=_parse_version)
         resolve_root(mod_id, version, "pinned")
 
+    # A required mod's broken closure blocks; a recommendation's or pin's
+    # only leaves that mod out.
+    settled = [m for m in roots if reason[m.id] == "required"]
+    dependencies = resolve_dependencies(settled, index, repo_bases, CLIENT_TARGET)
+    for m in [m for m in roots if reason[m.id] != "required"]:
+        try:
+            deps = resolve_dependencies(settled + [m], index, repo_bases, CLIENT_TARGET)
+            collect_library_dependencies(settled + [m] + deps, CLIENT_TARGET)
+        except ModManagerError as e:
+            _warn(f"'{m.id}' {m.version} is left out of this join: {e}")
+            del reason[m.id]
+            continue
+        settled.append(m)
+        dependencies = deps
+    roots = settled
+
     # Only a mod that resolved as a server root can overrule a pin.
     server_versions = {**recommended, **required}
     pin_conflicts = [
@@ -161,7 +184,6 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
         and pinned_version != server_versions[mod_id]
     ]
 
-    dependencies = resolve_dependencies(roots, index, repo_bases, CLIENT_TARGET)
     for dep in dependencies:
         reason.setdefault(dep.id, "dependency")
 
@@ -182,7 +204,6 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
     for mod_id in needed_by:
         reason[mod_id] = "dependency"
 
-    installed = _client_records(game_dir)
     entries = []
     for mod in all_mods:
         cached = os.path.isdir(_cache_mod_dir(mod.id, mod.version,
@@ -196,10 +217,12 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
                                  manifest=mod, needed_by=needed_by.get(mod.id, "")))
 
     active_ids = {e.mod_id for e in entries}
-    # Declining is "don't add it", never "take it away".
-    to_deactivate = [mod_id for mod_id, rec in installed.items()
-                     if rec.get("enabled") and mod_id not in active_ids
-                     and mod_id not in declined]
+    # Declining is "don't add it", never "take it away". Disabling is one switch
+    # for the folder, so a mod this folder's server runs stays on.
+    unwanted = [mod_id for mod_id, rec in installed.items()
+                if rec.get("enabled") and mod_id not in active_ids and mod_id not in declined]
+    shared = [m for m in unwanted if has_target(installed[m], "server") and m not in forced_off]
+    to_deactivate = [m for m in unwanted if m not in shared]
 
     libraries = collect_library_dependencies(all_mods, CLIENT_TARGET)
     # Against what stays enabled: the render prunes what it disables.
@@ -208,7 +231,22 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
 
     return JoinPlan(entries=entries, to_deactivate=to_deactivate, libraries=libraries,
                     missing=missing, needs_repo=needs_repo, pin_conflicts=pin_conflicts,
-                    declined=skipped, unresolved_pins=unresolved_pins)
+                    declined=skipped, unresolved_pins=unresolved_pins, shared=shared,
+                    forced_off={k: v for k, v in forced_off.items() if k in to_deactivate})
+
+
+def _from_record(game_dir, rec, version):
+    """The manifest an intact installed record of `version` stands in for, so
+    a join that already matches needs no source; else None."""
+    if not rec or rec.get("version") != version:
+        return None
+    try:
+        m = _manifest_from_dict(rec, rec.get("source_repo", ""))
+    except ModManagerError:
+        return None
+    if m is None or m.artifact_for(CLIENT_TARGET) is None:
+        return None
+    return m if verify_mod_files(game_dir, m.id, CLIENT_TARGET) is not False else None
 
 
 ACTION_INSTALL     = "install"      # needs downloading
@@ -223,7 +261,6 @@ ACTION_SERVER_ONLY = "server-only"  # no client_windows build
 ACTION_MISSING     = "missing"      # in no configured repo
 ACTION_NEEDS_REPO  = "needs-repo"   # only in a repo not added here
 
-# Problems first, then changes, then the quiet rows.
 _ACTION_ORDER = {
     ACTION_MISSING: 0, ACTION_NEEDS_REPO: 0,
     ACTION_INSTALL: 1, ACTION_ACTIVATE: 1, ACTION_UPDATE: 1,
@@ -327,12 +364,16 @@ def build_mod_diff(game_dir, server_mods, plan):
         rows.append(DiffRow(mod_id=mod_id, **row))
 
     for mod_id in plan.to_deactivate:
+        old = plan.forced_off.get(mod_id)
         add(mod_id, server_version="", client_enabled=True, action=ACTION_DEACTIVATE,
-            reason="", optional=True,
-            note=("this server doesn't run it; keeping it on won't block your "
-                  "join. Pin keeps it enabled on every server, so it stops "
-                  "being offered for deactivation at all (same as Mod "
-                  "Manager's Keep Enabled)."))
+            reason="", optional=old is None,
+            note=(f"it replaces {old}, which this server runs, so they can't both load"
+                  if old else "this server doesn't run it. Keep leaves it on for this "
+                  "join; Pin keeps it on for every server"))
+    for mod_id in plan.shared:
+        add(mod_id, server_version="", client_enabled=True, action=ACTION_MATCH,
+            reason="", optional=False,
+            note="your server in this game folder runs it, so it stays on")
     for mod_id, version in plan.declined:
         add(mod_id, server_version=version, action=ACTION_SKIPPED,
             reason="recommended", optional=True,
@@ -388,10 +429,15 @@ def _prune_orphaned_libraries(game_dir):
                 pass
 
 
+def _plan_libraries(plan):
+    # From the entries the player kept, not every one planned.
+    return collect_library_dependencies([e.manifest for e in plan.entries], CLIENT_TARGET)
+
+
 def render_plan_steps(plan):
     """How many items render_active_set reports through on_step."""
     return (len([e for e in plan.entries if not e.active])
-            + len(plan.libraries) + len(plan.to_deactivate))
+            + len(_plan_libraries(plan)) + len(plan.to_deactivate))
 
 
 def render_active_set(game_dir, plan, on_progress, on_step):
@@ -433,7 +479,7 @@ def render_active_set(game_dir, plan, on_progress, on_step):
             download(entry)
         on_step(entry.mod_id, "done")
 
-    for lib in plan.libraries:
+    for lib in _plan_libraries(plan):
         filename = _safe_basename(lib.filename)
         on_step(filename, "start")
         _ensure_library(game_dir, lib, on_progress, verb="Installing")

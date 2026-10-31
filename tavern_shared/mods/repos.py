@@ -15,13 +15,17 @@ DEFAULT_REPO = "https://raw.githubusercontent.com/ModdingTavern/TavernMods/main"
 CFG_REPOS_KEY = "mod_repos"
 SUPPORTED_INDEX_MAJOR = 2
 _INDEX_TTL_SECONDS = 300
+_MAX_JSON_BYTES = 8 * 1024 * 1024    # TavernLib's MaxJsonBytes
 
 
 def _get_json(url, timeout=15):
     req = urllib.request.Request(url, headers={"User-Agent": "TavernLauncher/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            body = resp.read(_MAX_JSON_BYTES + 1)
+        if len(body) > _MAX_JSON_BYTES:
+            raise ModManagerError(f"{url} is over {_MAX_JSON_BYTES // (1024 * 1024)} MB; refusing it.")
+        return json.loads(body.decode("utf-8"))
     except urllib.error.HTTPError as e:
         raise ModManagerError(f"{urlparse(url).netloc} returned HTTP {e.code} for {url}")
     except (urllib.error.URLError, TimeoutError, OSError) as e:
@@ -94,7 +98,7 @@ def add_repo(cfg, url):
             "That URL didn't serve a valid mod index (no 'mods' object in "
             "repository.json). Double-check it's the raw-content base URL of a "
             "correctly structured repo.")
-    if index.get("index_version") != SUPPORTED_INDEX_MAJOR:
+    if not _is_supported(index):
         raise ModManagerError(
             f"That repository's index is schema v{index.get('index_version')}, and "
             f"this launcher reads v{SUPPORTED_INDEX_MAJOR} only, so it would list "
@@ -118,6 +122,12 @@ def remove_repo(cfg, ref):
     cfg[CFG_REPOS_KEY] = {k: v for k, v in (cfg.get(CFG_REPOS_KEY) or {}).items()
                           if k != ref and _norm(v) != _norm(ref)}
     save_cfg(cfg)
+
+
+def _is_supported(index):
+    # An int, as TavernLib reads it: 2.0 == 2 in Python.
+    iv = index.get("index_version")
+    return isinstance(iv, int) and iv == SUPPORTED_INDEX_MAJOR
 
 
 @dataclass
@@ -182,8 +192,8 @@ def _fetch_repo_index(base, force):
         return hit[1]
     try:
         index = _get_json(f"{base}/repository.json")
-        iv = index.get("index_version") if isinstance(index, dict) else None
-        if iv != SUPPORTED_INDEX_MAJOR:
+        if not isinstance(index, dict) or not _is_supported(index):
+            iv = index.get("index_version") if isinstance(index, dict) else None
             raise ModManagerError(f"index schema v{iv}, this build supports "
                                   f"v{SUPPORTED_INDEX_MAJOR}")
     except ModManagerError as e:
@@ -191,9 +201,11 @@ def _fetch_repo_index(base, force):
         return hit[1] if hit else ([], [])
 
     out = []
-    for mod_id, by_major in index.get("mods", {}).items():
+    mods = index.get("mods")
+    for mod_id, by_major in (mods.items() if isinstance(mods, dict) else ()):
         if isinstance(by_major, dict):
-            out += [s for s in (_summary_from_dict(e, mod_id, base) for e in by_major.values())
+            out += [s for s in (_summary_from_dict(e, mod_id, base)
+                                for e in by_major.values() if isinstance(e, dict))
                     if s is not None]
     _index_cache[base] = (now, (out, _replacements_from(index, base)))
     return _index_cache[base][1]

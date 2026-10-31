@@ -1,4 +1,4 @@
-"""The on-disk layout (REPO_STRUCTURE.md "Install destinations"); twin of
+"""The on-disk layout (REPO_STRUCTURE.md "Install layout"); twin of
 TavernLib's ModPaths."""
 import os
 
@@ -15,6 +15,9 @@ def _safe_basename(name):
     # A drive ("C:evil.dll") or an NTFS stream ("mod.dll:x"); basename sees neither.
     if ":" in name:
         raise ModManagerError(f"Filename {name!r} must not contain a colon.")
+    # Windows drops a trailing dot or space, so "a.b." would open "a.b".
+    if name != name.rstrip(". "):
+        raise ModManagerError(f"Filename {name!r} must not end in a dot or space.")
     if os.path.basename(name) != name:
         raise ModManagerError(f"Filename {name!r} must be a bare basename.")
     return name
@@ -57,6 +60,10 @@ def _disabled_record_path(game_dir, mod_id):
 
 def _staging_path(game_dir, mod_id):
     return os.path.join(_mods_base(game_dir), f".{_safe_basename(mod_id)}.installing")
+
+
+def _aside_path(game_dir, mod_id):
+    return os.path.join(_mods_base(game_dir), f".{_safe_basename(mod_id)}.old")
 
 
 def _library_sidecar_path(game_dir, filename):

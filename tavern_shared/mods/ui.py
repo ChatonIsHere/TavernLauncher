@@ -43,7 +43,7 @@ _TARGET_NAMES = {"client_windows": "Windows", "server": "Server", "client_androi
 
 
 def target_label(targets):
-    """"PC + Server", "Server only", ..."""
+    """"Windows + Server", "Server only", ..."""
     names = [_TARGET_NAMES.get(t, t) for t in sorted(targets, key=list(_TARGET_NAMES).index)
              if t in _TARGET_NAMES]
     if not names:
@@ -129,10 +129,8 @@ class ModListWindow(_Dialog):
 
     def _install(self, mod, version=None):
         """Installs `mod` at `version`, default its highest, asking first about
-        dependencies not yet installed (_confirm_install). The
-        game-running guard comes last, right before the write it protects:
-        accepting its risk for an install that is then refused anyway teaches
-        players to click through it."""
+        dependencies not yet installed (_confirm_install). The game-running
+        guard comes last, right before the write it protects."""
         if self._busy:
             return
         if not _melonloader_installed(self._game_dir):
@@ -154,9 +152,6 @@ class ModListWindow(_Dialog):
                     f"to run the {server_scene} scene.\n\nInstall it anyway?",
                     parent=self):
                 return
-        if not confirm_while_game_running(self, self._is_game_running,
-                                          f"Installing {mod.name}"):
-            return
         label = f"{mod.name} {version}" if version else mod.name
         self._set_busy(True, f"Checking what {label} needs...")
         index, game_dir, target = self._index, self._game_dir, self._target
@@ -190,14 +185,20 @@ class ModListWindow(_Dialog):
             install_mod_set(game_dir, mods, target, progress)
             return self._retire(progress)
         run_bg(self, install,
-               on_ok=lambda removed: self._finish(done + removed),
+               on_ok=lambda retired: self._finish(done + self._retired(*retired)),
                on_err=lambda e: self._finish(f"Install failed: {e}"))
 
     def _retire(self, progress):
-        """In the worker after an install: removes the mods it replaced (see
-        retire_replaced) and moves their pins on. Returns text for the
-        status line."""
-        removed = retire_replaced(self._game_dir, self._index, progress)
+        """In the worker after an install: (removed, note) from retire_replaced.
+        The install itself succeeded, so a failure here is only a note."""
+        try:
+            return retire_replaced(self._game_dir, self._index, progress), ""
+        except Exception as e:
+            return [], f" Couldn't remove the mod it replaces: {e}"
+
+    def _retired(self, removed, note):
+        """On the Tk thread: moves retired mods' pins to their replacements.
+        Returns text for the status line."""
         if removed and self._target == "client_windows":
             cfg = load_cfg()
             pinned = {_parse_pin_entry(p)[0] for p in list_pinned(cfg)}
@@ -206,7 +207,7 @@ class ModListWindow(_Dialog):
                     remove_pin(cfg, old_id)
                     if new_id not in pinned:
                         add_pin(cfg, new_id)
-        return "".join(f" Removed {old_id}, which it replaces." for old_id, _new in removed)
+        return note + "".join(f" Removed {old_id}, which it replaces." for old_id, _new in removed)
 
     def _record(self, mod_id):
         return next((r for r in self._installed_recs if r.get("id") == mod_id), None)
@@ -244,8 +245,9 @@ class ModListWindow(_Dialog):
         return missing_dependencies(rec, self._installed_recs, self._index, self._target)
 
     def _missing_text(self, missing):
-        notes = {"missing": "not installed", "disabled": "turned off"}
-        return ", ".join(f"{self._mod_name(dep_id)} ({notes.get(why, f'older than {min_v}')})"
+        notes = {"missing": "not installed", "disabled": "turned off", "too old": "older than {}",
+                 "wrong major": "needs {}"}
+        return ", ".join(f"{self._mod_name(dep_id)} ({notes[why].format(min_v)})"
                          for dep_id, min_v, why in missing)
 
     def _install_deps(self, mod_id, name):
@@ -268,7 +270,8 @@ class ModListWindow(_Dialog):
             install_dependencies(game_dir, rec, index, list_repos(load_cfg()), target, progress)
             return self._retire(progress)
         run_bg(self, install,
-               on_ok=lambda removed: self._finish(f"Installed what {name} needs.{removed}"),
+               on_ok=lambda retired: self._finish(f"Installed what {name} needs."
+                                                  + self._retired(*retired)),
                on_err=lambda e: self._finish(f"Install failed: {e}"))
 
 
@@ -472,7 +475,6 @@ class CommunityModsWindow(ModListWindow):
         status_lbl = tk.Label(cells[0], bg=SURF, font=("Segoe UI",9), anchor="w")
         status_lbl.pack(fill="both", padx=6)
         installed_var = tk.StringVar(value=r["installed"] or "-")
-        # The source's own mods carry a star in the Source column.
         source = source_label(s.source_repo) + (" ★" if r["own"] else "")
         for cell, text, bold, color in ((cells[1], r["author"] or "-", False, PARCH),
                                         (cells[2], r["name"], True, PARCH),
@@ -500,7 +502,6 @@ class CommunityModsWindow(ModListWindow):
                  justify="left", anchor="w"
         ).pack(side="left", fill="x", expand=True)
 
-        # Unmet dependencies of an installed copy, shown only while there are some.
         needs_row = tk.Frame(card, bg=SURF)
         needs_var = tk.StringVar()
         tk.Label(needs_row, textvariable=needs_var, bg=SURF, fg=AMBER, font=("Segoe UI",8),
@@ -510,7 +511,6 @@ class CommunityModsWindow(ModListWindow):
                         font=("Segoe UI",8), pady=2, padx=8)
         deps_btn.pack(side="right")
 
-        # Builds, parity, scenes and requires: collapsed until asked for.
         details = tk.Frame(card, bg=SURF)
         parity_text = "Exact version required" if s.parity_required else "Any compatible version"
         tag_text = f"{target_label(s.targets)}  ·  {parity_text}"
@@ -610,7 +610,7 @@ class CommunityModsWindow(ModListWindow):
                     deps = resolve_mod_by_id(repos, mod_id, prefer_repo=summary.source_repo).dependencies
                     text = ("Requires: " + ", ".join(f"{d}>={v}" for d, v in sorted(deps.items()))
                             if deps else "No dependencies.")
-                except ModManagerError:
+                except Exception:
                     text = "Couldn't load dependency info."
                 _DEPS_CACHE[key] = text
                 post(self, self._deps_fetched, key, mod_id, text)
@@ -790,7 +790,6 @@ class ModManagerWindow(ModListWindow):
         self._toggle_btn = _btn(bar, "Disable", self._on_toggle, style="normal",
                                 font=("Segoe UI",9), pady=5, padx=14)
         self._toggle_btn.pack(side="left", padx=8)
-        # Switch to a replacement, or install missing dependencies.
         self._fix_btn = _btn(bar, "Install Dependencies", self._on_fix, style="normal",
                              font=("Segoe UI",9), pady=5, padx=14)
         self._fix_btn.pack(side="left")
@@ -1256,7 +1255,7 @@ class ModVersionWindow(_Dialog):
                 try:
                     deps = _fetch_manifest(repo_bases, mod.id, v, prefer_repo=mod.source_repo).dependencies
                     text = ", ".join(f"{dep_id}>={min_v}" for dep_id, min_v in sorted(deps.items())) or "-"
-                except ModManagerError:
+                except Exception:
                     text = "?"
                 post(self, self._apply_requires, v, text)
         run_bg(self, fetch, on_ok=lambda _: self._status.set(""))
