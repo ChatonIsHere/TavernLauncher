@@ -7,9 +7,10 @@ CFG_DECLINED_KEY = "declined_mods"    # {server host: [mod id]}, keyed like toke
 
 
 def _parse_pin_entry(entry):
-    """"id" or "id@version" -> (id, version or None); also a modlist entry."""
-    mod_id, sep, version = entry.partition("@")
-    return mod_id, (version if sep else None)
+    """"id" or "id@version" -> (id, version or None); also a modlist entry.
+    A bare "id@" means latest, as in TavernLib."""
+    mod_id, _sep, version = entry.partition("@")
+    return mod_id, version or None
 
 
 def list_pinned(cfg):
