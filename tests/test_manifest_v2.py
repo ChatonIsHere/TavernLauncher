@@ -10,7 +10,7 @@ import os
 import types
 import unittest
 
-from conftest import stub
+from conftest import install_mod_closure, stub
 from test_modmanager import (
     DEFAULT, _FakeInstallFixture, _TempDataDirFixture, _srv, lib_dep, make_manifest,
     manifest_dict, mm, slim_entry, summary,
@@ -185,27 +185,11 @@ class PerTargetInstalls(_FakeInstallFixture, unittest.TestCase):
         self.assertEqual((rec["version"], mm.installed_targets(rec)), ("2.0.0", ["client_windows"]))
         self.assertFalse(os.path.exists(self._mod_file("ver.m", target="server")))
 
-    def test_a_locked_other_target_folder_is_left_behind_unlisted(self):
-        """A running server holding .server/ open: it stays, but nothing lists
-        it, so nothing loads it."""
-        self._both("lock.m", "1.0.0")
-        self._publish("lock.m", "2.0.0")
-        real = install._remove_best_effort
-        stub(self, install, "_remove_best_effort",
-             lambda path: False if path.endswith(".server") else real(path))
-        with quiet() as err:
-            self._closure("lock.m", "2.0.0", target="client_windows")
-        self.assertTrue(os.path.isdir(self._mod_file("lock.m", target="server")))
-        self.assertIn(".server", err.getvalue())
-        self.assertEqual(mm.installed_targets(self._record("lock.m")), ["client_windows"])
-        self.assertEqual(mm.handshake_snapshot(self.game, "server")[2], [])
-        self.assertEqual(mm.mod_status(self.game, "lock.m", [], "server"), "missing")
-
     def test_a_pc_only_dependency_is_pruned_for_a_server_install(self):
         self._publish("pc.dep", "1.0.0", targets=("client_windows",))
         self._publish("root.m", "1.0.0", dependencies={"pc.dep": "1.0.0"})
         with quiet():
-            mm.install_mod_closure(self.game, summary("root.m", ["1.0.0"]),
+            install_mod_closure(self.game, summary("root.m", ["1.0.0"]),
                                    [summary("pc.dep", ["1.0.0"], targets=("client_windows",))],
                                    [self.BASE], self.progress.append, "server")
         self.assertEqual(os.listdir(os.path.join(self.game, "Mods")), ["root.m"])

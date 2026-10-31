@@ -43,3 +43,10 @@ def temp_dir(test, prefix="tavern_test_"):
     path = tempfile.mkdtemp(prefix=prefix)
     test.addCleanup(shutil.rmtree, path, ignore_errors=True)
     return path
+
+
+def install_mod_closure(game_dir, mod, index, repo_bases, on_progress, target, version=None):
+    """A Get Mods install without its prompt: `mod` and its whole closure."""
+    from tavern_shared.mods import install
+    root, deps, _ = install.plan_mod_install(game_dir, mod, index, repo_bases, target, version)
+    install.install_mod_set(game_dir, deps + [root], target, on_progress)

@@ -16,7 +16,7 @@ from tavern_shared.mods import (
     base, cache, install, layout, manifest, modlist, pins, plan, repos,
     resolve,
 )
-from conftest import stub, temp_dir
+from conftest import install_mod_closure, stub, temp_dir
 from tavern_shared import paths
 
 
@@ -652,7 +652,7 @@ class _FakeInstallFixture:
 
     def _closure(self, mod_id, version="1.0.0", target=None):
         """Closure-install one already-published mod, as Get Mods does."""
-        mm.install_mod_closure(self.game, summary(mod_id, [version]),
+        install_mod_closure(self.game, summary(mod_id, [version]),
                                [summary(mod_id, [version])], [self.BASE],
                                self.progress.append, target or self.TARGET)
 
@@ -701,7 +701,7 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
 
         index = [summary("dep.k", ["1.0.0"]), summary("root.m", ["1.0.0"])]
         root_summary = summary("root.m", ["1.0.0"])
-        mm.install_mod_closure(self.game, root_summary, index, [self.BASE], self.progress.append, target="client_windows")
+        install_mod_closure(self.game, root_summary, index, [self.BASE], self.progress.append, target="client_windows")
 
         # Each mod lands in its own folder, Mods/<id>/, with the dll inside.
         self.assertTrue(os.path.isfile(os.path.join(self.game, "Mods", "root.m", ".client_windows", "root.m.dll")))
@@ -733,7 +733,7 @@ class InstallEndToEnd(_FakeInstallFixture, unittest.TestCase):
         self._publish("v.v", "1.0.0")
         self._publish("v.v", "2.0.0")
         index = [summary("v.v", ["1.0.0", "2.0.0"])]
-        mm.install_mod_closure(self.game, summary("v.v", ["1.0.0", "2.0.0"]), index,
+        install_mod_closure(self.game, summary("v.v", ["1.0.0", "2.0.0"]), index,
                                [self.BASE], self.progress.append, version="1.0.0", target="client_windows")
         mod_meta = read_json(os.path.join(self.game, "Mods", "v.v", "manifest.json"))
         self.assertEqual(mod_meta["version"], "1.0.0")
@@ -901,10 +901,11 @@ class MissingDependencies(_FakeInstallFixture, unittest.TestCase):
     """Get Mods asks before adding dependencies; a mod installed without them
     is marked until Install deps adds them."""
 
-    def _publish_pair(self, dep_versions=("1.0.0",), dep_targets=("client_windows", "server")):
+    def _publish_pair(self, dep_versions=("1.0.0",), dep_targets=("client_windows", "server"),
+                      dep_min="1.0.0"):
         for v in dep_versions:
             self._publish("dep.k", v, targets=dep_targets)
-        self._publish("root.m", "1.0.0", dependencies={"dep.k": "1.0.0"})
+        self._publish("root.m", "1.0.0", dependencies={"dep.k": dep_min})
         return [summary("dep.k", list(dep_versions), targets=dep_targets),
                 summary("root.m", ["1.0.0"])]
 
@@ -936,20 +937,27 @@ class MissingDependencies(_FakeInstallFixture, unittest.TestCase):
 
     def test_a_disabled_dependency_counts_as_missing(self):
         index = self._publish_pair()
-        mm.install_mod_closure(self.game, index[1], index, [self.BASE], noop, self.TARGET)
+        install_mod_closure(self.game, index[1], index, [self.BASE], noop, self.TARGET)
         mm.disable_mod(self.game, "dep.k")
         self.assertEqual(self._missing(index), [("dep.k", "1.0.0", "disabled")])
 
     def test_an_old_dependency_counts_as_missing(self):
+        index = self._publish_pair(dep_versions=("1.0.0", "1.1.0"), dep_min="1.1.0")
+        self._root_alone()
+        install_mod_closure(self.game, index[0], index, [self.BASE], noop, self.TARGET,
+                            version="1.0.0")
+        self.assertEqual(self._missing(index), [("dep.k", "1.1.0", "too old")])
+
+    def test_a_dependency_on_another_major_counts_as_missing(self):
         index = self._publish_pair(dep_versions=("0.9.0", "1.0.0"))
         self._root_alone()
-        mm.install_mod_closure(self.game, index[0], index, [self.BASE], noop, self.TARGET,
-                               version="0.9.0")
-        self.assertEqual(self._missing(index), [("dep.k", "1.0.0", "too old")])
+        install_mod_closure(self.game, index[0], index, [self.BASE], noop, self.TARGET,
+                            version="0.9.0")
+        self.assertEqual(self._missing(index), [("dep.k", "1.0.0", "wrong major")])
 
     def test_a_dependency_with_no_build_here_is_not_missing(self):
         index = self._publish_pair(dep_targets=("server",))
-        mm.install_mod_closure(self.game, index[1], index, [self.BASE], noop, self.TARGET)
+        install_mod_closure(self.game, index[1], index, [self.BASE], noop, self.TARGET)
         self.assertEqual(self._missing(index), [])
 
 

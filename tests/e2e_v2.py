@@ -28,6 +28,7 @@ LAUNCHER = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURES = os.path.join(LAUNCHER, "tests", "fixtures", "v2")
 sys.path.insert(0, LAUNCHER)
 from tavern_shared.mods import install, modlist, plan, repos  # noqa: E402
+from conftest import install_mod_closure  # noqa: E402
 
 with socket.socket() as _probe:
     _serving = _probe.connect_ex(("127.0.0.1", 8765)) == 0
@@ -83,7 +84,7 @@ def py_install(game, mod_id, target):
     index = repos.fetch_indexes([BASE], force=True)
     root = next(s for s in index if s.id == mod_id)
     with contextlib.redirect_stderr(io.StringIO()):
-        install.install_mod_closure(game, root, index, [BASE], lambda _m: None, target)
+        install_mod_closure(game, root, index, [BASE], lambda _m: None, target)
 
 
 def cs_server_install(game, *mod_ids):

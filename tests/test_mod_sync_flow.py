@@ -1,21 +1,10 @@
 """The client launcher's mod-sync flow, at the seams where the Sync button and
 the join path have to agree with each other.
 
-Three things are pinned here, all of them cases where the launcher used to say
-one thing and do another:
-
-  * a decline taken back has to be RE-PLANNED before it can be applied - the
-    plan on screen never resolved that mod, so applying it as-is installs
-    nothing while reporting success;
-  * Sync and Join must key declines and the mods-list cache by the same host
-    string, which is the resolved one, because that's what the join path uses;
-  * "this server runs no mods" and "this server told us nothing about its mods"
-    are different answers - only the second one has nothing to sync against.
-
-The window is never built: ClientLauncher is a tk.Tk subclass and needs a
-display, a game folder and a config file. The methods under test are bound onto
-a plain namespace instead, so each test says exactly which of them it exercises
-and which collaborators it stands in for.
+Pinned here: a decline taken back is re-planned before it is applied; Sync
+and Join key declines and the mods-list cache by the resolved host; and "no
+mods" differs from "no mod info". ClientLauncher needs a display, so the
+methods under test are bound onto a plain namespace.
 """
 import os
 import sys
@@ -83,9 +72,8 @@ def bind(ns, *names):
 
 
 class UnDecliningRePlans(unittest.TestCase):
-    """FINDING: turning a declined recommendation back on used to be a no-op -
-    the row said "Install", Apply reported success, and nothing was installed
-    until the next join happened to re-plan."""
+    """A declined recommendation turned back on is re-planned, so Apply
+    installs it rather than reporting success over nothing."""
 
     def setUp(self):
         self.rendered = []
@@ -191,9 +179,8 @@ class UnDecliningRePlans(unittest.TestCase):
 
 
 class CheckKeysBySameHostAsJoin(unittest.TestCase):
-    """FINDING: Sync keyed declines and the mods-list cache by the raw field
-    text while the join path keys everything by the resolved IP, so on a DNS
-    name the two flows were reading different declines."""
+    """Sync keys declines and the mods-list cache by the resolved IP, as the
+    join path does."""
 
     def _check(self, resp):
         ns = launcher(_check_status=FakeVar(), _check_label=FakeWidget(),
@@ -225,9 +212,8 @@ class CheckKeysBySameHostAsJoin(unittest.TestCase):
 
 
 class NoModsVersusNoModInfo(unittest.TestCase):
-    """FINDING: a server running no mods reported an empty list, which the
-    launcher treated as "nothing to sync" - so the deactivations the Sync button
-    promises never happened, on either path."""
+    """A server running no mods is an empty set to sync against, which
+    deactivates what's active here; only no mod info at all skips."""
 
     def _get_server_mods(self, resp, fetched=None):
         ns = launcher(_mods_list_cache={}, _server_untracked=[])
@@ -286,8 +272,8 @@ class NoModsVersusNoModInfo(unittest.TestCase):
 
 
 class SyncVerifiesBeforeClaimingSuccess(unittest.TestCase):
-    """FINDING: Sync Mods said "Your mods now match this server" without the
-    parity check the join path runs after the same render."""
+    """Sync runs the join's post-render parity check before saying the mods
+    match."""
 
     def _sync(self, installed):
         server_mods = [{"id": "a.mod", "version": "1.0.0", "targets": ["client_windows", "server"],

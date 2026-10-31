@@ -1,10 +1,5 @@
-"""The partial-update marker is one shared file in AppData for BOTH launcher
-exes (deliberately not next to either exe — the marker exists to report that
-writing next to the exe was blocked). The install_dir recorded inside it is
-therefore load-bearing: without checking it, whichever launcher started first
-consumed and cleared the other launcher's report, so the user it was actually
-for never saw it.
-"""
+"""The partial-update marker is one AppData file shared by both launchers, so
+each reads only a report whose install_dir is its own."""
 import os
 import sys
 import json

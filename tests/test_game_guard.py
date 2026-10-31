@@ -1,12 +1,5 @@
-"""The "close the game first" check.
-
-Mod work while the game is running fails on Windows file locks somewhere in the
-middle of an rmtree or a replace, so the whole value of this guard is that it
-runs BEFORE anything is written and that it stays silent the rest of the time.
-Both halves are tested here: a launcher that has no idea whether the game is up
-(the server one) must never see a dialog, and one whose game has exited must not
-either -- a guard that nags on every click is one people learn to click through.
-"""
+"""The "close the game first" check: asked before any write, and silent when
+the game isn't known to be running."""
 import os
 import sys
 import unittest
