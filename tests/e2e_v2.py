@@ -30,12 +30,14 @@ sys.path.insert(0, LAUNCHER)
 from tavern_shared.mods import install, modlist, plan, repos  # noqa: E402
 from conftest import install_mod_closure  # noqa: E402
 
+class _Quiet(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *_a):
+        pass
+
+
 with socket.socket() as _probe:
     _serving = _probe.connect_ex(("127.0.0.1", 8765)) == 0
 if not _serving:
-    class _Quiet(http.server.SimpleHTTPRequestHandler):
-        def log_message(self, *_a):
-            pass
     _handler = functools.partial(_Quiet, directory=os.path.join(FIXTURES, "repo"))
     _server = http.server.ThreadingHTTPServer(("127.0.0.1", 8765), _handler)
     threading.Thread(target=_server.serve_forever, daemon=True).start()
@@ -52,7 +54,7 @@ def check(cond, label):
 
 
 def harness(*args):
-    out = subprocess.run([HARNESS, *args], capture_output=True, text=True, timeout=300)
+    out = subprocess.run([HARNESS, *args], capture_output=True, encoding="utf-8", timeout=300)
     if out.returncode != 0:
         print(out.stdout, out.stderr)
         raise RuntimeError(f"harness {args[0]} exited {out.returncode}")
@@ -220,6 +222,12 @@ check(install.verify_mod_files(game, SPLIT, "client_windows") is True, "python s
 check(harness("verify", game, SPLIT, "server").strip() == "False", "C# sees the server build as damaged")
 check(harness("verify", game, SPLIT, "client_windows").strip() == "True", "C# sees the client_windows build as intact")
 install._verify_memo.clear()
+before = record(game, SPLIT)
+with open(victim, "rb"):         # a running server holding its build open
+    cs_server_install(game, EXAMPLE, SPLIT)
+check(record(game, SPLIT) == before and install.verify_mod_files(game, SPLIT, "server") is False,
+      "C# repair while .server is in use: refused, record untouched")
+install._verify_memo.clear()
 cs_server_install(game, EXAMPLE, SPLIT)
 check(record(game, SPLIT) == expected("SplitMod.client_windows+server"), "after C# repair: record bytes still golden")
 check(install.verify_mod_files(game, SPLIT, "server") is True, "after C# repair: server build verifies")
@@ -251,6 +259,101 @@ for rel, obj in (("index.json", {SPLIT: served["mods"][SPLIT]}), ("replaced.json
         json.dump(obj, f)
 resolved = harness("resolve", rdir, "ExampleDev.Root@1.0.0", "server").strip().splitlines()[-1]
 check(resolved == f"ok {SPLIT}@1.0.0", f"C# resolver: a dependency on a replaced mod gets its replacement ({resolved})")
+
+print("\n== a copied mod folder is untracked, never a second install")
+copy = os.path.join(game, "Mods", SPLIT + " - Copy")
+shutil.copytree(os.path.join(game, "Mods", SPLIT), copy)
+check(not any(" - Copy/." in d for d in select(game, "server")), "C#: the copy's build doesn't load")
+py_untracked = [u["name"] for u in install.list_untracked_mods(game)]
+cs_untracked = [u["name"] for u in harness_json("snap", game)["untracked"]]
+check(py_untracked == cs_untracked == [SPLIT + " - Copy"], f"both list the copy as untracked ({py_untracked} / {cs_untracked})")
+check(harness_json("snap", game)["hash"] == install.handshake_snapshot(game, "server")[0], "mods_hash still identical")
+shutil.rmtree(copy)
+
+print("\n== handshake order and stamps for awkward names")
+g5 = new_game(); games.append(g5)
+for mod_id in ("T.\ue000", "T.\U0001f600", "T.a"):
+    hand_record(g5, mod_id, ["server", "client_windows"], True)
+loose = os.path.join(g5, "Mods", "Loose.dll")
+open(loose, "wb").close()
+os.utime(loose, ns=(1_700_000_000_999_999_900,) * 2)
+cs = harness_json("snap", g5)
+py_hash, _count, py_mods, _u = install.handshake_snapshot(g5, "server")
+check(cs["hash"] == py_hash, "mods_hash identical with astral ids and a sub-second mtime")
+check([m["id"] for m in cs["mods"]] == [m["id"] for m in py_mods], "mods_list order identical")
+
+print("\n== record bytes for awkward strings")
+fmt_dir = tempfile.mkdtemp(prefix="v2fmt_"); games.append(fmt_dir)
+awkward = {"a": "DEL\x7f ctl\x01 \u00e9 \U0001f600 \\ \"q\"", "n": [1, -2, {"k": None, "t": True}]}
+with open(os.path.join(fmt_dir, "in.json"), "w", encoding="utf-8") as f:
+    json.dump(awkward, f, ensure_ascii=False)
+harness("format", os.path.join(fmt_dir, "in.json"), os.path.join(fmt_dir, "out.json"))
+with open(os.path.join(fmt_dir, "out.json"), "rb") as f:
+    check(f.read() == install._sidecar_bytes(awkward), "ModRecord.Format matches _sidecar_bytes byte for byte")
+named = dict(split, artifacts=[dict(split["artifacts"][1], download_url="https://x/v1/My%20Mod.dll")])
+with open(os.path.join(fmt_dir, "named.json"), "w", encoding="utf-8") as f:
+    json.dump(named, f)
+cs_name = harness("manifest", os.path.join(fmt_dir, "named.json")).split("name=")[-1].strip()
+py_name = plan._manifest_from_dict(named, BASE).artifacts[0].install_name(SPLIT)
+check(cs_name == py_name == "My Mod.dll", f"dll install name percent-decoded on both sides ({py_name} / {cs_name})")
+
+print("\n== reconcile against a source that changes (scratch repo on :8766)")
+scratch = tempfile.mkdtemp(prefix="v2src_"); games.append(scratch)
+shutil.copytree(os.path.join(FIXTURES, "repo"), scratch, dirs_exist_ok=True)
+SCRATCH = "http://127.0.0.1:8766"
+_scratch_server = http.server.ThreadingHTTPServer(
+    ("127.0.0.1", 8766), functools.partial(_Quiet, directory=scratch))
+threading.Thread(target=_scratch_server.serve_forever, daemon=True).start()
+with open(os.path.join(FIXTURES, "repo", "manifests", "ExampleDev", "PcHelper", "1.0.0.json"), encoding="utf-8") as f:
+    helper = json.load(f)
+art = dict(helper["artifacts"][0], targets=["server"])
+
+
+def publish(mod_id, deps=None, manifest=True):
+    """Lists mod_id 1.0.0 in the scratch index, a server build of PcHelper's dll."""
+    if manifest:
+        m = dict(helper, id=mod_id, name=mod_id, parity_required=False, dependencies=deps or {},
+                 artifacts=[art])
+        folder = os.path.join(scratch, "manifests", *mod_id.split(".", 1))
+        os.makedirs(folder, exist_ok=True)
+        for leaf in ("1.0.0.json", "latest.json"):
+            with open(os.path.join(folder, leaf), "w", encoding="utf-8") as f:
+                json.dump(m, f)
+    served["mods"][mod_id] = {"1": dict(served["mods"][HELPER]["1"], name=mod_id, targets=["server"])}
+    save_index()
+
+
+def save_index():
+    with open(os.path.join(scratch, "repository.json"), "w", encoding="utf-8") as f:
+        json.dump(served, f)
+
+
+def enabled(game_dir):
+    return {r["id"]: r.get("enabled") for r in install.list_installed_mods(game_dir)}
+
+
+g6 = new_game(); games.append(g6)
+publish("ExampleDev.NeedsOld", {OLD: "1.0.0"})
+for run in (1, 2):
+    harness("reconcile", g6, SCRATCH, "ExampleDev.NeedsOld")
+    check(enabled(g6).get(SPLIT) is True, f"run {run}: a dependency on a replaced mod keeps its replacement enabled")
+
+g7 = new_game(); games.append(g7)
+publish("ExampleDev.Keeper")
+harness("reconcile", g7, SCRATCH, "ExampleDev.Keeper")
+del served["mods"]["ExampleDev.Keeper"]
+served["replaced"]["ExampleDev.Keeper"] = {"by": "ExampleDev.Ghost"}
+publish("ExampleDev.Ghost", manifest=False)
+harness("reconcile", g7, SCRATCH, "ExampleDev.Keeper")
+check(enabled(g7) == {"ExampleDev.Keeper": True}, f"a replacement that can't be fetched keeps the listed mod ({enabled(g7)})")
+
+os.makedirs(os.path.join(scratch, "v1"))
+with open(os.path.join(scratch, "v1", "repository.json"), "w", encoding="utf-8") as f:
+    json.dump({"index_version": 1, "mods": {}}, f)
+check(harness("validaterepo", SCRATCH).strip().splitlines()[-1] == "ok", "addrepo accepts a v2 index")
+check(harness("validaterepo", SCRATCH + "/v1").strip().splitlines()[-1].startswith("refused: That repository's index is schema v1"),
+      "addrepo refuses a v1 index")
+_scratch_server.shutdown()
 
 for g in games:
     shutil.rmtree(g, ignore_errors=True)
