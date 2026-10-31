@@ -15,7 +15,7 @@ import unittest
 import urllib.request
 from urllib.parse import urlparse
 
-from conftest import stub, temp_dir
+from conftest import install_mod_closure, stub, temp_dir
 from tavern_shared.mods import install, repos
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "v2")
@@ -47,7 +47,7 @@ class _Golden:
         root = next(s for s in index if s.id == mod_id)
         with contextlib.redirect_stderr(io.StringIO()):
             for target in order:
-                install.install_mod_closure(game, root, index, [BASE], lambda _m: None, target)
+                install_mod_closure(game, root, index, [BASE], lambda _m: None, target)
         return game
 
     def test_every_case_matches_its_golden_bytes(self):

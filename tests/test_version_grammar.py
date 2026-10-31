@@ -1,13 +1,5 @@
-"""Which version strings the launcher accepts, as opposed to which ones it can
-technically parse.
-
-TavernLib parses the same index and the same manifests with int.TryParse, and
-both sides skip an unparseable version with a warning rather than throwing. So a
-string only Python accepts doesn't blow up anywhere - it quietly gives the two
-implementations different version sets for the same mod, and with that a
-different highest() and a different major lock. These cases pin the grammar to
-the intersection.
-"""
+"""The version grammar, held to what TavernLib's ModVersion accepts: a string
+only one side parses gives the two different version sets for one mod."""
 import os
 import sys
 import unittest

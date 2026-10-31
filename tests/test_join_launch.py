@@ -1,17 +1,9 @@
 """The client launcher's join path, from the auth handshake to the game's
 command line, and the pre-join parity check that gates it.
 
-Two things are pinned here:
-
-  * the scene the server asks for during auth (/tutorialScene, /questScene)
-    reaches the game's launch args. The 1.8.5 merge left _do_launch passing a
-    variable that no longer existed, so every authenticated join raised
-    NameError - with no conflict marker to point at it;
-  * a required mod with no version fails parity, as it does in TavernLib's
-    ModParity.ValidateClient, rather than matching a client that lacks it.
-
-As in test_mod_sync_flow, the window is never built: the methods under test
-are bound onto a plain namespace, with each collaborator stood in for.
+Pinned here: the scene the server asks for during auth reaches the game's
+launch args, and a required mod with no version fails parity, as in TavernLib's
+ModParity.CheckJoin. The methods under test are bound onto a plain namespace.
 """
 import os
 import shutil
@@ -109,7 +101,6 @@ class SceneReachesTheLaunchArgs(unittest.TestCase):
         self.assertEqual(self.planned_scene, ["normal"])
 
     def test_a_port_typed_with_the_address_moves_to_the_port_field(self):
-        # "100.66.236.126:1757" was looked up whole, with the auth port on.
         args = self._join(None, ip="100.66.236.126:1757", port="1758")
         self.assertEqual(self.resolved, ["100.66.236.126"])
         self.assertEqual(self.ns.v_ip.get(), "100.66.236.126")
@@ -237,7 +228,7 @@ class TavernEssentialsDetection(unittest.TestCase):
 
 
 class VersionlessRequiredModFailsParity(unittest.TestCase):
-    """Mirror of TavernLib's ModParity.ValidateClient rule."""
+    """Mirror of TavernLib's ModParity.CheckJoin rule."""
 
     def _verify(self, server_mods, installed):
         ns = types.SimpleNamespace()
