@@ -96,6 +96,19 @@ class Placement(_TempDataDirFixture, unittest.TestCase):
             with mm._verified_download(url, self._sha_for(url), self.game, None):
                 pass
 
+    def test_a_loose_dll_that_cant_be_renamed_is_only_a_warning(self):
+        loose = os.path.join(self.game, "Mods", "a.m.dll")
+        os.makedirs(os.path.dirname(loose))
+        open(loose, "wb").close()
+
+        def locked(*_a):
+            raise PermissionError(13, "in use")
+        stub(self, install, "disable_untracked_dll", locked)
+        with quiet() as err:
+            self._install("a.m")
+        self.assertIn("couldn't be disabled", err.getvalue())
+        self.assertIs(mm.verify_mod_files(self.game, "a.m", self.TARGET), True)
+
     def test_names_ending_in_a_dot_or_space_are_refused(self):
         for name in ("a.dll.", "a.dll ", "a.b."):
             with self.assertRaises(mm.ModManagerError):
@@ -234,7 +247,7 @@ class SourceData(_TempDataDirFixture, unittest.TestCase):
             make_manifest("a.m", "1.0.0", library_dependencies=[lib])
 
     def test_dependencies_must_map_ids_to_version_strings(self):
-        for deps in ({"x.y": 1}, "x.y", [["x.y", "1.0.0"]]):
+        for deps in ({"x.y": 1}, "x.y", [["x.y", "1.0.0"]], [], "", False):
             with self.assertRaises(mm.ModManagerError, msg=repr(deps)):
                 make_manifest("a.m", "1.0.0", dependencies=deps)
         self.assertEqual(make_manifest("a.m", "1.0.0", dependencies=None).dependencies, {})
