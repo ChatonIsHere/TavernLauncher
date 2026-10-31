@@ -19,7 +19,7 @@ from tavern_shared.patch import (
 )
 
 MELONLOADER_RELEASES_PAGE = "https://github.com/LavaGang/MelonLoader/releases/latest"
-TAVERNLIB_RELEASES_PAGE   = "https://github.com/ModdingTavern/TavernLib/releases/latest"
+TAVERNLIB_RELEASES_PAGE   = "https://github.com/ChatonIsHere/TavernLib/releases/latest"
 PATCH_RELEASES_PAGE       = "https://github.com/ModdingTavern/TavernDefaults/releases/latest"
 
 
