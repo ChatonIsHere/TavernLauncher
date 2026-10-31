@@ -257,7 +257,9 @@ def _place_target(game_dir, base, target, staging, entry):
     """The one write path for a target folder: swaps the staged tree in, then
     writes the record (enabled) last, per the spec's one-version rule. What
     it replaces is moved aside first, so a folder a running game or server
-    holds open refuses the install before anything is lost."""
+    holds open refuses the install before anything is lost. Only the dot
+    target folders are replaced, so data a mod keeps beside them survives
+    (a pre-v2 layout's files go too)."""
     mod_id = base["id"]
     _displace_foreign(game_dir, mod_id)
     rec = _owned_mod_record(game_dir, mod_id)
@@ -271,9 +273,10 @@ def _place_target(game_dir, base, target, staging, entry):
     shutil.rmtree(aside, ignore_errors=True)
     os.makedirs(aside)
     wanted = {RECORD_NAME, DISABLED_RECORD_NAME} | {f".{t}" for t in keep}
+    legacy = rec is not None and _is_pre_v2(rec)
     moved = []
     try:
-        for name in sorted(set(os.listdir(mod_dir)) - wanted):
+        for name in sorted(n for n in set(os.listdir(mod_dir)) - wanted if legacy or n.startswith(".")):
             os.replace(os.path.join(mod_dir, name), os.path.join(aside, name))
             moved.append(name)
     except OSError as e:
