@@ -16,11 +16,11 @@ from tavern_shared.theme import SURF2, _btn
 
 
 def count_mods_needing_attention(game_dir, target):
-    """Outdated, damaged or replaced community mods; 0 on any failure.
-    Workers only."""
+    """Enabled community mods that are outdated, damaged or replaced; 0 on any
+    failure. Workers only."""
     try:
         installed = [r for r in list_installed_mods(game_dir)
-                     if record_matches_target(r, target)]
+                     if r.get("enabled") and record_matches_target(r, target)]
         if not installed:
             return 0
         index = fetch_indexes(list_repos(load_cfg()))

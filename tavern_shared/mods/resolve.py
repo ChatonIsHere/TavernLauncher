@@ -1,6 +1,7 @@
 """Dependency closure and manifest fetching."""
 from tavern_shared.mods import repos
 from tavern_shared.mods.base import ModManagerError, _parse_version, _warn
+from tavern_shared.mods.layout import _safe_basename
 from tavern_shared.mods.manifest import _manifest_from_dict
 from tavern_shared.mods.repos import _norm
 
@@ -38,6 +39,10 @@ def resolve_dependencies(roots, summary_index, repo_bases, target):
             _warn(f"{requirer} depends on '{dep_id}', which has been replaced by "
                   f"'{rep.by}'; using that instead.")
             dep_id, min_v = rep.by, f"{major}.0.0"
+        # After the swap, which can lead back up the chain.
+        if dep_id in chain:
+            raise ModManagerError(
+                f"Circular dependency: {' -> '.join(chain + [dep_id])}.")
         if dep_id in pruned:
             _warn(f"{requirer} depends on '{dep_id}', which has no {target} "
                   f"build; skipped.")
@@ -58,6 +63,17 @@ def resolve_dependencies(roots, summary_index, repo_bases, target):
                 f"(major {major}). These majors can't be satisfied together.")
 
         new_min = max(req_min.get(dep_id, mv), mv)
+        if dep_id in root_ids:
+            # A root is installed at the version asked for; it can't be swapped.
+            have = _parse_version(chosen[dep_id].version)
+            if have[0] != major or have < new_min:
+                raise ModManagerError(
+                    f"{requirer} needs '{dep_id}' >= {'.'.join(map(str, new_min))} "
+                    f"(major {major}), but {chosen[dep_id].version} is the version "
+                    f"being installed.")
+            req_major[dep_id], req_min[dep_id] = major, new_min
+            req_by.setdefault(dep_id, (requirer, min_v))
+            return
         summary = summ.get((dep_id, major))
         available = summary.versions if summary else []
         candidates = [v for v in available if _parse_version(v) >= new_min]
@@ -92,9 +108,6 @@ def resolve_dependencies(roots, summary_index, repo_bases, target):
                 f"{' -> '.join(chain)}. This is almost certainly a mistake in the "
                 f"mods' dependency data.")
         for dep_id, min_v in sorted((mod.dependencies or {}).items()):
-            if dep_id in chain:
-                raise ModManagerError(
-                    f"Circular dependency: {' -> '.join(chain + [dep_id])}.")
             add_requirement(dep_id, min_v, mod.name or mod.id, chain)
 
     for root in roots:
@@ -117,14 +130,16 @@ def _index_source(index, mod_id, repo_bases, version=None):
 def _fetch_manifest_leaf(repo_bases, mod_id, leaf, prefer_repo=None, what=None,
                          expect_version=None):
     """The first repo's manifests/<author>/<repo>/<leaf> that parses, trying
-    prefer_repo first. With expect_version, a manifest naming another id or
-    version fails that repo like a 404 (as in TavernLib), and successes are
-    memoized."""
+    prefer_repo first if it is one of repo_bases. A manifest naming another
+    id, or with expect_version another version, fails that repo like a 404,
+    as in TavernLib; per-version successes are memoized."""
     if "." not in mod_id:
         raise ModManagerError(
             f"Mod id {mod_id!r} isn't '<github-user>.<github-repo>'.")
-    author, repo = mod_id.split(".", 1)
-    order = list(dict.fromkeys(_norm(b) for b in ([prefer_repo] if prefer_repo else []) + repo_bases))
+    # Both halves become URL path segments, and the id can come from an unreviewed index.
+    author, repo = (_safe_basename(p) for p in mod_id.split(".", 1))
+    trusted = [_norm(b) for b in repo_bases]
+    order = list(dict.fromkeys(([_norm(prefer_repo)] if _norm(prefer_repo) in trusted else []) + trusted))
     last_err = None
     for base in order:
         key = (base, mod_id, expect_version)
@@ -139,12 +154,12 @@ def _fetch_manifest_leaf(repo_bases, mod_id, leaf, prefer_repo=None, what=None,
         m = _manifest_from_dict(data, base)
         if m is None:
             continue
+        if m.id != mod_id or expect_version not in (None, m.version):
+            last_err = ModManagerError(
+                f"{url} serves '{m.id}' {m.version}, not the requested "
+                f"'{mod_id}' {expect_version or '(latest)'}.")
+            continue
         if expect_version is not None:
-            if (m.id, m.version) != (mod_id, expect_version):
-                last_err = ModManagerError(
-                    f"{url} serves '{m.id}' {m.version}, not the requested "
-                    f"'{mod_id}' {expect_version}.")
-                continue
             _manifest_memo[key] = m
         return m
     raise ModManagerError(
