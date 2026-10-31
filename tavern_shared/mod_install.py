@@ -25,7 +25,7 @@ MELONLOADER_ZIP_URLS = {
 }
 
 
-TAVERNLIB_DOWNLOAD_URL = "https://github.com/ModdingTavern/TavernLib/releases/latest/download/TavernLib.dll"
+TAVERNLIB_DOWNLOAD_URL = "https://github.com/ChatonIsHere/TavernLib/releases/latest/download/TavernLib.dll"
 
 
 TAVERNLIB_FILENAME = "TavernLib.dll"
