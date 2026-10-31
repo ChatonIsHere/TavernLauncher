@@ -34,7 +34,7 @@ If your machine reported success but you still end up in the main menu, it's a g
 - Rename it to `Root.Township.dll`, and copy the file
 - Navigate to `C:\Games\Alta\A Township Tale\A Township Tale_Data\Managed` (or wherever you have it installed, same subdirectory)
 - Paste the file in this directory and replace the existing one
-- Grab the `TavernLib.dll` file from inside the "Patch" folder you downloaded (or grab the most recent version from <https://github.com/ModdingTavern/TavernLib/releases>)
+- Grab the `TavernLib.dll` file from inside the "Patch" folder you downloaded (or grab the most recent version from <https://github.com/ChatonIsHere/TavernLib/releases>)
 - Navigate to `C:\Games\Alta\A Township Tale\Plugins` (if the folder doesn't exist, make it)
 - Paste `TavernLib.dll` here
 - Grab the `MelonLoader.x64.zip` archive from the "Patch" folder you downloaded (or get the latest official version at <https://github.com/LavaGang/MelonLoader/releases>)
