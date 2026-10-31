@@ -34,7 +34,9 @@ lists, verifies, exports and claims only its own target.
   copy (`cache_restore_mod`) both end there, so the spec's version rule is
   applied once. It moves what it replaces aside before swapping in, so a
   folder a running game or server holds open refuses the install with nothing
-  lost, rather than leaving a record that no longer matches the disk.
+  lost, rather than leaving a record that no longer matches the disk. It
+  replaces only the dot target folders, so data a mod keeps beside them
+  (TavernEssentials' config and key) survives an update.
 - **Record bytes** come from `install._sidecar_bytes`, never a text-mode
   write. `tests/test_v2_golden.py` holds them to records generated from the
   spec alone.

@@ -64,6 +64,25 @@ class Placement(_TempDataDirFixture, unittest.TestCase):
         for target in ("client_windows", "server"):
             self.assertIs(mm.verify_mod_files(self.game, "lock.m", target), True)
 
+    def test_data_a_mod_keeps_beside_its_build_survives_an_update(self):
+        self._install("data.m")
+        kept = os.path.join(self.game, "Mods", "data.m", "UserData", "key.xml")
+        os.makedirs(os.path.dirname(kept))
+        open(kept, "wb").close()
+        self._publish("data.m", "2.0.0")
+        self._closure("data.m", "2.0.0")
+        self.assertEqual(self._record("data.m")["version"], "2.0.0")
+        self.assertTrue(os.path.isfile(kept))
+
+    def test_a_pre_v2_layouts_files_are_replaced(self):
+        write_record(self.game, "old.m", installed=None)
+        loose = os.path.join(self.game, "Mods", "old.m", "Old.dll")
+        open(loose, "wb").close()
+        self._install("old.m")
+        self.assertFalse(os.path.exists(loose))
+        self.assertEqual(sorted(os.listdir(os.path.join(self.game, "Mods", "old.m"))),
+                         [".client_windows", "manifest.json"])
+
     def test_a_copied_folder_is_untracked(self):
         self._install("a.m")
         shutil.copytree(os.path.join(self.game, "Mods", "a.m"),
