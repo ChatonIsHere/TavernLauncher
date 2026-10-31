@@ -649,6 +649,9 @@ def _read_mod_record(game_dir, mod_id):
     return None
 
 
+_warned_unusable = set()     # once per folder, as TavernLib's ModRecord warns
+
+
 def _folder_record(folder, warn=False):
     """(record, enabled) if the folder is ours, else None: the spec's
     ownership predicate, twin of TavernLib's ModRecord.ReadOwned. The id must
@@ -664,7 +667,8 @@ def _folder_record(folder, warn=False):
     try:
         parity_required(rec)
     except ModManagerError as e:
-        if warn:
+        if warn and folder not in _warned_unusable:
+            _warned_unusable.add(folder)
             _warn(f"installed mod {rec['id']} has an unusable record ({e}), "
                   f"so it is being ignored; reinstall it to fix.")
         return None
