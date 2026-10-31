@@ -44,9 +44,9 @@ def add_pin(cfg, entry):
         raise ModManagerError(
             f"'{entry}' isn't a valid mod id. Ids look like Author.ModId, "
             f"optionally with an exact version: Author.ModId@1.2.0.")
-    if version is not None:
+    if version is not None or entry.endswith("@"):
         try:
-            _parse_version(version)
+            _parse_version(version or "")
         except ModManagerError as e:
             raise ModManagerError(
                 f"'{entry}' doesn't pin a usable version: {e} Leave the "
