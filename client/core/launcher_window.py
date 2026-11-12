@@ -34,7 +34,7 @@ except ImportError:
     pass
 from tavern_shared.log_tailer import GameLogTailer
 from tavern_shared.mod_install import _melonloader_installed, _tavernlib_installed
-from tavern_shared.paths import _delete_last_rejection_file, _last_rejection_path
+from tavern_shared.paths import _delete_last_rejection_file, _last_rejection_path, _record_launcher_path
 from tavern_shared.game_guard import any_game_running, confirm_while_game_running
 from tavern_shared import mods
 from tavern_shared.bg import run_bg
@@ -113,6 +113,8 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         _finish_dark_window(self)
         attach_help_tab(self)
         run_app_ready(self, self._print)
+        _record_launcher_path()
+        self._check_rejection(None, None, startup=True)
 
     def deiconify(self):
         self._screen_fit.fit_once()
@@ -1377,18 +1379,26 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         TavernLib writes when a server denies the join over mods. The launch
         deleted any stale copy, so one present now is this attempt's."""
         proc.wait()
+        self._check_rejection(host, relaunch)
+
+    def _check_rejection(self, host, relaunch, startup=False):
+        """At startup, only a recent one the game handed over (rejoin) counts:
+        TavernLib started this launcher for it."""
         path = _last_rejection_path()
-        if not os.path.isfile(path):
-            return
         try:
+            if startup and time.time() - os.path.getmtime(path) > 600:
+                return
             with open(path, "r", encoding="utf-8") as f:
                 payload = json.load(f)
+        except FileNotFoundError:
+            return
         except Exception as e:
             self._print(f"Could not read the rejection file: {e}", "warn")
             return
-        finally:
-            try: os.remove(path)
-            except OSError: pass
+        if startup and payload.get("rejoin") is not True:
+            return
+        try: os.remove(path)
+        except OSError: pass
 
         if payload.get("schema") != 1:
             return
@@ -1416,7 +1426,8 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         missing = payload.get("missing") or []
         names = "\n".join(f"  • {m['id']} {m['version']}" for m in missing)
         server = payload.get("server_name") or "That server"
-        if not messagebox.askyesno("Mods needed to rejoin",
+        # rejoin: the player already said yes in the game.
+        if payload.get("rejoin") is not True and not messagebox.askyesno("Mods needed to rejoin",
                 f"{server} rejected the join because these mods didn't "
                 f"match:\n\n{names}\n\nInstall the exact versions it needs "
                 f"and try rejoining?", parent=self):
