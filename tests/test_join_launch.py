@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import client.core.launcher_window as lw
 from tavern_shared.mods.install import has_target
 from tavern_shared.mods.manifest import parity_required, scene_from_arg
-from tests._tk_fakes import FakeVar, FakeWidget, InlineThread, NoThread
+from tests._tk_fakes import FakeVar, FakeWidget, InlineThread, NoThread, inline_run_bg
 
 
 class FakeProc:
@@ -210,7 +210,7 @@ class RejectionWatch(unittest.TestCase):
             offered=[], launched=[])
         ns._offer_rejection_recovery = lambda p, relaunch: ns.offered.append(relaunch)
         ns._do_launch = lambda password=None: ns.launched.append((ns.v_ip.get(), ns.v_port.get()))
-        bind(ns, "_watch_for_rejection", "_rejoin")
+        bind(ns, "_watch_for_rejection", "_check_rejection", "_rejoin")
         proc = types.SimpleNamespace(wait=lambda: 0)
         with mock.patch.object(lw, "_last_rejection_path", lambda: path):
             ns._watch_for_rejection(proc, host, relaunch)
@@ -246,6 +246,69 @@ class RejectionWatch(unittest.TestCase):
 
     def test_no_file_offers_nothing(self):
         self.assertEqual(self._watch(None, None, None).offered, [])
+
+
+class RejectionAtStartup(unittest.TestCase):
+    """TavernLib starts the launcher when it isn't watching the game."""
+
+    def _start(self, payload, age=0):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "last_rejection.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        if age:
+            old = os.path.getmtime(path) - age
+            os.utime(path, (old, old))
+        ns = types.SimpleNamespace(after=lambda ms, fn: fn(), _print=lambda msg, tag="": None, offered=[])
+        ns._offer_rejection_recovery = lambda p, relaunch: ns.offered.append(p)
+        bind(ns, "_check_rejection", "_rejoin")
+        with mock.patch.object(lw, "_last_rejection_path", lambda: path):
+            ns._check_rejection(None, None, startup=True)
+        return ns, os.path.exists(path)
+
+    def test_a_handed_over_rejection_is_recovered(self):
+        ns, left = self._start({**RejectionWatch._payload("5.6.7.8"), "rejoin": True})
+        self.assertEqual(len(ns.offered), 1)
+        self.assertFalse(left)
+
+    def test_one_the_player_didnt_hand_over_is_left_alone(self):
+        ns, left = self._start(RejectionWatch._payload("5.6.7.8"))
+        self.assertEqual(ns.offered, [])
+        self.assertTrue(left)
+
+    def test_an_old_one_is_left_alone(self):
+        ns, _ = self._start({**RejectionWatch._payload("5.6.7.8"), "rejoin": True}, age=3600)
+        self.assertEqual(ns.offered, [])
+
+
+class RecoveryQuestion(unittest.TestCase):
+
+    def _recover(self, payload, answer):
+        rejoined, asked = [], []
+        ns = types.SimpleNamespace(
+            v_exe=FakeVar(r"C:\game\A Township Tale.exe"), _action_btn=FakeWidget(),
+            _print=lambda msg, tag="": None, _game_is_running=lambda: False)
+        bind(ns, "_offer_rejection_recovery", "_recovery_done", "_recovery_failed")
+        fake_mods = types.SimpleNamespace(
+            list_repos=lambda cfg: [], fetch_indexes=lambda bases: [],
+            resolve_missing_mods=lambda missing, index, bases: ([], []),
+            install_mod_set=lambda game, mods, target, progress: None)
+        with mock.patch.object(lw.messagebox, "askyesno", lambda *a, **k: asked.append(a) or answer), \
+             mock.patch.object(lw, "confirm_while_game_running", lambda *a: True), \
+             mock.patch.object(lw, "run_bg", inline_run_bg), \
+             mock.patch.object(lw, "load_cfg", lambda: {}), \
+             mock.patch.object(lw, "mods", fake_mods):
+            ns._offer_rejection_recovery(payload, lambda: rejoined.append(True))
+        return asked, rejoined
+
+    def test_the_player_is_asked(self):
+        asked, rejoined = self._recover(RejectionWatch._payload("5.6.7.8"), False)
+        self.assertEqual((len(asked), rejoined), (1, []))
+
+    def test_not_again_once_they_chose_in_the_game(self):
+        asked, rejoined = self._recover({**RejectionWatch._payload("5.6.7.8"), "rejoin": True}, False)
+        self.assertEqual((asked, rejoined), ([], [True]))
 
 
 class TavernEssentialsDetection(unittest.TestCase):
