@@ -51,12 +51,13 @@ class SceneReachesTheLaunchArgs(unittest.TestCase):
             _print=lambda msg, tag="": None,
             _show_token_button=lambda: None,
             _popen_console_kwargs=lambda: {},
+            _watch_for_rejection=lambda proc, host, relaunch: None,
             # Mod reconciliation is its own flow; here it just lets the
             # launch go ahead, the way it does when there's nothing to sync.
             _reconcile_mods=lambda host, exe, go, scene=None: (
                 self.planned_scene.append(scene), go(None)),
         )
-        bind(ns, "_do_launch", "_launch_game", "_mods_claim", "_take_host")
+        bind(ns, "_do_launch", "_launch_game", "_mods_claim", "_take_host", "spawn_game")
         self.ns = ns
         fake_mods = types.SimpleNamespace(
             list_installed_mods=lambda game_dir: [],
@@ -142,7 +143,7 @@ class MainMenuLaunch(unittest.TestCase):
             v_platform=FakeVar("fly"), v_debug_helper=FakeVar(False), _game_procs=[],
             _save=lambda: None, _print=lambda msg, tag="": printed.append((msg, tag)),
             _popen_console_kwargs=lambda: {})
-        bind(ns, "_do_launch_menu", "_mods_claim")
+        bind(ns, "_do_launch_menu", "_mods_claim", "spawn_game")
         pc = {"installed": {"client_windows": {}}}
         fake_mods = types.SimpleNamespace(
             has_target=has_target,
