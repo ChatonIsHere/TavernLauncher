@@ -5,6 +5,7 @@ Pinned here: the scene the server asks for during auth reaches the game's
 launch args, and a required mod with no version fails parity, as in TavernLib's
 ModParity.CheckJoin. The methods under test are bound onto a plain namespace.
 """
+import json
 import os
 import shutil
 import sys
@@ -17,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import client.core.launcher_window as lw
 from tavern_shared.mods.install import has_target
 from tavern_shared.mods.manifest import parity_required, scene_from_arg
-from tests._tk_fakes import FakeVar, FakeWidget, NoThread
+from tests._tk_fakes import FakeVar, FakeWidget, InlineThread, NoThread
 
 
 class FakeProc:
@@ -142,7 +143,8 @@ class MainMenuLaunch(unittest.TestCase):
             v_exe=FakeVar(r"C:\game\A Township Tale.exe"), v_username=FakeVar("Tester"),
             v_platform=FakeVar("fly"), v_debug_helper=FakeVar(False), _game_procs=[],
             _save=lambda: None, _print=lambda msg, tag="": printed.append((msg, tag)),
-            _popen_console_kwargs=lambda: {})
+            _popen_console_kwargs=lambda: {}, watched=[])
+        ns._watch_for_rejection = lambda proc, host, relaunch: ns.watched.append((host, relaunch))
         bind(ns, "_do_launch_menu", "_mods_claim", "spawn_game")
         pc = {"installed": {"client_windows": {}}}
         fake_mods = types.SimpleNamespace(
@@ -164,6 +166,8 @@ class MainMenuLaunch(unittest.TestCase):
              mock.patch.object(lw, "mods", fake_mods), \
              mock.patch.object(lw, "build_tokens",
                                lambda uid, name, token="", claim="": claims.append(claim) or ("a", "r", "i")), \
+             mock.patch.object(lw, "_delete_last_rejection_file", lambda: None), \
+             mock.patch.object(lw, "threading", types.SimpleNamespace(Thread=InlineThread)), \
              mock.patch.object(lw.subprocess, "Popen", popen):
             ns._do_launch_menu()
         return ns, launched, printed, claims
@@ -183,6 +187,65 @@ class MainMenuLaunch(unittest.TestCase):
         """Enabled mods installed for client_windows, and nothing else."""
         _, _, _, claims = self._launch()
         self.assertEqual(claims, ['{"a.mod": "1.2.3"}'])
+
+    def test_it_is_watched_for_a_mods_rejection_with_no_server_of_its_own(self):
+        """A join from the menu (TavernEssentials' board) can be refused over mods."""
+        ns, _, _, _ = self._launch()
+        self.assertEqual(ns.watched, [(None, None)])
+
+
+class RejectionWatch(unittest.TestCase):
+    """What the launcher does with last_rejection.json once the game exits."""
+
+    def _watch(self, payload, host, relaunch):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "last_rejection.json")
+        if payload is not None:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+        ns = types.SimpleNamespace(
+            v_ip=FakeVar("1.2.3.4"), v_port=FakeVar("1757"), _save=lambda: None,
+            _print=lambda msg, tag="": None, after=lambda ms, fn: fn(),
+            offered=[], launched=[])
+        ns._offer_rejection_recovery = lambda p, relaunch: ns.offered.append(relaunch)
+        ns._do_launch = lambda password=None: ns.launched.append((ns.v_ip.get(), ns.v_port.get()))
+        bind(ns, "_watch_for_rejection", "_rejoin")
+        proc = types.SimpleNamespace(wait=lambda: 0)
+        with mock.patch.object(lw, "_last_rejection_path", lambda: path):
+            ns._watch_for_rejection(proc, host, relaunch)
+        self.assertFalse(os.path.exists(path), "the rejection file is consumed")
+        return ns
+
+    @staticmethod
+    def _payload(host):
+        return {"schema": 1, "server": {"host": host, "game_port": 1800},
+                "server_name": "Board Server", "missing": [{"id": "a.mod", "version": "1.0.0"}]}
+
+    def test_the_launched_server_rejoins_as_it_was_launched(self):
+        relaunch = lambda: None
+        ns = self._watch(self._payload("1.2.3.4"), "1.2.3.4", relaunch)
+        self.assertEqual(ns.offered, [relaunch])
+
+    def test_another_server_is_recovered_for_and_joined(self):
+        """Refused on a join made inside the game, after a join to another server."""
+        ns = self._watch(self._payload("5.6.7.8"), "1.2.3.4", lambda: None)
+        self.assertEqual(len(ns.offered), 1)
+        ns.offered[0]()
+        self.assertEqual(ns.launched, [("5.6.7.8", "1800")])
+
+    def test_a_menu_launch_joins_the_server_that_refused(self):
+        ns = self._watch(self._payload("5.6.7.8"), None, None)
+        ns.offered[0]()
+        self.assertEqual(ns.launched, [("5.6.7.8", "1800")])
+
+    def test_a_menu_launch_with_no_server_recorded_offers_nothing(self):
+        payload = self._payload("5.6.7.8")
+        del payload["server"]
+        self.assertEqual(self._watch(payload, None, None).offered, [])
+
+    def test_no_file_offers_nothing(self):
+        self.assertEqual(self._watch(None, None, None).offered, [])
 
 
 class TavernEssentialsDetection(unittest.TestCase):
