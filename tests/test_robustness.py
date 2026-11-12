@@ -476,3 +476,21 @@ class WarningLog(unittest.TestCase):
             base._warn("hello")
         with open(os.path.join(data, "modmanager.log"), encoding="utf-8") as f:
             self.assertEqual(f.read(), "[modmanager] hello\n")
+
+
+class LauncherPath(unittest.TestCase):
+    """Where TavernLib finds the launcher to start it."""
+
+    def _record(self, frozen):
+        data = temp_dir(self)
+        stub(self, paths, "_tavern_data_dir", lambda: data)
+        with mock.patch.object(paths.sys, "frozen", frozen, create=True):
+            paths._record_launcher_path()
+        path = os.path.join(data, "launcher_path.txt")
+        return open(path, encoding="utf-8").read() if os.path.exists(path) else None
+
+    def test_a_built_launcher_records_its_exe(self):
+        self.assertEqual(self._record(True), sys.executable)
+
+    def test_running_from_source_records_nothing(self):
+        self.assertIsNone(self._record(False))
