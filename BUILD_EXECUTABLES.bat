@@ -57,10 +57,10 @@ echo  Refreshing bundled Setup payloads in Patch\...
 python dependencies\refresh_bundled_payloads.py
 
 echo.
-echo  Installing PyInstaller and Pillow...
-pip install pyinstaller pillow markdown tkinterweb -q
+echo  Installing PyInstaller, Pillow and the console client...
+pip install pyinstaller pillow markdown tkinterweb websocket-client -q
 if errorlevel 1 (
-    echo  [ERROR] Failed to install PyInstaller/Pillow.
+    echo  [ERROR] Failed to install the build packages.
     pause
     exit /b 1
 )
