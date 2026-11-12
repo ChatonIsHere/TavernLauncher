@@ -41,6 +41,17 @@ def _delete_last_rejection_file():
     except OSError: pass
 
 
+def _record_launcher_path():
+    """TavernDirectories.LauncherPath: TavernLib starts the launcher from it."""
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        with open(os.path.join(_tavern_data_dir(), "launcher_path.txt"), "w", encoding="utf-8") as f:
+            f.write(sys.executable)
+    except OSError:
+        pass
+
+
 def _sha256_file(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
