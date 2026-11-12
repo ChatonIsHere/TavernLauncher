@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import types
 
 HARNESS = sys.argv[1]
 LAUNCHER = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -29,6 +30,7 @@ FIXTURES = os.path.join(LAUNCHER, "tests", "fixtures", "v2")
 sys.path.insert(0, LAUNCHER)
 from tavern_shared.mods import install, modlist, plan, repos  # noqa: E402
 from conftest import install_mod_closure  # noqa: E402
+from client.core.launcher_window import ClientLauncher  # noqa: E402
 
 class _Quiet(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *_a):
@@ -130,6 +132,12 @@ for order in ("python-first", "csharp-first"):
             check(install.verify_mod_files(game, mod_id, t) is True, f"{order}: {mod_id} {t} verifies (Python)")
         check(not any(f.endswith(".dll") for f in os.listdir(os.path.join(game, "Mods", mod_id))),
               f"{order}: nothing loadable at {mod_id}/ root")
+
+    # The claim an in-game join mints (TavernEssentials' board) is the one the launcher sends.
+    cs_claim = harness("claim", game).strip().splitlines()[-1]
+    py_claim = ClientLauncher._mods_claim(types.SimpleNamespace(_print=print), game)
+    check(json.loads(cs_claim) == json.loads(py_claim), f"{order}: C# client claim matches the launcher's")
+    check(admitted(game, cs_claim), f"{order}: the C# claim passes the join gate")
 
     # Server handshake: both implementations, same folder.
     py_hash, py_count, py_mods, py_untracked = install.handshake_snapshot(game, target="server")
