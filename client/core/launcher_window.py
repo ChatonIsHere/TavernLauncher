@@ -1394,17 +1394,30 @@ class ClientLauncher(LauncherCommon, tk.Tk):
             return
         server = payload.get("server") or {}
         if server.get("host") and server.get("host") != host:
+            # Refused on a join made inside the game (TavernEssentials'
+            # board): recover for that server and join it instead.
+            relaunch = lambda: self._rejoin(server["host"], server.get("game_port"))
+        elif relaunch is None:
             return
         missing = payload.get("missing") or []
         if not missing:
             return
         self.after(0, lambda: self._offer_rejection_recovery(payload, relaunch))
 
+    def _rejoin(self, host, port):
+        """Joins host:port as if picked from a server list."""
+        self.v_ip.set(host)
+        if port:
+            self.v_port.set(str(port))
+        self._save()
+        self._do_launch(password=None)
+
     def _offer_rejection_recovery(self, payload, relaunch):
         missing = payload.get("missing") or []
         names = "\n".join(f"  • {m['id']} {m['version']}" for m in missing)
+        server = payload.get("server_name") or "That server"
         if not messagebox.askyesno("Mods needed to rejoin",
-                f"That server rejected the join because these mods didn't "
+                f"{server} rejected the join because these mods didn't "
                 f"match:\n\n{names}\n\nInstall the exact versions it needs "
                 f"and try rejoining?", parent=self):
             return
@@ -1530,8 +1543,13 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         if self.v_debug_helper.get():
             args.append("/debug_helper")
 
+        _delete_last_rejection_file()
         self._print(f"Launching main menu on {platform or 'default'}...", "warn")
-        self.spawn_game("menu", args, label="Main menu", what="Menu")
+        proc = self.spawn_game("menu", args, label="Main menu", what="Menu")
+        if proc:
+            # A join from the menu (TavernEssentials' board) can be refused over mods.
+            threading.Thread(target=self._watch_for_rejection,
+                             args=(proc, None, None), daemon=True).start()
 
     def spawn_game(self, kind, argv, host=None, port=None, label=None, what="Game"):
         """Starts the game from argv (argv[0] is the exe) and returns the
