@@ -682,10 +682,14 @@ class ServerLauncher(LauncherCommon, tk.Tk):
         self._save()
         access, refresh, identity = build_server_tokens()
         console_token = build_console_token()
-        try:
-            with open(CONSOLE_TOKEN_FILE,"w") as f:
-                f.write(console_token)
-        except: pass
+        if console_token is None:
+            self._print("console_tokens.json can't be read, so console_token.txt was left as it was. "
+                        "The server refuses every console token until it reads.", "err")
+        else:
+            try:
+                with open(CONSOLE_TOKEN_FILE,"w") as f:
+                    f.write(console_token)
+            except: pass
         self._served_game_dir = os.path.dirname(exe)
         if not self._auth_on:
             start_auth_service(self._print, lambda: self._served_game_dir)
