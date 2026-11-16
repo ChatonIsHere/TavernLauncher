@@ -1,5 +1,6 @@
 """The Mod Manager window and the Get Mods, Mod Sources and Change
 Version windows it opens, shared by both launchers."""
+import io
 import json
 import os
 import tkinter as tk
@@ -15,7 +16,7 @@ from tavern_shared.theme import (
 from tavern_shared.window_chrome import _enable_dark_titlebar
 
 from tavern_shared.mods.base import ModManagerError, _parse_version, load_cfg
-from tavern_shared.mods.cache import clear_mod_cache, ensure_mod_libraries
+from tavern_shared.mods.cache import cached_icon, clear_mod_cache, ensure_mod_libraries
 from tavern_shared.mods.install import (
     _highest_by_id, _is_pre_v2, _verify_memo, disable_mod, disable_untracked_dll, enable_mod,
     enable_untracked_dll, has_target, install_dependencies, install_mod_set, installed_targets,
@@ -31,6 +32,11 @@ from tavern_shared.mods.repos import (
     _is_default, _source_display, add_repo, fetch_indexes, is_own_mod, list_repos, remove_repo,
 )
 from tavern_shared.mods.resolve import _fetch_manifest, resolve_mod_by_id
+
+try:    # icons need Pillow; without it rows just have none
+    from PIL import Image as _PILImage, ImageTk as _PILImageTk
+except Exception:
+    _PILImage = None
 
 
 def record_matches_target(rec, target):
@@ -49,6 +55,14 @@ def target_label(targets):
     if not names:
         return "-"
     return names[0] + " only" if len(names) == 1 else " + ".join(names)
+
+
+def icon_url(icons, px):
+    """The smallest of {size: url} at least px across, else the largest; None for none."""
+    if not icons:
+        return None
+    fits = [size for size in icons if size >= px]
+    return icons[min(fits) if fits else max(icons)]
 
 
 def source_label(source_repo):
@@ -89,11 +103,43 @@ class ModListWindow(_Dialog):
         self._installed_recs = []   # install records, enabled or not
         self._rows = {}
         self._busy = False
+        self._icon_photos = {}      # url -> PhotoImage, kept so Tk doesn't drop it
         super().__init__(parent, title, size, minsize)
         self._load(force=False)
 
     def _busy_changed(self):
         pass
+
+    def _load_icons(self, wanted, px, show):
+        """show(key, photo) for each {key: url}, from memory or fetched in the background."""
+        if _PILImage is None:
+            return
+        todo = {}
+        for key, url in wanted.items():
+            if url in self._icon_photos:
+                show(key, self._icon_photos[url])
+            elif url:
+                todo[key] = url
+        def fetch():
+            for key, url in todo.items():
+                try:
+                    post(self, self._icon_ready, key, url, cached_icon(url), px, show)
+                except Exception:
+                    pass    # a missing icon is just a blank
+        if todo:
+            run_bg(self, fetch)
+
+    def _icon_ready(self, key, url, data, px, show):
+        if url not in self._icon_photos:
+            try:
+                img = _PILImage.open(io.BytesIO(data), formats=["PNG"])
+                if max(img.size) > 1024:
+                    return
+                img = img.convert("RGBA").resize((px, px), _PILImage.LANCZOS)
+            except Exception:
+                return
+            self._icon_photos[url] = _PILImageTk.PhotoImage(img, master=self)
+        show(key, self._icon_photos[url])
 
     def _set_busy(self, busy, msg=""):
         self._busy = busy
@@ -328,7 +374,8 @@ class CommunityModsWindow(ModListWindow):
     """Browse the merged index and install from it, as cards with a search box."""
 
     _COL_LABELS = ("Status", "Author", "Mod", "Installed", "Latest", "Source")
-    _WIDTHS     = (86,       100,      208,   66,          60,       116)
+    _WIDTHS     = (86,       100,      170,   66,          60,       116)
+    _ICON = 36      # px; the icon column is this plus its padding
     _STATE_STYLE = {    # state -> (status, its colour, button)
         "missing":  ("Available",    PARCH, "Install"),
         "damaged":  ("Damaged",      RED,   "Reinstall"),
@@ -373,6 +420,7 @@ class CommunityModsWindow(ModListWindow):
 
         header = tk.Frame(list_wrap, bg=SURF)
         header.pack(fill="x")
+        tk.Frame(header, bg=SURF, width=self._ICON + 10, height=24).pack(side="left")
         for text, width in zip(self._COL_LABELS, self._WIDTHS):
             cell = tk.Frame(header, bg=SURF, width=width, height=24)
             cell.pack(side="left", fill="y"); cell.pack_propagate(False)
@@ -424,6 +472,13 @@ class CommunityModsWindow(ModListWindow):
         self._apply_filter()
         self._set_busy(False, "")
         self._refresh_states()
+        self._load_icons({i: icon_url(r["summary"].icons, self._ICON) for i, r in self._rows.items()},
+                         self._ICON, self._show_card_icon)
+
+    def _show_card_icon(self, mod_id, photo):
+        w = self._card_widgets.get(mod_id)
+        if w:
+            w["icon"].config(image=photo)
 
     def _installed_versions(self, installed):
         return {m["id"]: m.get("version", "?") for m in installed
@@ -463,8 +518,15 @@ class CommunityModsWindow(ModListWindow):
         s = r["summary"]
         card = tk.Frame(self._cards_frame, bg=SURF,
                         highlightbackground=BORDER, highlightthickness=1)
+        icon_box = tk.Frame(card, bg=SURF, width=self._ICON, height=self._ICON)
+        icon_box.pack(side="left", anchor="n", padx=(8,2), pady=8)
+        icon_box.pack_propagate(False)
+        icon = tk.Label(icon_box, bg=SURF, bd=0)
+        icon.pack(fill="both", expand=True)
+        body = tk.Frame(card, bg=SURF)
+        body.pack(side="left", fill="both", expand=True)
 
-        top = tk.Frame(card, bg=SURF)
+        top = tk.Frame(body, bg=SURF)
         top.pack(fill="x", pady=(8,0))
         cells = []
         for width in self._WIDTHS:
@@ -490,7 +552,7 @@ class CommunityModsWindow(ModListWindow):
                    style="primary", font=("Segoe UI",9), pady=4, padx=10, width=11)
         btn.pack(side="right", padx=(6,10))
 
-        desc_row = tk.Frame(card, bg=SURF)
+        desc_row = tk.Frame(body, bg=SURF)
         desc_row.pack(fill="x", padx=10, pady=(4,8))
         toggle = tk.Button(desc_row, text="Details ▸", bg=SURF, fg=MUTED,
                            activebackground=SURF, activeforeground=AMBER,
@@ -498,11 +560,11 @@ class CommunityModsWindow(ModListWindow):
                            command=lambda: self._toggle_details(mod_id))
         toggle.pack(side="right", anchor="n")
         tk.Label(desc_row, text=r["description"] or "No description provided.",
-                 bg=SURF, fg=PARCH, font=("Segoe UI",8), wraplength=680,
+                 bg=SURF, fg=PARCH, font=("Segoe UI",8), wraplength=640,
                  justify="left", anchor="w"
         ).pack(side="left", fill="x", expand=True)
 
-        needs_row = tk.Frame(card, bg=SURF)
+        needs_row = tk.Frame(body, bg=SURF)
         needs_var = tk.StringVar()
         tk.Label(needs_row, textvariable=needs_var, bg=SURF, fg=AMBER, font=("Segoe UI",8),
                  wraplength=600, justify="left", anchor="w"
@@ -511,7 +573,7 @@ class CommunityModsWindow(ModListWindow):
                         font=("Segoe UI",8), pady=2, padx=8)
         deps_btn.pack(side="right")
 
-        details = tk.Frame(card, bg=SURF)
+        details = tk.Frame(body, bg=SURF)
         parity_text = "Exact version required" if s.parity_required else "Any compatible version"
         tag_text = f"{target_label(s.targets)}  ·  {parity_text}"
         if s.scenes:
@@ -523,11 +585,11 @@ class CommunityModsWindow(ModListWindow):
 
         requires_var = tk.StringVar(value="Loading dependencies…")
         tk.Label(details, textvariable=requires_var, bg=SURF, fg=PARCH,
-                 font=("Segoe UI",8,"italic"), wraplength=760, justify="left", anchor="w"
+                 font=("Segoe UI",8,"italic"), wraplength=720, justify="left", anchor="w"
         ).pack(fill="x")
 
         self._card_widgets[mod_id] = {
-            "card": card, "status_lbl": status_lbl, "installed_var": installed_var,
+            "card": card, "icon": icon, "status_lbl": status_lbl, "installed_var": installed_var,
             "btn": btn, "requires_var": requires_var,
             "desc_row": desc_row, "details": details, "toggle": toggle, "expanded": False,
             "needs_row": needs_row, "needs_var": needs_var, "deps_btn": deps_btn,
@@ -773,7 +835,7 @@ class ModManagerWindow(ModListWindow):
 
         table_wrap = tk.Frame(self, bg=BG)
         table_wrap.pack(fill="both", expand=True, padx=16)
-        self._tree = _mk_tree(table_wrap, self._COLS, self._WIDTHS, height=10)
+        self._tree = _mk_tree(table_wrap, self._COLS, self._WIDTHS, height=10, icon_width=30)
         for tag, color in (("missing", PARCH), ("damaged", RED), ("current", GREEN),
                            ("outdated", AMBER), ("unknown", MUTED), ("needs", AMBER),
                            ("replaced", AMBER),
@@ -880,6 +942,12 @@ class ModManagerWindow(ModListWindow):
         if keep and self._tree.exists(keep):
             self._tree.selection_set(keep)
         self._sync_buttons()
+        self._load_icons({i: icon_url(r["summary"].icons, 20) for i, r in self._rows.items() if r["summary"]},
+                         20, self._show_row_icon)
+
+    def _show_row_icon(self, row_id, photo):
+        if self._tree.exists(row_id):
+            self._tree.item(row_id, image=photo)
 
     def _row_tag(self, r):
         if r.get("enabled") is False:

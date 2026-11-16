@@ -2,10 +2,13 @@
 download: mod_cache/<id>/<version>/<artifact sha256>/ holds one target's tree
 and the record that placed it (cut to that target); _libraries/<filename>/<sha256>/
 holds a library and its sidecar."""
+import hashlib
 import json
 import os
 import shutil
+import threading
 import time
+import urllib.request
 
 from tavern_shared import paths
 from tavern_shared.paths import _sha256_file
@@ -107,6 +110,31 @@ def cache_store_library(game_dir, filename):
     shutil.copy2(src, os.path.join(staging, filename))
     shutil.copy2(sidecar, os.path.join(staging, f"{filename}.meta.json"))
     os.replace(staging, dest)
+
+
+_ICON_MAX_BYTES = 1024 * 1024      # TavernMods' limit
+
+
+def cached_icon(url):
+    """A mod icon's PNG bytes, downloaded once: an icon URL is pinned to a
+    commit or release, so a cached copy never goes stale."""
+    path = os.path.join(_cache_base(), "_icons", hashlib.sha256(url.encode("utf-8")).hexdigest() + ".png")
+    if os.path.isfile(path):
+        with open(path, "rb") as f:
+            return f.read()
+    if not url.startswith("https://"):
+        raise ModManagerError(f"refusing to fetch icon {url!r}")
+    req = urllib.request.Request(url, headers={"User-Agent": "TavernLauncher/1.0"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = resp.read(_ICON_MAX_BYTES + 1)
+    if len(data) > _ICON_MAX_BYTES or not data.startswith(b"\x89PNG"):
+        raise ModManagerError(f"{url} isn't a PNG of at most 1 MB")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{threading.get_ident()}.tmp"     # two windows can fetch at once
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+    return data
 
 
 def clear_mod_cache():

@@ -170,7 +170,8 @@ def _mk_scrollbar(parent, command, orient="vertical"):
     return sb
 
 
-def _mk_tree(parent, cols, widths, height=8, hscroll=False):
+def _mk_tree(parent, cols, widths, height=8, hscroll=False, icon_width=0):
+    """icon_width > 0 adds a first column that shows each row's image."""
     style = ttk.Style()
     style.configure("Tav.Treeview", background=SURF, fieldbackground=SURF,
                     foreground=PARCH, rowheight=26, borderwidth=0)
@@ -193,8 +194,10 @@ def _mk_tree(parent, cols, widths, height=8, hscroll=False):
     body = tk.Frame(f, bg=SURF)
     body.pack(fill="both", expand=True, padx=2, pady=2)
 
-    tree = ttk.Treeview(body, columns=cols, show="headings",
+    tree = ttk.Treeview(body, columns=cols, show="tree headings" if icon_width else "headings",
                         selectmode="browse", height=height, style="Tav.Treeview")
+    if icon_width:
+        tree.column("#0", width=icon_width, minwidth=icon_width, stretch=False, anchor="center")
     for col, w in zip(cols, widths):
         tree.heading(col, text=col.replace("_"," ").title())
         # With a horizontal scrollbar, columns should keep their exact width
