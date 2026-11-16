@@ -191,6 +191,50 @@ def _send_framed(conn, obj):
     conn.sendall(len(body).to_bytes(4, "big") + body)
 
 
+_MAX_REQUEST = 65536
+_MAX_MODS, _MAX_MOD_FIELD = 1000, 128
+
+
+def _read_request(conn):
+    """One JSON request, which can span several recvs (set_mods' list).
+    None when the client sent nothing."""
+    data = b""
+    while len(data) < _MAX_REQUEST:
+        chunk = conn.recv(_MAX_REQUEST - len(data))
+        if not chunk:
+            break
+        data += chunk
+        try:
+            return json.loads(data.decode())
+        except ValueError:
+            continue
+    if not data:
+        return None
+    raise ValueError("Invalid or incomplete request.")
+
+
+def _set_mods(req, ip):
+    """Saves the mods the player's game loads, {id: version}, in their users.json
+    entry. TavernLib's join check reads them there: the join token is too small
+    to carry them."""
+    mods = req.get("mods")
+    username = str(req.get("username", "")).strip()
+    token = str(req.get("token", "")).strip()
+    if (not username or not token or not isinstance(mods, dict) or len(mods) > _MAX_MODS
+            or not all(isinstance(v, str) and 0 < len(k) <= _MAX_MOD_FIELD and len(v) <= _MAX_MOD_FIELD
+                       for k, v in mods.items())):
+        return {"status": "error", "message": "Malformed mod list"}
+    with _users_lock:
+        users = _load_users()
+        entry = users.get(username.lower())
+        if not entry or not entry.get("token") or entry["token"] != token:
+            _record_fail(ip)
+            return {"status": "error", "message": "Account not found. Join the server first."}
+        entry["mods"] = dict(sorted(mods.items()))
+        _save_users(users)
+    return {"status": "ok"}
+
+
 def _handle_auth(conn, addr, log_fn, get_game_dir):
     ip = addr[0] if addr else "?"
     try:
@@ -198,9 +242,8 @@ def _handle_auth(conn, addr, log_fn, get_game_dir):
         if not _throttle_ok(ip):
             conn.sendall(json.dumps({"status":"error","message":"Too many attempts."}).encode())
             return
-        data = conn.recv(65536)
-        if not data: return
-        req = json.loads(data.decode())
+        req = _read_request(conn)
+        if req is None: return
 
         # ── ping / info probe ──
         if req.get("ping"):
@@ -281,6 +324,10 @@ def _handle_auth(conn, addr, log_fn, get_game_dir):
                 "status": "whitelist_application_received",
                 "already_pending": not added,
             }).encode())
+            return
+
+        if req.get("set_mods"):
+            conn.sendall(json.dumps(_set_mods(req, ip)).encode())
             return
 
         # ── addon dispatch — e.g. custom_models registers handlers for
@@ -370,6 +417,7 @@ def _handle_auth(conn, addr, log_fn, get_game_dir):
                     # next with this username, so a lost token can be recovered.
                     entry["token"] = token
                     entry["registered_from"] = ip
+                    entry.pop("mods", None)
                     users[key] = entry
                     _save_users(users)
                     user_id = entry["user_id"]
@@ -382,6 +430,10 @@ def _handle_auth(conn, addr, log_fn, get_game_dir):
                     return
                 else:
                     user_id = entry["user_id"]
+                    # This join sends its own list once its mods are installed,
+                    # so the last join's can't stand in for it.
+                    if entry.pop("mods", None) is not None:
+                        _save_users(users)
             else:
                 # Per-IP registration limit — prevent one IP flooding with
                 # accounts. Toggleable in Server Settings, defaults to on.
