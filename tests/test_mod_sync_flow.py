@@ -333,3 +333,43 @@ class ServerModsListShape(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QuickJoinSkipsTheWindow(unittest.TestCase):
+    """With Quick join on, a join applies its plan without the comparison
+    window, unless a pin needs a choice."""
+
+    def _join(self, plan, quick=True):
+        server_mods = [{"id": "a.mod", "version": "1.0.0", "targets": ["client_windows", "server"],
+                        "parity_required": True, "target_sha256": {}}]
+        opened, rendered, launched = [], [], []
+        ns = launcher(
+            _set_sync_busy=lambda busy: None,
+            _report_server_untracked=lambda: None,
+            _build_mod_plan=lambda game_dir, host, scene=None, mods_hash=None: ("plan", (plan, server_mods)),
+            _open_mod_diff=lambda *args, **kwargs: opened.append(kwargs))
+        bind(ns, "_reconcile_mods", "_post_render_check", "_verify_mod_parity", "_build_divergence")
+        fake_mods = types.SimpleNamespace(
+            parity_required=parity_required, has_target=has_target,
+            list_installed_mods=lambda game_dir: [{"id": "a.mod", "version": "1.0.0", "enabled": True,
+                                                   "installed": {"client_windows": {}}}],
+            render_active_set=lambda game_dir, p, on_msg, on_step: rendered.append(p))
+        with mock.patch.object(lw, "mods", fake_mods), mock.patch.object(lw, "run_bg", inline_run_bg), \
+             mock.patch.object(lw, "quick_join_on", lambda: quick):
+            ns._reconcile_mods("10.0.0.5", r"C:\game\A Township Tale.exe", then=launched.append)
+        return opened, rendered, launched
+
+    def test_the_plan_is_applied_and_the_game_launched(self):
+        plan = make_plan(entries=[entry("a.mod", reason="required")])
+        opened, rendered, launched = self._join(plan)
+        self.assertEqual((opened, rendered, len(launched)), ([], [plan], 1))
+
+    def test_a_pin_conflict_still_opens_the_window(self):
+        plan = make_plan(entries=[entry("a.mod", reason="required")])
+        plan.pin_conflicts = [("a.mod", "0.9.0", "1.0.0")]
+        opened, rendered, launched = self._join(plan)
+        self.assertEqual((len(opened), rendered, launched), (1, [], []))
+
+    def test_without_it_the_window_opens(self):
+        opened, rendered, launched = self._join(make_plan(entries=[entry("a.mod", reason="required")]), quick=False)
+        self.assertEqual((len(opened), rendered, launched), (1, [], []))

@@ -587,3 +587,17 @@ class Icons(_TempDataDirFixture, unittest.TestCase):
         stub(self, ui, "_PILImage", None)
         ns._load_icons({"a.m": self.URL}, 36, lambda *a: self.fail("drew an icon"))
         self.assertEqual(fetched, [])
+
+
+class QuickJoinFile(_TempDataDirFixture, unittest.TestCase):
+    """Quick join is on while quick_join exists in the data folder, which TavernLib shares."""
+
+    def test_switching_it(self):
+        self.assertFalse(paths.quick_join_on())
+        paths.set_quick_join(True)
+        self.assertTrue(os.path.isfile(os.path.join(self.data_dir, "quick_join")))
+        paths.set_quick_join(True)
+        self.assertTrue(paths.quick_join_on())
+        paths.set_quick_join(False)
+        paths.set_quick_join(False)
+        self.assertFalse(paths.quick_join_on())

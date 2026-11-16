@@ -59,6 +59,8 @@ class SceneReachesTheLaunchArgs(unittest.TestCase):
                 self.planned_scene.append(scene), go(None)),
         )
         bind(ns, "_do_launch", "_launch_game", "_mods_claim", "_take_host", "spawn_game")
+        ns._rejoining = getattr(self, "_rejoin_next", False)
+        self._rejoin_next = False
         self.ns = ns
         fake_mods = types.SimpleNamespace(
             list_installed_mods=lambda game_dir: [],
@@ -85,6 +87,12 @@ class SceneReachesTheLaunchArgs(unittest.TestCase):
             ns._do_launch(password=None)
         self.assertEqual(len(launched), 1, "the game was never launched")
         return launched[0]
+
+    def test_the_rejoin_after_installing_says_so_once(self):
+        self._rejoin_next = True
+        self.assertIn("/tavern_rejoin", self._join(None))
+        self.assertFalse(self.ns._rejoining)
+        self.assertNotIn("/tavern_rejoin", self._join(None))
 
     def test_a_tutorial_server_launches_into_the_tutorial_scene(self):
         self.assertIn("/tutorialScene", self._join("/tutorialScene"))
@@ -207,7 +215,7 @@ class RejectionWatch(unittest.TestCase):
         ns = types.SimpleNamespace(
             v_ip=FakeVar("1.2.3.4"), v_port=FakeVar("1757"), _save=lambda: None,
             _print=lambda msg, tag="": None, after=lambda ms, fn: fn(),
-            offered=[], launched=[])
+            v_quick_join=FakeVar(False), offered=[], launched=[])
         ns._offer_rejection_recovery = lambda p, relaunch: ns.offered.append(relaunch)
         ns._do_launch = lambda password=None: ns.launched.append((ns.v_ip.get(), ns.v_port.get()))
         bind(ns, "_watch_for_rejection", "_check_rejection", "_rejoin")
@@ -284,7 +292,7 @@ class RejectionAtStartup(unittest.TestCase):
 
 class RecoveryQuestion(unittest.TestCase):
 
-    def _recover(self, payload, answer):
+    def _recover(self, payload, answer, quick=False):
         rejoined, asked = [], []
         ns = types.SimpleNamespace(
             v_exe=FakeVar(r"C:\game\A Township Tale.exe"), _action_btn=FakeWidget(),
@@ -298,8 +306,10 @@ class RecoveryQuestion(unittest.TestCase):
              mock.patch.object(lw, "confirm_while_game_running", lambda *a: True), \
              mock.patch.object(lw, "run_bg", inline_run_bg), \
              mock.patch.object(lw, "load_cfg", lambda: {}), \
+             mock.patch.object(lw, "quick_join_on", lambda: quick), \
              mock.patch.object(lw, "mods", fake_mods):
             ns._offer_rejection_recovery(payload, lambda: rejoined.append(True))
+        self.rejoining = getattr(ns, "_rejoining", False)
         return asked, rejoined
 
     def test_the_player_is_asked(self):
@@ -309,6 +319,14 @@ class RecoveryQuestion(unittest.TestCase):
     def test_not_again_once_they_chose_in_the_game(self):
         asked, rejoined = self._recover({**RejectionWatch._payload("5.6.7.8"), "rejoin": True}, False)
         self.assertEqual((asked, rejoined), ([], [True]))
+
+    def test_not_with_quick_join_on(self):
+        asked, rejoined = self._recover(RejectionWatch._payload("5.6.7.8"), False, quick=True)
+        self.assertEqual((asked, rejoined), ([], [True]))
+
+    def test_the_rejoin_launch_is_marked(self):
+        self._recover({**RejectionWatch._payload("5.6.7.8"), "rejoin": True}, False)
+        self.assertTrue(self.rejoining)
 
 
 class TavernEssentialsDetection(unittest.TestCase):
