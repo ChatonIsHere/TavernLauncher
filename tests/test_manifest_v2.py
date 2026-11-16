@@ -388,9 +388,9 @@ class CacheBySha(_TempDataDirFixture, unittest.TestCase):
 
 
 class ClientReadsItsOwnTarget(_FakeInstallFixture, unittest.TestCase):
-    """The claim, the parity check and the build advisory all read client_windows."""
+    """The mod list, the parity check and the build advisory all read client_windows."""
 
-    def test_the_claim_lists_enabled_mods_installed_for_pc(self):
+    def test_the_mod_list_has_enabled_mods_installed_for_pc(self):
         for mod_id in ("a.pc", "b.srv", "c.off"):
             self._publish(mod_id, "1.0.0")
         self._closure("a.pc", target="client_windows")
@@ -398,8 +398,7 @@ class ClientReadsItsOwnTarget(_FakeInstallFixture, unittest.TestCase):
         self._closure("c.off", target="client_windows")
         mm.disable_mod(self.game, "c.off")
         ns = types.SimpleNamespace(_print=lambda *a: None)
-        claim = lw.ClientLauncher._mods_claim(ns, self.game)
-        self.assertEqual(json.loads(claim), {"a.pc": "1.0.0"})
+        self.assertEqual(lw.ClientLauncher._mods_list(ns, self.game), {"a.pc": "1.0.0"})
 
     def test_the_build_advisory_compares_pc_hashes(self):
         self._install("b.m")

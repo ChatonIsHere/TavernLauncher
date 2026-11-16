@@ -77,8 +77,8 @@ def select(game, role):
     return [l.strip().replace("\\", "/") for l in harness("select", game, role).splitlines() if l.strip()]
 
 
-def admitted(game, claim):
-    verdict = harness("parity", game, claim).strip().splitlines()[-1]
+def admitted(game, mods_list):
+    verdict = harness("parity", game, mods_list).strip().splitlines()[-1]
     if not verdict.startswith(("admit", "refuse")):
         raise RuntimeError(f"unexpected parity output: {verdict!r}")
     return verdict.startswith("admit")
@@ -133,11 +133,11 @@ for order in ("python-first", "csharp-first"):
         check(not any(f.endswith(".dll") for f in os.listdir(os.path.join(game, "Mods", mod_id))),
               f"{order}: nothing loadable at {mod_id}/ root")
 
-    # The claim an in-game join mints (TavernEssentials' board) is the one the launcher sends.
-    cs_claim = harness("claim", game).strip().splitlines()[-1]
-    py_claim = ClientLauncher._mods_claim(types.SimpleNamespace(_print=print), game)
-    check(json.loads(cs_claim) == json.loads(py_claim), f"{order}: C# client claim matches the launcher's")
-    check(admitted(game, cs_claim), f"{order}: the C# claim passes the join gate")
+    # The list an in-game join sends (TavernEssentials' board) is the one the launcher sends.
+    cs_mods = harness("mods", game).strip().splitlines()[-1]
+    py_mods = ClientLauncher._mods_list(types.SimpleNamespace(_print=print), game)
+    check(json.loads(cs_mods) == py_mods, f"{order}: C# client mod list matches the launcher's")
+    check(admitted(game, cs_mods), f"{order}: the C# list passes the join gate")
 
     # Server handshake: both implementations, same folder.
     py_hash, py_count, py_mods, py_untracked = install.handshake_snapshot(game, target="server")
@@ -170,13 +170,13 @@ os.replace(os.path.join(mod_dir, "manifest.disabled.json"), os.path.join(mod_dir
 
 print("\n== join verdicts (TavernLib)")
 both = json.dumps({EXAMPLE: "1.2.0", SPLIT: "1.0.0"})
-for claim, allowed, label in (
-        (both, True, "claim with both exact versions"),
-        (json.dumps({EXAMPLE: "1.2.0"}), False, "claim missing SplitMod"),
-        (json.dumps({EXAMPLE: "1.1.0", SPLIT: "1.0.0"}), False, "claim with the wrong ExampleMod version"),
-        ("none", False, "no claim (Quest standalone), parity mods with client targets"),
+for mods_list, allowed, label in (
+        (both, True, "list with both exact versions"),
+        (json.dumps({EXAMPLE: "1.2.0"}), False, "list missing SplitMod"),
+        (json.dumps({EXAMPLE: "1.1.0", SPLIT: "1.0.0"}), False, "list with the wrong ExampleMod version"),
+        ("none", False, "no list (Quest standalone), parity mods with client targets"),
 ):
-    check(admitted(game, claim) == allowed, f"parity: {label} -> {'allowed' if allowed else 'denied'}")
+    check(admitted(game, mods_list) == allowed, f"parity: {label} -> {'allowed' if allowed else 'denied'}")
 
 
 def hand_record(game, mod_id, targets, parity):
@@ -201,13 +201,13 @@ def hand_record(game, mod_id, targets, parity):
 
 g2 = new_game(); games.append(g2)
 hand_record(g2, "T.QuestOnly", ["server", "client_android"], True)
-check(admitted(g2, "none") is False, "parity: no claim vs required server+client_android mod -> denied")
-check(admitted(g2, "{}") is True, "parity: PC claim vs required server+client_android mod (no client_windows build) -> allowed")
+check(admitted(g2, "none") is False, "parity: no list vs required server+client_android mod -> denied")
+check(admitted(g2, "{}") is True, "parity: PC list vs required server+client_android mod (no client_windows build) -> allowed")
 g3 = new_game(); games.append(g3)
 hand_record(g3, "T.Optional", ["server", "client_windows"], False)
 hand_record(g3, "T.ServerOnly", ["server"], True)
-check(admitted(g3, "none") is True, "parity: no claim vs optional + server-only required mods -> allowed")
-check(admitted(g3, "{}") is True, "parity: empty claim vs optional + server-only required -> allowed")
+check(admitted(g3, "none") is True, "parity: no list vs optional + server-only required mods -> allowed")
+check(admitted(g3, "{}") is True, "parity: empty list vs optional + server-only required -> allowed")
 
 print("\n== a fresh PC client plans against the C# server's mods list")
 client = new_game(); games.append(client)

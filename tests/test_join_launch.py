@@ -33,10 +33,11 @@ def bind(ns, *names):
 
 class SceneReachesTheLaunchArgs(unittest.TestCase):
 
-    def _join(self, scene_arg, ip="", port="1757"):
+    def _join(self, scene_arg, ip="", port="1757", send_error=None):
         launched = []
         self.planned_scene = []
         self.resolved = []
+        self.sent, self.printed = [], []
         ns = types.SimpleNamespace(
             v_exe=FakeVar(r"C:\game\A Township Tale.exe"),
             v_username=FakeVar("Tester"),
@@ -49,7 +50,7 @@ class SceneReachesTheLaunchArgs(unittest.TestCase):
             _action_btn=FakeWidget(),
             _game_procs=[],
             _save=lambda: None,
-            _print=lambda msg, tag="": None,
+            _print=lambda msg, tag="": self.printed.append((msg, tag)),
             _show_token_button=lambda: None,
             _popen_console_kwargs=lambda: {},
             _watch_for_rejection=lambda proc, host, relaunch: None,
@@ -58,17 +59,27 @@ class SceneReachesTheLaunchArgs(unittest.TestCase):
             _reconcile_mods=lambda host, exe, go, scene=None: (
                 self.planned_scene.append(scene), go(None)),
         )
-        bind(ns, "_do_launch", "_launch_game", "_mods_claim", "_take_host", "spawn_game")
+        bind(ns, "_do_launch", "_launch_game", "_mods_list", "_take_host", "spawn_game")
         ns._rejoining = getattr(self, "_rejoin_next", False)
         self._rejoin_next = False
         self.ns = ns
+        pc = {"installed": {"client_windows": {}}}
         fake_mods = types.SimpleNamespace(
-            list_installed_mods=lambda game_dir: [],
+            has_target=has_target,
+            list_installed_mods=lambda game_dir: [
+                {"id": "a.mod", "version": "1.2.3", "enabled": True, **pc},
+                {"id": "off.mod", "version": "2.0.0", "enabled": False, **pc},
+                # The host's server build in the same folder: the game never loads it.
+                {"id": "srv.mod", "version": "3.0.0", "enabled": True, "installed": {"server": {}}}],
             scene_from_arg=scene_from_arg)
 
         def popen(args, **kwargs):
-            launched.append(args)
+            launched.append((args, list(self.sent)))
             return FakeProc()
+
+        def send_mods(host, user, token, mods_list):
+            self.sent.append((host, user, token, mods_list))
+            return send_error
 
         with mock.patch.object(lw.os.path, "isfile", lambda p: True), \
              mock.patch.object(lw, "_resolve_ip_for_game",
@@ -81,12 +92,23 @@ class SceneReachesTheLaunchArgs(unittest.TestCase):
              mock.patch.object(lw, "save_cfg", lambda cfg: None), \
              mock.patch.object(lw, "mods", fake_mods), \
              mock.patch.object(lw, "build_tokens", lambda *a: ("a", "r", "i")), \
+             mock.patch.object(lw, "send_mods", send_mods), \
              mock.patch.object(lw, "_delete_last_rejection_file", lambda: None), \
              mock.patch.object(lw.subprocess, "Popen", popen), \
              mock.patch.object(lw, "threading", types.SimpleNamespace(Thread=NoThread)):
             ns._do_launch(password=None)
         self.assertEqual(len(launched), 1, "the game was never launched")
-        return launched[0]
+        self.sent_before_launch = launched[0][1]
+        return launched[0][0]
+
+    def test_the_mod_list_is_sent_before_the_game_starts(self):
+        """Enabled mods installed for client_windows, and nothing else."""
+        self._join(None)
+        self.assertEqual(self.sent_before_launch, [("127.0.0.1", "Tester", "tok", {"a.mod": "1.2.3"})])
+
+    def test_a_failed_send_still_launches_and_says_so(self):
+        self._join(None, send_error="connection refused")
+        self.assertTrue(any("connection refused" in msg and tag == "warn" for msg, tag in self.printed))
 
     def test_the_rejoin_after_installing_says_so_once(self):
         self._rejoin_next = True
@@ -153,17 +175,7 @@ class MainMenuLaunch(unittest.TestCase):
             _save=lambda: None, _print=lambda msg, tag="": printed.append((msg, tag)),
             _popen_console_kwargs=lambda: {}, watched=[])
         ns._watch_for_rejection = lambda proc, host, relaunch: ns.watched.append((host, relaunch))
-        bind(ns, "_do_launch_menu", "_mods_claim", "spawn_game")
-        pc = {"installed": {"client_windows": {}}}
-        fake_mods = types.SimpleNamespace(
-            has_target=has_target,
-            list_installed_mods=lambda d: [
-                {"id": "a.mod", "version": "1.2.3", "enabled": True, **pc},
-                {"id": "off.mod", "version": "2.0.0", "enabled": False, **pc},
-                # The host's server build in the same folder: the game never
-                # loads it, so it's no part of what this client claims.
-                {"id": "srv.mod", "version": "3.0.0", "enabled": True,
-                 "installed": {"server": {}}}])
+        bind(ns, "_do_launch_menu", "spawn_game")
         claims = []
 
         def popen(args, **kwargs):
@@ -171,9 +183,8 @@ class MainMenuLaunch(unittest.TestCase):
             return FakeProc()
 
         with mock.patch.object(lw.os.path, "isfile", lambda p: True), \
-             mock.patch.object(lw, "mods", fake_mods), \
              mock.patch.object(lw, "build_tokens",
-                               lambda uid, name, token="", claim="": claims.append(claim) or ("a", "r", "i")), \
+                               lambda uid, name, token="": claims.append(token) or ("a", "r", "i")), \
              mock.patch.object(lw, "_delete_last_rejection_file", lambda: None), \
              mock.patch.object(lw, "threading", types.SimpleNamespace(Thread=InlineThread)), \
              mock.patch.object(lw.subprocess, "Popen", popen):
@@ -191,10 +202,9 @@ class MainMenuLaunch(unittest.TestCase):
         ns, _, _, _ = self._launch()
         self.assertEqual(len(ns._game_procs), 1)
 
-    def test_it_carries_the_same_mods_claim_as_a_join(self):
-        """Enabled mods installed for client_windows, and nothing else."""
+    def test_it_has_no_server_token(self):
         _, _, _, claims = self._launch()
-        self.assertEqual(claims, ['{"a.mod": "1.2.3"}'])
+        self.assertEqual(claims, [""])
 
     def test_it_is_watched_for_a_mods_rejection_with_no_server_of_its_own(self):
         """A join from the menu (TavernEssentials' board) can be refused over mods."""
