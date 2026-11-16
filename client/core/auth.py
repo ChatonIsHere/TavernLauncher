@@ -40,6 +40,24 @@ def authenticate(host, username, token, password=None, timeout=8):
     return None, resp.get("message", "Authentication failed."), False
 
 
+def send_mods(host, username, token, mods, timeout=8):
+    """Tells the server the mods this game loads, {id: version}, once they're
+    installed, for TavernLib's join check. The join token can't carry them: the
+    game's join message is too small. Returns None, or what went wrong."""
+    payload = {"set_mods": True, "username": username, "token": token, "mods": mods}
+    try:
+        s = socket.socket()
+        s.settimeout(timeout)
+        s.connect((host, AUTH_PORT))
+        s.sendall(json.dumps(payload).encode())
+        raw = s.recv(4096)
+        s.close()
+        resp = json.loads(raw.decode())
+    except Exception as e:
+        return str(e)
+    return None if resp.get("status") == "ok" else resp.get("message", "The server refused the mod list.")
+
+
 def register_whitelist_application(host, username, timeout=8):
     """Sends a register_whitelist_application request to TavernLib's own
     AuthManager (port 1762) -- this works against ANY server running
@@ -212,7 +230,7 @@ def _valid_port(value, default=1757):
         return default
 
 
-def build_tokens(user_id, username, tavern_token="", mods_claim=""):
+def build_tokens(user_id, username, tavern_token=""):
     """tavern_token is our OWN internal secret (the same one _get_or_create_token
     already tracks per server+username) — embedded here as an extra custom
     claim purely for a server-side mod to verify independently. UserId and
@@ -224,11 +242,7 @@ def build_tokens(user_id, username, tavern_token="", mods_claim=""):
     that's only ever handed out after actually passing the auth handshake
     (password, whitelist, blacklist all included), so a mod checking it
     against the server's own records closes that gap regardless of what
-    else the presented JWT claims to be.
-
-    mods_claim ("TavernMods", JSON {id: version}) is for TavernLib's parity
-    check; like TavernToken it rides the identity token, the one the game
-    sends a server."""
+    else the presented JWT claims to be."""
     exp, uid = 9999999999, str(user_id)
     a = _jwt({"UserId":uid,"Username":username,"role":"Access","is_verified":"True",
               "is_member":"True","Policy":["offline","play_offline","server_access_pre_alpha",
@@ -236,11 +250,11 @@ def build_tokens(user_id, username, tavern_token="", mods_claim=""):
               "server_access_development","server_access_testing","game_access_testing",
               "server_owner","debug_features","admin_vr_modes","database_admin",
               "server_create_development","reuse_refresh_tokens"],
-              "TavernToken":tavern_token,"TavernMods":mods_claim,
+              "TavernToken":tavern_token,
               "exp":exp,"iss":"AltaWebAPI","aud":"AltaClient"})
     r = _jwt({"UserId":uid,"role":"Refresh","exp":exp,"iss":"AltaWebAPI","aud":"AltaClient"})
     i = _jwt({"UserId":uid,"Username":username,"role":"Identity","is_member":"True",
-              "is_dev":"True","TavernToken":tavern_token,"TavernMods":mods_claim,
+              "is_dev":"True","TavernToken":tavern_token,
               "exp":exp,"iss":"AltaWebAPI","aud":"AltaClient"})
     return a, r, i
 
