@@ -53,7 +53,7 @@ from client.core.config import (
 from tavern_shared.flashing import start_flashing_button
 from client.core.auth import (
     AUTH_PORT, authenticate, ping_server, _resolve_ip_for_game, _valid_port, split_host_port,
-    build_tokens, _headless_user_id, register_whitelist_application, ticket_request,
+    build_tokens, _headless_user_id, register_whitelist_application, send_mods, ticket_request,
     fetch_server_mods,
 )
 from client.core.launch_hooks import run_post_auth_hooks, run_launch_hooks, LaunchContext
@@ -1058,7 +1058,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         return warnings
 
     def _post_render_check(self, game_dir, server_mods):
-        """One read of Mods/ for the parity check, the advisory and the claim."""
+        """One read of Mods/ for the parity check, the advisory and the mod list."""
         installed = _enabled_mods(game_dir)
         return (self._verify_mod_parity(server_mods, installed),
                 self._build_divergence(server_mods, installed), installed)
@@ -1176,7 +1176,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
             kind, payload = self._build_mod_plan(game_dir, host, scene, mods_hash)
             installed = None
             if joining and kind == "skip":
-                # For the fail-open launch's mods claim.
+                # For the fail-open launch's mod list.
                 try: installed = _enabled_mods(game_dir)
                 except Exception: pass
             return kind, payload, installed
@@ -1344,24 +1344,27 @@ class ClientLauncher(LauncherCommon, tk.Tk):
             scene_arg=scene_arg, installed=installed, kind="join", label=sv_name),
             scene=mods.scene_from_arg(scene_arg))
 
-    def _mods_claim(self, game_dir, installed=None):
-        """The TavernMods claim, {id: version}; "" when Mods/ can't be read."""
+    def _mods_list(self, game_dir, installed=None):
+        """{id: version} of the enabled mods, for set_mods; None when Mods/ can't be read."""
         try:
             if installed is None:
                 installed = _enabled_mods(game_dir)
-            return json.dumps({m["id"]: m.get("version", "") for m in installed},
-                              sort_keys=True)
+            return {m["id"]: m.get("version", "") for m in installed}
         except Exception as e:
             self._print(f"Could not read installed mods for the join handshake: {e}", "warn")
-            return ""
+            return None
 
     def _launch_game(self, exe, ip, host, platform, username, user_id, token,
                      relaunch, scene_arg=None, installed=None, kind="join", label=None):
         """The shared tail of both join paths; `installed` is what the verify
-        read, for the mods claim."""
-        mods_claim = self._mods_claim(os.path.dirname(exe), installed)
+        read, for the mod list. A headless join has no token and no handshake."""
+        mods_list = self._mods_list(os.path.dirname(exe), installed) if token else None
+        if mods_list is not None:
+            error = send_mods(host, username, token, mods_list)
+            if error:
+                self._print(f"Couldn't send your mod list, so the server may refuse the join: {error}", "warn")
 
-        access, refresh, identity = build_tokens(user_id, username, token, mods_claim)
+        access, refresh, identity = build_tokens(user_id, username, token)
         args = [exe, "/force_offline",
                 "/access_token", access, "/refresh_token", refresh,
                 "/identity_token", identity, "/join_local_server"]
@@ -1566,8 +1569,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         self._save()
 
         user_id = _headless_user_id(username)
-        access, refresh, identity = build_tokens(user_id, username, "",
-                                                 self._mods_claim(os.path.dirname(exe)))
+        access, refresh, identity = build_tokens(user_id, username)
         args = [exe, "/force_offline",
                 "/access_token", access, "/refresh_token", refresh,
                 "/identity_token", identity]
@@ -1622,7 +1624,7 @@ CLIENT_TARGET = "client_windows"
 
 
 def _enabled_mods(game_dir):
-    """What the game loads: the claim and the parity check."""
+    """What the game loads: the mod list and the parity check."""
     return [m for m in mods.list_installed_mods(game_dir)
             if m.get("enabled") and mods.has_target(m, CLIENT_TARGET)]
 
