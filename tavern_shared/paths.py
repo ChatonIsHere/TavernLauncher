@@ -35,6 +35,20 @@ def _last_rejection_path():
     return os.path.join(_tavern_data_dir(), "last_rejection.json")
 
 
+def quick_join_on():
+    """Quick join: install a refusing server's mods and rejoin without asking.
+    On while TavernDirectories.QuickJoin exists; TavernLib switches it too."""
+    return os.path.exists(os.path.join(_tavern_data_dir(), "quick_join"))
+
+
+def set_quick_join(on):
+    path = os.path.join(_tavern_data_dir(), "quick_join")
+    if on:
+        open(path, "a").close()
+    elif os.path.exists(path):
+        os.remove(path)
+
+
 def _delete_last_rejection_file():
     """Before every launch, so a file present afterwards is that attempt's."""
     try: os.remove(_last_rejection_path())
