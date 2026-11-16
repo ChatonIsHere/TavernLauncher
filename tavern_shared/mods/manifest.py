@@ -118,6 +118,7 @@ class ModSummary:
     source_repo: str
     parity_required: bool = True
     scenes: list = None
+    icons: dict = None              # {size in px: https url}, display only
 
     def highest(self):
         return max(self.versions, key=_parse_version)
@@ -284,6 +285,11 @@ def _summary_from_dict(d, mod_id, source_repo):
         _warn(f"index entry for {mod_id}: {e} Shown as working in every scene.")
         scenes = None
     targets = d.get("targets")
+    icons = {}
+    for i in d.get("icons") if isinstance(d.get("icons"), list) else ():
+        if (isinstance(i, dict) and type(i.get("size")) is int and i["size"] > 0
+                and isinstance(i.get("url"), str) and i["url"].startswith("https://")):
+            icons.setdefault(i["size"], i["url"])
     return ModSummary(
         id=mod_id,
         name=str(d.get("name", mod_id)),
@@ -295,4 +301,5 @@ def _summary_from_dict(d, mod_id, source_repo):
         source_repo=source_repo,
         parity_required=required,
         scenes=scenes,
+        icons=icons,
     )
