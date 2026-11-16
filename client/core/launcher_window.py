@@ -34,7 +34,9 @@ except ImportError:
     pass
 from tavern_shared.log_tailer import GameLogTailer
 from tavern_shared.mod_install import _melonloader_installed, _tavernlib_installed
-from tavern_shared.paths import _delete_last_rejection_file, _last_rejection_path, _record_launcher_path
+from tavern_shared.paths import (
+    _delete_last_rejection_file, _last_rejection_path, _record_launcher_path, quick_join_on, set_quick_join,
+)
 from tavern_shared.game_guard import any_game_running, confirm_while_game_running
 from tavern_shared import mods
 from tavern_shared.bg import run_bg
@@ -105,6 +107,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         # this back to "official", matching how they've always behaved.
         self._selected_kind = "official"
         self._mods_list_cache = {}    # host -> (mods_hash, mods, untracked)
+        self._rejoining = False     # the next launch is the rejoin after installing a server's mods
         self._server_untracked = []
         # Every game started: the running-game guard can be overridden.
         self._game_procs = []
@@ -270,6 +273,13 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         self.v_show_melonloader = tk.BooleanVar(value=False)
         tk.Checkbutton(df, text="Show MelonLoader", variable=self.v_show_melonloader,
                        command=self._save, bg=BG, fg=MUTED, selectcolor=SURF,
+                       activebackground=BG, activeforeground=AMBER,
+                       padx=0, pady=0, borderwidth=0, highlightthickness=0,
+                       font=("Segoe UI",7)).pack(side="left", padx=(8,0))
+        self.v_quick_join = tk.BooleanVar(value=quick_join_on())
+        tk.Checkbutton(df, text="Quick Join", variable=self.v_quick_join,
+                       command=lambda: set_quick_join(self.v_quick_join.get()),
+                       bg=BG, fg=MUTED, selectcolor=SURF,
                        activebackground=BG, activeforeground=AMBER,
                        padx=0, pady=0, borderwidth=0, highlightthickness=0,
                        font=("Segoe UI",7)).pack(side="left", padx=(8,0))
@@ -1140,6 +1150,15 @@ class ClientLauncher(LauncherCommon, tk.Tk):
             if joining and not (changed or plan.to_deactivate or plan.pin_conflicts):
                 verify(server_mods)
                 return
+            # Quick join: no window, unless a pin needs a choice.
+            if joining and quick_join_on() and not plan.pin_conflicts:
+                self._print("Quick join: matching this server's mods.", "warn")
+                run_bg(self, lambda: mods.render_active_set(
+                           game_dir, plan, lambda m: self.after(0, lambda: self._print(m, "dim")),
+                           lambda i, s: None),
+                       on_ok=lambda _: verify(server_mods),
+                       on_err=lambda e: abort(f"Applying the mod changes failed: {e}"))
+                return
 
             def cancelled(win):
                 if joining and not win.apply_attempted:
@@ -1363,6 +1382,10 @@ class ClientLauncher(LauncherCommon, tk.Tk):
             # told us during the auth handshake that it needs this, so the
             # client has to match, not choose for itself.
             args.append(scene_arg)
+        if self._rejoining:
+            # TavernLib won't quick-join again from this launch, so a server that still refuses can't loop.
+            args.append("/tavern_rejoin")
+            self._rejoining = False
 
         _delete_last_rejection_file()
 
@@ -1379,6 +1402,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         TavernLib writes when a server denies the join over mods. The launch
         deleted any stale copy, so one present now is this attempt's."""
         proc.wait()
+        self.after(0, lambda: self.v_quick_join.set(quick_join_on()))   # TavernLib may have switched it
         self._check_rejection(host, relaunch)
 
     def _check_rejection(self, host, relaunch, startup=False):
@@ -1427,7 +1451,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         names = "\n".join(f"  • {m['id']} {m['version']}" for m in missing)
         server = payload.get("server_name") or "That server"
         # rejoin: the player already said yes in the game.
-        if payload.get("rejoin") is not True and not messagebox.askyesno("Mods needed to rejoin",
+        if payload.get("rejoin") is not True and not quick_join_on() and not messagebox.askyesno("Mods needed to rejoin",
                 f"{server} rejected the join because these mods didn't "
                 f"match:\n\n{names}\n\nInstall the exact versions it needs "
                 f"and try rejoining?", parent=self):
@@ -1459,6 +1483,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
     def _recovery_done(self, relaunch):
         self._action_btn.config(state="normal")
         self._print("Recovered the missing mods, rejoining…", "ok")
+        self._rejoining = True
         relaunch()
 
     def _do_launch_headless(self):
