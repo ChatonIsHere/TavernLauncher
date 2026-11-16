@@ -494,3 +494,96 @@ class LauncherPath(unittest.TestCase):
 
     def test_running_from_source_records_nothing(self):
         self.assertIsNone(self._record(False))
+
+
+class Icons(_TempDataDirFixture, unittest.TestCase):
+    """Mod icons: read leniently from the index, cached on disk, drawn at the size a list needs."""
+
+    URL = "https://raw.githubusercontent.com/a/m/" + "0" * 40 + "/icon-128.png"
+
+    @staticmethod
+    def _png(size=128):
+        from PIL import Image
+        out = io.BytesIO()
+        Image.new("RGBA", (size, size), (200, 120, 40, 255)).save(out, "PNG")
+        return out.getvalue()
+
+    def test_the_index_keeps_only_usable_icons(self):
+        icons = [{"size": 128, "url": self.URL}, {"size": 128, "url": "https://dup"},
+                 {"size": 256, "url": "http://insecure"}, {"size": "512", "url": "https://x"},
+                 {"size": True, "url": "https://x"}, {"size": 0, "url": "https://x"}, "nope",
+                 {"size": 512, "url": "https://big"}]
+        s = mm._summary_from_dict({**slim_entry(["1.0.0"]), "icons": icons}, "a.m", DEFAULT)
+        self.assertEqual(s.icons, {128: self.URL, 512: "https://big"})
+        for bad in (None, "icon.png", {"128": self.URL}):
+            self.assertEqual(mm._summary_from_dict({**slim_entry(["1.0.0"]), "icons": bad},
+                                                   "a.m", DEFAULT).icons, {})
+
+    def test_icon_url_picks_the_smallest_that_covers(self):
+        icons = {128: "s", 256: "m", 512: "l"}
+        self.assertEqual([ui.icon_url(icons, px) for px in (20, 128, 129, 300, 600)],
+                         ["s", "s", "m", "l", "l"])
+        self.assertIsNone(ui.icon_url({}, 20))
+        self.assertIsNone(ui.icon_url(None, 20))
+
+    def test_cached_icon_downloads_once(self):
+        from tavern_shared.mods import cache
+        fetched = []
+
+        def urlopen(req, timeout):
+            fetched.append(req.full_url)
+            return contextlib.nullcontext(io.BytesIO(self._png()))
+        stub(self, cache.urllib.request, "urlopen", urlopen)
+        self.assertEqual(cache.cached_icon(self.URL), self._png())
+        self.assertEqual(cache.cached_icon(self.URL), self._png())
+        self.assertEqual(fetched, [self.URL])
+        cache.clear_mod_cache()
+        cache.cached_icon(self.URL)
+        self.assertEqual(len(fetched), 2)
+
+    def test_cached_icon_refuses_what_isnt_a_small_png(self):
+        from tavern_shared.mods import cache
+        for body in (b"GIF89a....", self._png() + b"\0" * cache._ICON_MAX_BYTES):
+            stub(self, cache.urllib.request, "urlopen",
+                 lambda req, timeout, body=body: contextlib.nullcontext(io.BytesIO(body)))
+            with self.subTest(len(body)), self.assertRaises(base.ModManagerError):
+                cache.cached_icon(self.URL + str(len(body)))
+        with self.assertRaises(base.ModManagerError):
+            cache.cached_icon("http://example.com/i.png")
+        self.assertFalse(os.path.isdir(os.path.join(self.data_dir, "mod_cache", "_icons"))
+                         and os.listdir(os.path.join(self.data_dir, "mod_cache", "_icons")))
+
+    def _ns(self, served):
+        ns = types.SimpleNamespace(_icon_photos={})
+        for name in ("_load_icons", "_icon_ready"):
+            setattr(ns, name, types.MethodType(getattr(ui.ModListWindow, name), ns))
+        stub(self, ui, "run_bg", lambda w, fn, on_ok=None, on_err=None: fn())
+        stub(self, ui, "post", lambda w, fn, *a: fn(*a))
+        stub(self, ui, "_PILImageTk", types.SimpleNamespace(PhotoImage=lambda img, master: ("photo", img.size)))
+        fetched = []
+
+        def cached_icon(url):
+            fetched.append(url)
+            if url not in served:
+                raise OSError("offline")
+            return served[url]
+        stub(self, ui, "cached_icon", cached_icon)
+        return ns, fetched
+
+    def test_icons_are_drawn_once_per_url_and_failures_stay_blank(self):
+        ns, fetched = self._ns({self.URL: self._png(), "https://huge": self._png(1100),
+                                "https://junk": b"\x89PNG not really"})
+        shown = []
+        wanted = {"a.m": self.URL, "b.m": self.URL, "c.m": None, "d.m": "https://gone",
+                  "e.m": "https://huge", "f.m": "https://junk"}
+        ns._load_icons(wanted, 36, lambda key, photo: shown.append((key, photo)))
+        self.assertEqual(shown, [("a.m", ("photo", (36, 36))), ("b.m", ("photo", (36, 36)))])
+        ns._load_icons({"a.m": self.URL}, 36, lambda key, photo: shown.append((key, photo)))
+        self.assertEqual(len(shown), 3)
+        self.assertEqual(fetched.count(self.URL), 2)    # a.m and b.m in the first call; then from memory
+
+    def test_without_pillow_there_are_no_icons(self):
+        ns, fetched = self._ns({self.URL: self._png()})
+        stub(self, ui, "_PILImage", None)
+        ns._load_icons({"a.m": self.URL}, 36, lambda *a: self.fail("drew an icon"))
+        self.assertEqual(fetched, [])
