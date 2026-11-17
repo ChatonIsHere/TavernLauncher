@@ -150,6 +150,11 @@ for order in ("python-first", "csharp-first"):
 
 game = games[0]
 
+print("\n== a mods refusal fits the game's 1100-byte join message")
+for count in (1, 3, 9, 50):
+    size, listed = map(int, harness("reason", str(count)).strip().splitlines()[-1].split())
+    check(size <= 700 and 1 <= listed <= count, f"{count} missing: {size} bytes, lists {listed}")
+
 print("\n== which folders MelonLoader loads")
 for role, own, other in (("server", ".server", ".client_windows"), ("client_windows", ".client_windows", ".server")):
     dirs = select(game, role)
