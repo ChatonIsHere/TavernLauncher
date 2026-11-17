@@ -14,8 +14,8 @@
   },
   "tavernlib": {
     "filename": "TavernLib.dll",
-    "sha256": "b9f51ae14ac28804dc36a8b48b83a279745fed643a4abd66fbfeae8f54fcf2f0",
-    "size": 305152,
-    "tag": "v1.5.4-mm.5"
+    "sha256": "160ffeceaf5c6d7e27526f0df89e1489af6ad9e0e706f930b1b763b9e091633c",
+    "size": 304640,
+    "tag": "v1.5.4-mm.6"
   }
 }
