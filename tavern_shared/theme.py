@@ -180,6 +180,12 @@ def _mk_tree(parent, cols, widths, height=8, hscroll=False, icon_width=0):
     style.map("Tav.Treeview",
               background=[("selected",AMBERDIM)],
               foreground=[("selected","#ffd080")])
+    # Rows are flat: no indent or expand arrow, which pushed an icon out of its column.
+    style.configure("Tav.Treeview", indent=0)
+    style.layout("Tav.Treeview.Item", [("Treeitem.padding", {"sticky": "nswe", "children": [
+        ("Treeitem.image", {"side": "left", "sticky": ""}),
+        ("Treeitem.focus", {"side": "left", "sticky": "", "children": [
+            ("Treeitem.text", {"side": "left", "sticky": ""})]})]})])
     f = tk.Frame(parent, bg=SURF, highlightbackground=BORDER, highlightthickness=1)
     f.pack(fill="both", expand=True)
 
