@@ -813,7 +813,7 @@ class ModManagerWindow(ModListWindow):
     manager didn't place."""
 
     _COLS   = ("status", "author", "mod", "installed", "latest", "managed", "source")
-    _WIDTHS = (86,       96,       196,   66,          62,       78,        106)
+    _WIDTHS = (86,       96,       180,   66,          62,       94,        106)
     _STATE_WORD = {
         "missing":  "Missing",
         "damaged":  "Damaged",
@@ -1008,8 +1008,9 @@ class ModManagerWindow(ModListWindow):
             status = "Disabled"
         else:
             status = self._STATE_WORD.get(self._row_tag(r), "")
+        managed = "Kept enabled" if r["kind"] == "managed" and r["key"] in self._pinned_ids else r["managed"]
         return (status, r["author"], r["name"],
-                r["installed"], r["latest"], r["managed"], r["source"])
+                r["installed"], r["latest"], managed, r["source"])
 
     def _apply_states(self, states):
         for row_id, r in self._rows.items():
@@ -1051,7 +1052,8 @@ class ModManagerWindow(ModListWindow):
         r = self._rows.get(row)
         if not r:
             return
-        menu = tk.Menu(self, tearoff=0, bg=SURF, fg=PARCH,
+        # selectcolor: the check mark, otherwise dark on dark until hovered.
+        menu = tk.Menu(self, tearoff=0, bg=SURF, fg=PARCH, selectcolor=AMBER,
                        activebackground=AMBERDIM, activeforeground=PARCH)
         managed = r["kind"] == "managed"
         menu.add_command(label="Uninstall", command=self._on_uninstall,
@@ -1191,6 +1193,8 @@ class ModManagerWindow(ModListWindow):
             self._status.set(str(e))
             return
         self._pinned_ids = {_parse_pin_entry(p)[0] for p in list_pinned(cfg)}
+        if self._tree.exists(f"m:{mod_id}"):
+            self._tree.item(f"m:{mod_id}", values=self._row_values(f"m:{mod_id}"))
 
     def _open_community(self):
         if self._community_win and self._community_win.winfo_exists():
