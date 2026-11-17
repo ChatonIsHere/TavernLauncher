@@ -5,6 +5,7 @@ import math
 import json
 import os
 import tkinter as tk
+import webbrowser
 from tkinter import filedialog, messagebox, simpledialog
 
 from tavern_shared.bg import post, run_bg
@@ -30,7 +31,8 @@ from tavern_shared.mods.modlist import (
 )
 from tavern_shared.mods.pins import _parse_pin_entry, add_pin, list_pinned, remove_pin
 from tavern_shared.mods.repos import (
-    _is_default, _source_display, add_repo, fetch_indexes, is_own_mod, list_repos, remove_repo,
+    _is_default, _source_display, add_repo, fetch_indexes, is_own_mod, list_repos, mod_repo_url,
+    remove_repo,
 )
 from tavern_shared.mods.resolve import _fetch_manifest, resolve_mod_by_id
 
@@ -73,6 +75,13 @@ def _draw_star(img, centre, radius, colour):
     points = [(cx + (radius if i % 2 == 0 else radius * 0.45) * math.sin(math.pi * i / 5),
                cy - (radius if i % 2 == 0 else radius * 0.45) * math.cos(math.pi * i / 5)) for i in range(10)]
     ImageDraw.Draw(img).polygon(points, fill=colour)
+
+
+def _bind_tree(widget, sequence, handler):
+    """Binds a widget and everything inside it."""
+    widget.bind(sequence, handler)
+    for child in widget.winfo_children():
+        _bind_tree(child, sequence, handler)
 
 
 def source_label(source_repo):
@@ -602,6 +611,7 @@ class CommunityModsWindow(ModListWindow):
                  font=("Segoe UI",8,"italic"), wraplength=720, justify="left", anchor="w"
         ).pack(fill="x")
 
+        _bind_tree(card, "<Button-3>", lambda e: self._card_menu(e, mod_id))
         self._card_widgets[mod_id] = {
             "card": card, "icon": icon, "status_lbl": status_lbl, "installed_var": installed_var,
             "btn": btn, "requires_var": requires_var,
@@ -609,6 +619,17 @@ class CommunityModsWindow(ModListWindow):
             "needs_row": needs_row, "needs_var": needs_var, "deps_btn": deps_btn,
         }
         self._apply_card_state(mod_id)
+
+    def _card_menu(self, event, mod_id):
+        url = mod_repo_url(mod_id)
+        if not url:
+            return
+        menu = tk.Menu(self, tearoff=0, bg=SURF, fg=PARCH, activebackground=AMBERDIM, activeforeground=PARCH)
+        menu.add_command(label="Open Source Repo", command=lambda: webbrowser.open(url))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     def _toggle_details(self, mod_id):
         w = self._card_widgets[mod_id]
@@ -1081,6 +1102,9 @@ class ModManagerWindow(ModListWindow):
                 menu.add_command(label="Change Version", command=lambda: ModVersionWindow(
                     self, r["summary"], versions, r["installed"], list_repos(load_cfg()),
                     on_install=lambda v: self._install(r["summary"], v)))
+        if managed and mod_repo_url(r["key"]):
+            menu.add_separator()
+            menu.add_command(label="Open Source Repo", command=lambda: webbrowser.open(mod_repo_url(r["key"])))
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:

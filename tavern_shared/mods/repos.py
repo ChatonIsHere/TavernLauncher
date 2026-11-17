@@ -65,6 +65,12 @@ def is_own_mod(mod_id, source_repo):
     return bool(owner) and mod_id.split(".", 1)[0].lower() == owner.lower()
 
 
+def mod_repo_url(mod_id):
+    """A mod's GitHub repository: ids are <github-user>.<github-repo>, as the TavernMods site links them."""
+    owner, _, repo = (mod_id or "").partition(".")
+    return f"https://github.com/{owner}/{repo}" if owner and repo else None
+
+
 def _source_display(url):
     """"Author/Repo" on a GitHub host, the full URL anywhere else."""
     if urlparse(_norm(url)).netloc.lower() in ("raw.githubusercontent.com", "github.com"):
