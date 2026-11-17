@@ -420,7 +420,7 @@ class CommunityModsWindow(ModListWindow):
 
         header = tk.Frame(list_wrap, bg=SURF)
         header.pack(fill="x")
-        tk.Frame(header, bg=SURF, width=self._ICON + 10, height=24).pack(side="left")
+        tk.Frame(header, bg=SURF, width=self._ICON + 30, height=24).pack(side="left")   # star and icon
         for text, width in zip(self._COL_LABELS, self._WIDTHS):
             cell = tk.Frame(header, bg=SURF, width=width, height=24)
             cell.pack(side="left", fill="y"); cell.pack_propagate(False)
@@ -518,8 +518,11 @@ class CommunityModsWindow(ModListWindow):
         s = r["summary"]
         card = tk.Frame(self._cards_frame, bg=SURF,
                         highlightbackground=BORDER, highlightthickness=1)
+        # As on the TavernMods site: a source's own mods are starred, left of the icon.
+        tk.Label(card, text="★" if r["own"] else "", bg=SURF, fg=AMBER, width=2,
+                 font=("Segoe UI",10)).pack(side="left", anchor="n", padx=(4,0), pady=(10,0))
         icon_box = tk.Frame(card, bg=SURF, width=self._ICON, height=self._ICON)
-        icon_box.pack(side="left", anchor="n", padx=(8,2), pady=8)
+        icon_box.pack(side="left", anchor="n", padx=(0,2), pady=8)
         icon_box.pack_propagate(False)
         icon = tk.Label(icon_box, bg=SURF, bd=0)
         icon.pack(fill="both", expand=True)
@@ -537,12 +540,11 @@ class CommunityModsWindow(ModListWindow):
         status_lbl = tk.Label(cells[0], bg=SURF, font=("Segoe UI",9), anchor="w")
         status_lbl.pack(fill="both", padx=6)
         installed_var = tk.StringVar(value=r["installed"] or "-")
-        source = source_label(s.source_repo) + (" ★" if r["own"] else "")
         for cell, text, bold, color in ((cells[1], r["author"] or "-", False, PARCH),
                                         (cells[2], r["name"], True, PARCH),
                                         (cells[3], installed_var, False, PARCH),
                                         (cells[4], r["latest"], False, PARCH),
-                                        (cells[5], source, False, AMBER if r["own"] else PARCH)):
+                                        (cells[5], source_label(s.source_repo), False, PARCH)):
             opts = {"textvariable": text} if isinstance(text, tk.StringVar) else {"text": text}
             tk.Label(cell, **opts, bg=SURF, fg=color, anchor="w",
                      font=("Segoe UI",9,"bold") if bold else ("Segoe UI",9)
@@ -799,7 +801,7 @@ class ModManagerWindow(ModListWindow):
     manager didn't place."""
 
     _COLS   = ("status", "author", "mod", "installed", "latest", "managed", "source")
-    _WIDTHS = (86,       96,       204,   66,          62,       78,        126)
+    _WIDTHS = (86,       96,       204,   66,          62,       78,        108)
     _STATE_WORD = {
         "missing":  "Missing",
         "damaged":  "Damaged",
@@ -835,7 +837,7 @@ class ModManagerWindow(ModListWindow):
 
         table_wrap = tk.Frame(self, bg=BG)
         table_wrap.pack(fill="both", expand=True, padx=16)
-        self._tree = _mk_tree(table_wrap, self._COLS, self._WIDTHS, height=10, icon_width=30)
+        self._tree = _mk_tree(table_wrap, self._COLS, self._WIDTHS, height=10, icon_width=48)
         for tag, color in (("missing", PARCH), ("damaged", RED), ("current", GREEN),
                            ("outdated", AMBER), ("unknown", MUTED), ("needs", AMBER),
                            ("replaced", AMBER),
@@ -919,7 +921,7 @@ class ModManagerWindow(ModListWindow):
                 "installed": meta.get("version", "?"),
                 "latest": s.highest() if s else "-",
                 "managed": "Managed",
-                "source": (source_label(source) + (" ★" if own else "")) if source else "-",
+                "source": source_label(source) if source else "-",
                 "own": own, "summary": s, "state": "unknown",
                 "enabled": meta.get("enabled", True),
                 "targets": installed_targets(meta),
@@ -941,7 +943,9 @@ class ModManagerWindow(ModListWindow):
         order = lambda i: (self._rows[i]["kind"] != "managed", not self._rows[i].get("own"),
                            self._rows[i]["name"].lower())
         for row_id in sorted(self._rows, key=order):
-            self._tree.insert("", "end", iid=row_id, values=self._row_values(row_id),
+            # A source's own mods are starred, left of the icon, as in Get Mods and on the TavernMods site.
+            self._tree.insert("", "end", iid=row_id, text=" ★" if self._rows[row_id].get("own") else "",
+                              values=self._row_values(row_id),
                               tags=(self._row_tag(self._rows[row_id]),))
         if keep and self._tree.exists(keep):
             self._tree.selection_set(keep)
