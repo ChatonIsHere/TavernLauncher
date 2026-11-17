@@ -308,6 +308,13 @@ class RepoSourcesConfig(unittest.TestCase):
         self.assertTrue(mm.is_own_mod("someone.Thing", OTHER))
         self.assertFalse(mm.is_own_mod("someone.Thing", "https://example.com/someone/theirmods"))
 
+    def test_mod_repo_url_follows_the_id(self):
+        from tavern_shared.mods.repos import mod_repo_url
+        self.assertEqual(mod_repo_url("ChatonIsHere.Steady"), "https://github.com/ChatonIsHere/Steady")
+        self.assertEqual(mod_repo_url("CG-Nik.Custom.Recipes"), "https://github.com/CG-Nik/Custom.Recipes")
+        for bad in ("NoDot", ".Repo", "Owner.", "", None):
+            self.assertIsNone(mod_repo_url(bad), bad)
+
     def test_add_repo_stores_by_shorthand(self):
         cfg = {}
         mm.add_repo(cfg, OTHER)
