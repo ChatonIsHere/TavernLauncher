@@ -799,7 +799,7 @@ class ModManagerWindow(ModListWindow):
     manager didn't place."""
 
     _COLS   = ("status", "author", "mod", "installed", "latest", "managed", "source")
-    _WIDTHS = (86,       96,       220,   66,          62,       78,        110)
+    _WIDTHS = (86,       96,       204,   66,          62,       78,        126)
     _STATE_WORD = {
         "missing":  "Missing",
         "damaged":  "Damaged",
@@ -911,6 +911,7 @@ class ModManagerWindow(ModListWindow):
             s = summaries.get(mod_id)
             # A mod no source lists any more (a replaced one) is named from its record.
             source = s.source_repo if s else meta.get("source_repo")
+            own = bool(source) and is_own_mod(mod_id, source)
             rows[f"m:{mod_id}"] = {
                 "kind": "managed", "key": mod_id,
                 "name": s.name if s else meta.get("name") or mod_id,
@@ -918,8 +919,8 @@ class ModManagerWindow(ModListWindow):
                 "installed": meta.get("version", "?"),
                 "latest": s.highest() if s else "-",
                 "managed": "Managed",
-                "source": source_label(source) if source else "-",
-                "summary": s, "state": "unknown",
+                "source": (source_label(source) + (" ★" if own else "")) if source else "-",
+                "own": own, "summary": s, "state": "unknown",
                 "enabled": meta.get("enabled", True),
                 "targets": installed_targets(meta),
                 "missing": self._missing_for(mod_id),
@@ -936,7 +937,10 @@ class ModManagerWindow(ModListWindow):
 
         keep = self._selected_id()
         self._tree.delete(*self._tree.get_children())
-        for row_id in sorted(self._rows, key=lambda i: self._rows[i]["name"].lower()):
+        # As in Get Mods: a source's own mods first, then by name; untracked files last.
+        order = lambda i: (self._rows[i]["kind"] != "managed", not self._rows[i].get("own"),
+                           self._rows[i]["name"].lower())
+        for row_id in sorted(self._rows, key=order):
             self._tree.insert("", "end", iid=row_id, values=self._row_values(row_id),
                               tags=(self._row_tag(self._rows[row_id]),))
         if keep and self._tree.exists(keep):
