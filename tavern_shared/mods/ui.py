@@ -15,7 +15,7 @@ from tavern_shared.theme import (
     AMBER, AMBERDIM, BG, BORDER, CYAN, GREEN, MUTED, PARCH, RED, SURF, _btn,
     _mk_tree, _scroll_stack, _window_header,
 )
-from tavern_shared.window_chrome import _enable_dark_titlebar
+from tavern_shared.window_chrome import _finish_dark_window, _start_hidden
 
 from tavern_shared.mods.base import ModManagerError, _parse_version, load_cfg
 from tavern_shared.mods.cache import cached_icon, clear_mod_cache, ensure_mod_libraries
@@ -77,6 +77,12 @@ def _draw_star(img, centre, radius, colour):
     ImageDraw.Draw(img).polygon(points, fill=colour)
 
 
+def _wrapping(label):
+    """Wraps a label's text at whatever width it's given, so it follows the window."""
+    label.bind("<Configure>", lambda e: label.config(wraplength=max(e.width - 4, 80)))
+    return label
+
+
 def _bind_tree(widget, sequence, handler):
     """Binds a widget and everything inside it."""
     widget.bind(sequence, handler)
@@ -93,6 +99,7 @@ class _Dialog(tk.Toplevel):
 
     def __init__(self, parent, title, size, minsize=None):
         super().__init__(parent)
+        _start_hidden(self)     # shown once built, so it never opens as a blank white window
         self.title(title)
         self.configure(bg=BG)
         self.geometry(size)
@@ -102,8 +109,8 @@ class _Dialog(tk.Toplevel):
             self.resizable(False, False)
         self._build()
         self.protocol("WM_DELETE_WINDOW", self.destroy)
-        _enable_dark_titlebar(self)
         self.transient(parent)
+        _finish_dark_window(self)
 
 
 class ModListWindow(_Dialog):
@@ -539,23 +546,21 @@ class CommunityModsWindow(ModListWindow):
         s = r["summary"]
         card = tk.Frame(self._cards_frame, bg=SURF,
                         highlightbackground=BORDER, highlightthickness=1)
+        # One row of star, icon and columns; the description and details below span the card.
+        top = tk.Frame(card, bg=SURF)
+        top.pack(fill="x", pady=(6,0))
         # As on the TavernMods site: a source's own mods are starred, left of the icon.
-        tk.Label(card, text="★" if r["own"] else "", bg=SURF, fg=AMBER, width=2,
-                 font=("Segoe UI",10)).pack(side="left", anchor="n", padx=(4,0), pady=(10,0))
-        icon_box = tk.Frame(card, bg=SURF, width=self._ICON, height=self._ICON)
-        icon_box.pack(side="left", anchor="n", padx=(0,2), pady=8)
+        tk.Label(top, text="★" if r["own"] else "", bg=SURF, fg=AMBER, width=2,
+                 font=("Segoe UI",10)).pack(side="left", padx=(4,0))
+        icon_box = tk.Frame(top, bg=SURF, width=self._ICON, height=self._ICON)
+        icon_box.pack(side="left", padx=(0,2))
         icon_box.pack_propagate(False)
         icon = tk.Label(icon_box, bg=SURF, bd=0)
         icon.pack(fill="both", expand=True)
-        body = tk.Frame(card, bg=SURF)
-        body.pack(side="left", fill="both", expand=True)
-
-        top = tk.Frame(body, bg=SURF)
-        top.pack(fill="x", pady=(8,0))
         cells = []
         for width in self._WIDTHS:
             cell = tk.Frame(top, bg=SURF, width=width, height=26)
-            cell.pack(side="left", fill="y"); cell.pack_propagate(False)
+            cell.pack(side="left"); cell.pack_propagate(False)     # centred on the icon
             cells.append(cell)
 
         status_lbl = tk.Label(cells[0], bg=SURF, font=("Segoe UI",9), anchor="w")
@@ -575,40 +580,39 @@ class CommunityModsWindow(ModListWindow):
                    style="primary", font=("Segoe UI",9), pady=4, padx=10, width=11)
         btn.pack(side="right", padx=(6,10))
 
-        desc_row = tk.Frame(body, bg=SURF)
+        desc_row = tk.Frame(card, bg=SURF)
         desc_row.pack(fill="x", padx=10, pady=(4,8))
         toggle = tk.Button(desc_row, text="Details ▸", bg=SURF, fg=MUTED,
                            activebackground=SURF, activeforeground=AMBER,
                            relief="flat", bd=0, cursor="hand2", font=("Segoe UI",8),
                            command=lambda: self._toggle_details(mod_id))
         toggle.pack(side="right", anchor="n")
-        tk.Label(desc_row, text=r["description"] or "No description provided.",
-                 bg=SURF, fg=PARCH, font=("Segoe UI",8), wraplength=640,
-                 justify="left", anchor="w"
+        _wrapping(tk.Label(desc_row, text=r["description"] or "No description provided.",
+                           bg=SURF, fg=PARCH, font=("Segoe UI",8), justify="left", anchor="w")
         ).pack(side="left", fill="x", expand=True)
 
-        needs_row = tk.Frame(body, bg=SURF)
+        needs_row = tk.Frame(card, bg=SURF)
         needs_var = tk.StringVar()
-        tk.Label(needs_row, textvariable=needs_var, bg=SURF, fg=AMBER, font=("Segoe UI",8),
-                 wraplength=600, justify="left", anchor="w"
+        _wrapping(tk.Label(needs_row, textvariable=needs_var, bg=SURF, fg=AMBER, font=("Segoe UI",8),
+                           justify="left", anchor="w")
         ).pack(side="left", fill="x", expand=True)
         deps_btn = _btn(needs_row, "Install deps", lambda: self._install_deps(mod_id, r["name"]),
                         font=("Segoe UI",8), pady=2, padx=8)
         deps_btn.pack(side="right")
 
-        details = tk.Frame(body, bg=SURF)
+        details = tk.Frame(card, bg=SURF)
         parity_text = "Exact version required" if s.parity_required else "Any compatible version"
         tag_text = f"{target_label(s.targets)}  ·  {parity_text}"
         if s.scenes:
             tag_text += "  ·  " + ", ".join(x.capitalize() for x in s.scenes) + " scene" \
                 + ("s" if len(s.scenes) > 1 else "") + " only"
-        tk.Label(details, text=tag_text, bg=SURF, fg=CYAN,
-                 font=("Segoe UI",8), anchor="w"
+        _wrapping(tk.Label(details, text=tag_text, bg=SURF, fg=CYAN,
+                           font=("Segoe UI",8), justify="left", anchor="w")
         ).pack(fill="x", pady=(0,2))
 
         requires_var = tk.StringVar(value="Loading dependencies…")
-        tk.Label(details, textvariable=requires_var, bg=SURF, fg=PARCH,
-                 font=("Segoe UI",8,"italic"), wraplength=720, justify="left", anchor="w"
+        _wrapping(tk.Label(details, textvariable=requires_var, bg=SURF, fg=PARCH,
+                           font=("Segoe UI",8,"italic"), justify="left", anchor="w")
         ).pack(fill="x")
 
         _bind_tree(card, "<Button-3>", lambda e: self._card_menu(e, mod_id))
