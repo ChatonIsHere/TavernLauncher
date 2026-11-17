@@ -1076,6 +1076,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         def abort(msg=None, tag="err"):
             if msg:
                 self._print(msg, tag)
+            self._rejoining = False   # so a later join asks again
             self._set_sync_busy(False)
 
         def verify(server_mods, win=None):
@@ -1150,9 +1151,10 @@ class ClientLauncher(LauncherCommon, tk.Tk):
             if joining and not (changed or plan.to_deactivate or plan.pin_conflicts):
                 verify(server_mods)
                 return
-            # Quick join: no window, unless a pin needs a choice.
-            if joining and quick_join_on() and not plan.pin_conflicts:
-                self._print("Quick join: matching this server's mods.", "warn")
+            # Quick join, or the rejoin the player agreed to after a refusal (which lists only the mods
+            # that fit in the game's message): no window, unless a pin needs a choice.
+            if joining and (quick_join_on() or self._rejoining) and not plan.pin_conflicts:
+                self._print("Matching this server's mods.", "warn")
                 run_bg(self, lambda: mods.render_active_set(
                            game_dir, plan, lambda m: self.after(0, lambda: self._print(m, "dim")),
                            lambda i, s: None),
