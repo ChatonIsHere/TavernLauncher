@@ -554,7 +554,7 @@ class Icons(_TempDataDirFixture, unittest.TestCase):
                          and os.listdir(os.path.join(self.data_dir, "mod_cache", "_icons")))
 
     def _ns(self, served):
-        ns = types.SimpleNamespace(_icon_photos={})
+        ns = types.SimpleNamespace(_icon_photos={}, _icon_images={})
         for name in ("_load_icons", "_icon_ready"):
             setattr(ns, name, types.MethodType(getattr(ui.ModListWindow, name), ns))
         stub(self, ui, "run_bg", lambda w, fn, on_ok=None, on_err=None: fn())
@@ -581,6 +581,21 @@ class Icons(_TempDataDirFixture, unittest.TestCase):
         ns._load_icons({"a.m": self.URL}, 36, lambda key, photo: shown.append((key, photo)))
         self.assertEqual(len(shown), 3)
         self.assertEqual(fetched.count(self.URL), 2)    # a.m and b.m in the first call; then from memory
+
+    def test_the_star_and_the_icon_keep_their_own_slots(self):
+        """Mod Manager's first column: the star at the left, the icon after it, whichever is missing."""
+        from PIL import Image
+        stub(self, ui, "_PILImageTk", types.SimpleNamespace(PhotoImage=lambda img, master: img))
+        ns = types.SimpleNamespace(_STAR_SLOT=18, _ICON_SLOT=20, _row_photos={},
+                                   _rows={"own": {"own": True}, "other": {"own": False}})
+        ns._row_image = types.MethodType(ui.ModManagerWindow._row_image, ns)
+        icon = Image.new("RGBA", (20, 20), (0, 0, 255, 255))
+        star_only, icon_only = ns._row_image("own"), ns._row_image("other", icon)
+        self.assertEqual(star_only.size, icon_only.size)
+        self.assertGreater(star_only.getpixel((8, 10))[3], 0)            # the star, in its slot
+        self.assertEqual(icon_only.getpixel((8, 10))[3], 0)              # no star: that slot stays empty
+        self.assertEqual(icon_only.getpixel((18 + 10, 10)), (0, 0, 255, 255))   # the icon, in its slot
+        self.assertIsNone(ns._row_image("other"))
 
     def test_without_pillow_there_are_no_icons(self):
         ns, fetched = self._ns({self.URL: self._png()})
