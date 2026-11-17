@@ -1,6 +1,7 @@
 """The Mod Manager window and the Get Mods, Mod Sources and Change
 Version windows it opens, shared by both launchers."""
 import io
+import math
 import json
 import os
 import tkinter as tk
@@ -65,6 +66,15 @@ def icon_url(icons, px):
     return icons[min(fits) if fits else max(icons)]
 
 
+def _draw_star(img, centre, radius, colour):
+    """A five-point star on a PIL image."""
+    from PIL import ImageDraw
+    cx, cy = centre
+    points = [(cx + (radius if i % 2 == 0 else radius * 0.45) * math.sin(math.pi * i / 5),
+               cy - (radius if i % 2 == 0 else radius * 0.45) * math.cos(math.pi * i / 5)) for i in range(10)]
+    ImageDraw.Draw(img).polygon(points, fill=colour)
+
+
 def source_label(source_repo):
     return "Modding Tavern" if _is_default(source_repo) else _source_display(source_repo)
 
@@ -104,6 +114,7 @@ class ModListWindow(_Dialog):
         self._rows = {}
         self._busy = False
         self._icon_photos = {}      # url -> PhotoImage, kept so Tk doesn't drop it
+        self._icon_images = {}      # url -> the PIL image, for views that draw it into another
         super().__init__(parent, title, size, minsize)
         self._load(force=False)
 
@@ -138,6 +149,7 @@ class ModListWindow(_Dialog):
                 img = img.convert("RGBA").resize((px, px), _PILImage.LANCZOS)
             except Exception:
                 return
+            self._icon_images[url] = img
             self._icon_photos[url] = _PILImageTk.PhotoImage(img, master=self)
         show(key, self._icon_photos[url])
 
@@ -801,7 +813,7 @@ class ModManagerWindow(ModListWindow):
     manager didn't place."""
 
     _COLS   = ("status", "author", "mod", "installed", "latest", "managed", "source")
-    _WIDTHS = (86,       96,       204,   66,          62,       78,        108)
+    _WIDTHS = (86,       96,       196,   66,          62,       78,        106)
     _STATE_WORD = {
         "missing":  "Missing",
         "damaged":  "Damaged",
@@ -816,6 +828,7 @@ class ModManagerWindow(ModListWindow):
                  is_game_running=None, server_scene=None):
         self._community_win = None
         self._pinned_ids = set()    # client only: pins are a join-time concept
+        self._row_photos = {}
         super().__init__(parent, "Mod Manager", "800x480", (680, 380), game_dir,
                          target, on_change, is_game_running, server_scene)
 
@@ -837,7 +850,7 @@ class ModManagerWindow(ModListWindow):
 
         table_wrap = tk.Frame(self, bg=BG)
         table_wrap.pack(fill="both", expand=True, padx=16)
-        self._tree = _mk_tree(table_wrap, self._COLS, self._WIDTHS, height=10, icon_width=48)
+        self._tree = _mk_tree(table_wrap, self._COLS, self._WIDTHS, height=10, icon_width=58)
         for tag, color in (("missing", PARCH), ("damaged", RED), ("current", GREEN),
                            ("outdated", AMBER), ("unknown", MUTED), ("needs", AMBER),
                            ("replaced", AMBER),
@@ -943,8 +956,7 @@ class ModManagerWindow(ModListWindow):
         order = lambda i: (self._rows[i]["kind"] != "managed", not self._rows[i].get("own"),
                            self._rows[i]["name"].lower())
         for row_id in sorted(self._rows, key=order):
-            # A source's own mods are starred, left of the icon, as in Get Mods and on the TavernMods site.
-            self._tree.insert("", "end", iid=row_id, text=" ★" if self._rows[row_id].get("own") else "",
+            self._tree.insert("", "end", iid=row_id, image=self._row_image(row_id) or "",
                               values=self._row_values(row_id),
                               tags=(self._row_tag(self._rows[row_id]),))
         if keep and self._tree.exists(keep):
@@ -953,9 +965,28 @@ class ModManagerWindow(ModListWindow):
         self._load_icons({i: icon_url(r["summary"].icons, 20) for i, r in self._rows.items() if r["summary"]},
                          20, self._show_row_icon)
 
-    def _show_row_icon(self, row_id, photo):
-        if self._tree.exists(row_id):
-            self._tree.item(row_id, image=photo)
+    def _show_row_icon(self, row_id, _photo):
+        r = self._rows.get(row_id)
+        if r and r["summary"] and self._tree.exists(row_id):
+            icon = self._icon_images.get(icon_url(r["summary"].icons, 20))
+            self._tree.item(row_id, image=self._row_image(row_id, icon) or "")
+
+    # The first column holds two slots, the star and then the icon, drawn as one image so neither moves
+    # when the other is missing. A source's own mods are starred, as in Get Mods and on the TavernMods site.
+    _STAR_SLOT, _ICON_SLOT = 18, 20
+
+    def _row_image(self, row_id, icon=None):
+        own = self._rows[row_id].get("own")
+        if _PILImage is None or not (own or icon):
+            return None
+        img = _PILImage.new("RGBA", (self._STAR_SLOT + self._ICON_SLOT, self._ICON_SLOT))
+        if own:
+            _draw_star(img, (8, 10), 7, AMBER)
+        if icon is not None:
+            img.alpha_composite(icon, (self._STAR_SLOT, 0))
+        photo = _PILImageTk.PhotoImage(img, master=self)
+        self._row_photos[row_id] = photo     # kept so Tk doesn't drop it
+        return photo
 
     def _row_tag(self, r):
         if r.get("enabled") is False:
