@@ -813,7 +813,7 @@ class ModManagerWindow(ModListWindow):
     manager didn't place."""
 
     _COLS   = ("status", "author", "mod", "installed", "latest", "managed", "source")
-    _WIDTHS = (86,       96,       180,   66,          62,       94,        106)
+    _WIDTHS = (86,       96,       188,   66,          62,       86,        106)
     _STATE_WORD = {
         "missing":  "Missing",
         "damaged":  "Damaged",
@@ -1008,7 +1008,8 @@ class ModManagerWindow(ModListWindow):
             status = "Disabled"
         else:
             status = self._STATE_WORD.get(self._row_tag(r), "")
-        managed = "Kept enabled" if r["kind"] == "managed" and r["key"] in self._pinned_ids else r["managed"]
+        # 📌: kept enabled (right-click > Keep Enabled).
+        managed = r["managed"] + (" 📌" if r["kind"] == "managed" and r["key"] in self._pinned_ids else "")
         return (status, r["author"], r["name"],
                 r["installed"], r["latest"], managed, r["source"])
 
