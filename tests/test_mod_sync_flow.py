@@ -60,6 +60,7 @@ class FakeWindow:
 def launcher(**attrs):
     ns = types.SimpleNamespace(**attrs)
     ns.after = lambda _delay, fn: fn()
+    ns._rejoining = False
     ns.printed = []
     ns._print = lambda msg, tag="": ns.printed.append((msg, tag))
     return ns
@@ -339,7 +340,7 @@ class QuickJoinSkipsTheWindow(unittest.TestCase):
     """With Quick join on, a join applies its plan without the comparison
     window, unless a pin needs a choice."""
 
-    def _join(self, plan, quick=True):
+    def _join(self, plan, quick=True, rejoining=False):
         server_mods = [{"id": "a.mod", "version": "1.0.0", "targets": ["client_windows", "server"],
                         "parity_required": True, "target_sha256": {}}]
         opened, rendered, launched = [], [], []
@@ -349,6 +350,8 @@ class QuickJoinSkipsTheWindow(unittest.TestCase):
             _build_mod_plan=lambda game_dir, host, scene=None, mods_hash=None: ("plan", (plan, server_mods)),
             _open_mod_diff=lambda *args, **kwargs: opened.append(kwargs))
         bind(ns, "_reconcile_mods", "_post_render_check", "_verify_mod_parity", "_build_divergence")
+        ns._rejoining = rejoining
+        self.ns = ns
         fake_mods = types.SimpleNamespace(
             parity_required=parity_required, has_target=has_target,
             list_installed_mods=lambda game_dir: [{"id": "a.mod", "version": "1.0.0", "enabled": True,
@@ -369,6 +372,18 @@ class QuickJoinSkipsTheWindow(unittest.TestCase):
         plan.pin_conflicts = [("a.mod", "0.9.0", "1.0.0")]
         opened, rendered, launched = self._join(plan)
         self.assertEqual((len(opened), rendered, launched), (1, [], []))
+
+    def test_the_agreed_rejoin_after_a_refusal_skips_it_too(self):
+        """The refusal lists only the mods that fit in the game's message; this installs the rest."""
+        plan = make_plan(entries=[entry("a.mod", reason="required")])
+        opened, rendered, launched = self._join(plan, quick=False, rejoining=True)
+        self.assertEqual((opened, rendered, len(launched)), ([], [plan], 1))
+
+    def test_a_join_that_fails_forgets_the_rejoin(self):
+        plan = make_plan(entries=[entry("a.mod", reason="required")])
+        with mock.patch.object(lw.ClientLauncher, "_build_divergence", lambda *a: []),              mock.patch.object(lw, "_enabled_mods", lambda d: []):
+            self._join(plan, quick=False, rejoining=True)
+        self.assertFalse(self.ns._rejoining)
 
     def test_without_it_the_window_opens(self):
         opened, rendered, launched = self._join(make_plan(entries=[entry("a.mod", reason="required")]), quick=False)
