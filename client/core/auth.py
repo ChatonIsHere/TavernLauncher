@@ -26,6 +26,14 @@ def auth_address(host):
 
 
 def authenticate(host, username, token, password=None, timeout=8):
+    """(user_id, error, scene_arg): login() without the ports, the shape
+    Rover and older callers unpack."""
+    return login(host, username, token, password, timeout)[:3]
+
+
+def login(host, username, token, password=None, timeout=8):
+    """(user_id, error, scene_arg, ports); ports is ports_of() the reply, or
+    None when the join was refused."""
     payload = {"username": username, "token": token}
     if password is not None:
         payload["password"] = hashlib.sha256(password.encode()).hexdigest()
