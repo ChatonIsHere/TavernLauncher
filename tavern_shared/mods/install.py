@@ -21,7 +21,9 @@ from tavern_shared.mods.layout import (
 from tavern_shared.mods.manifest import (
     SUPPORTED_MANIFEST_MAJOR, _artifacts_from_list, parity_required,
 )
-from tavern_shared.mods.repos import replacement_for, replacement_of_unlisted
+from tavern_shared.mods.repos import (
+    clashes, replacement_for, replacement_of_unlisted, withdrawal_for,
+)
 from tavern_shared.mods.resolve import _fetch_manifest, resolve_dependencies
 
 
@@ -471,6 +473,40 @@ def replaced_by(index, rec):
     """The Replacement that retires an installed record: only the one its own
     source declared, so another source can't take it over."""
     return replacement_for(index, rec.get("id"), rec.get("source_repo") or "")
+
+
+def withdrawn_from(index, rec):
+    """The Withdrawal of an installed record's version, from its own source."""
+    return withdrawal_for(index, rec.get("id"), rec.get("version"), rec.get("source_repo") or "")
+
+
+def enabled_clashes(recs, index, target):
+    """{mod id: [(Incompatibility, other id)]} among the enabled `recs` that
+    have `target` installed."""
+    versions = {r["id"]: r.get("version", "") for r in recs
+                if r.get("enabled", True) and has_target(r, target)}
+    out = {}
+    for inc in clashes(index, versions):
+        for mod_id in inc.below:
+            out.setdefault(mod_id, []).append((inc, inc.other(mod_id)))
+    return out
+
+
+def install_clashes(game_dir, mods, index, target):
+    """Before installing `mods` (manifests) for `target`: raises if two of
+    them don't work together, else [(Incompatibility, enabled installed id)]
+    they would leave enabled beside a mod they don't work with."""
+    incoming = {m.id: m.version for m in mods}
+    inside = clashes(index, incoming)
+    if inside:
+        a, b = sorted(inside[0].below)
+        raise ModManagerError(f"{a} and {b} would both be installed, and they don't work "
+                              f"together: {inside[0].note}")
+    others = {r["id"]: r.get("version", "") for r in list_installed_mods(game_dir)
+              if r["id"] not in incoming and r.get("enabled", True) and has_target(r, target)}
+    return [(inc, next(i for i in inc.below if i in others))
+            for inc in clashes(index, {**others, **incoming})
+            if any(i in incoming for i in inc.below)]
 
 
 def retire_replaced(game_dir, index, on_progress):

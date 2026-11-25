@@ -21,9 +21,10 @@ from tavern_shared.mods.base import ModManagerError, _parse_version, load_cfg
 from tavern_shared.mods.cache import cached_icon, clear_mod_cache, ensure_mod_libraries
 from tavern_shared.mods.install import (
     _highest_by_id, _is_pre_v2, _verify_memo, disable_mod, disable_untracked_dll, enable_mod,
-    enable_untracked_dll, has_target, install_dependencies, install_mod_set, installed_targets,
-    list_installed_mods, list_mods, list_untracked_mods, missing_dependencies, mod_status,
-    plan_mod_install, replaced_by, retire_replaced, uninstall_mod,
+    enable_untracked_dll, enabled_clashes, has_target, install_clashes, install_dependencies,
+    install_mod_set, installed_targets, list_installed_mods, list_mods, list_untracked_mods,
+    missing_dependencies, mod_status, plan_mod_install, replaced_by, retire_replaced, uninstall_mod,
+    withdrawn_from,
 )
 from tavern_shared.mods.manifest import runs_in_scene
 from tavern_shared.mods.modlist import (
@@ -246,6 +247,19 @@ class ModListWindow(_Dialog):
                 return
             if choice == "alone":
                 mods, skipped = [root], needed
+        try:
+            clash = install_clashes(self._game_dir, mods, self._index, self._target)
+        except ModManagerError as e:
+            self._status.set(f"Install failed: {e}")
+            return
+        off = sorted({other for _inc, other in clash})
+        if clash and not messagebox.askyesno("Doesn't work with an installed mod",
+                "\n".join(f"{self._name_by(next(i for i in inc.below if i != other))} doesn't work "
+                          f"with {self._name_by(other)}: {inc.note}" for inc, other in clash)
+                + f"\n\nInstall it and disable {', '.join(self._mod_name(o) for o in off)}?",
+                parent=self):
+            self._status.set("Install cancelled.")
+            return
         if not confirm_while_game_running(self, self._is_game_running,
                                           f"Installing {root.name}"):
             return
@@ -254,9 +268,13 @@ class ModListWindow(_Dialog):
         done = f"{label} installed."
         if skipped:
             done += f" It still needs {len(skipped)} other mod(s)."
+        if off:
+            done += f" Disabled {', '.join(self._mod_name(o) for o in off)}, which it doesn't work with."
         def install():
             progress = lambda m: post(self, self._status.set, m)
             install_mod_set(game_dir, mods, target, progress)
+            for other in off:
+                disable_mod(game_dir, other)
             return self._retire(progress)
         run_bg(self, install,
                on_ok=lambda retired: self._finish(done + self._retired(*retired)),
@@ -847,6 +865,8 @@ class ModManagerWindow(ModListWindow):
         "unknown":  "Installed",
         "needs":    "Needs mods",
         "replaced": "Replaced",
+        "withdrawn": "Withdrawn",
+        "clash":    "Conflict",
     }
 
     def __init__(self, parent, game_dir, target="client_windows", on_change=None,
@@ -878,7 +898,7 @@ class ModManagerWindow(ModListWindow):
         self._tree = _mk_tree(table_wrap, self._COLS, self._WIDTHS, height=10, icon_width=58)
         for tag, color in (("missing", PARCH), ("damaged", RED), ("current", GREEN),
                            ("outdated", AMBER), ("unknown", MUTED), ("needs", AMBER),
-                           ("replaced", AMBER),
+                           ("replaced", AMBER), ("withdrawn", RED), ("clash", AMBER),
                            ("untracked", PARCH), ("disabled", MUTED)):
             self._tree.tag_configure(tag, foreground=color)
         self._tree.bind("<<TreeviewSelect>>", lambda e: self._on_select())
@@ -943,6 +963,7 @@ class ModManagerWindow(ModListWindow):
         installed, untracked = on_disk
         self._installed_recs = installed
         summaries = _highest_by_id(self._index)
+        clashing = enabled_clashes(installed, self._index, self._target)
         rows = {}
         for meta in installed:
             mod_id = meta.get("id")
@@ -965,6 +986,8 @@ class ModManagerWindow(ModListWindow):
                 "targets": installed_targets(meta),
                 "missing": self._missing_for(mod_id),
                 "replaced": replaced_by(self._index, meta),
+                "withdrawn": withdrawn_from(self._index, meta),
+                "clashes": clashing.get(mod_id, []),
             }
         for u in untracked:
             rows[f"u:{u['kind']}:{u['name']}"] = {
@@ -1019,8 +1042,12 @@ class ModManagerWindow(ModListWindow):
         if r["kind"] != "managed":
             return "untracked"
         if r["state"] != "damaged":
+            if r["withdrawn"]:
+                return "withdrawn"
             if r["replaced"]:
                 return "replaced"
+            if r["clashes"]:
+                return "clash"
             if r["missing"]:
                 return "needs"
         return r["state"] or "current"
@@ -1055,11 +1082,31 @@ class ModManagerWindow(ModListWindow):
         sel = self._selected_id()
         return self._rows.get(sel) if sel else None
 
+    def _fix_label(self, r):
+        """What the fix button does for row r, or None: the first of an update
+        away from a withdrawn version, a switch to a replacement, disabling a mod
+        it clashes with, installing its dependencies."""
+        if not r or r.get("enabled") is False:
+            return None
+        if r.get("withdrawn"):
+            better = self._unwithdrawn(r)
+            return f"Update to {better.highest()}" if better else None
+        if r.get("replaced"):
+            return f"Switch to {self._name_by(r['replaced'].by)}"
+        if r.get("clashes"):
+            return f"Disable {self._mod_name(r['clashes'][0][1])}"
+        return "Install Dependencies" if r.get("missing") else None
+
+    def _unwithdrawn(self, r):
+        """The summary to update a withdrawn install to: its major's, else the
+        highest. Withdrawn versions are never listed, so either will do."""
+        same = [s for s in self._index if s.id == r["key"] and str(s.major) == r["installed"].split(".")[0]]
+        return same[0] if same else _highest_by_id(self._index).get(r["key"])
+
     def _sync_buttons(self):
         r = self._selected_row()
-        rep = r.get("replaced") if r else None
-        self._fix_btn.config(text=f"Switch to {self._name_by(rep.by)}" if rep
-                             else "Install Dependencies")
+        fix = self._fix_label(r)
+        self._fix_btn.config(text=fix or "Install Dependencies")
         if self._busy or r is None:
             self._uninstall_btn.config(state="disabled")
             self._toggle_btn.config(state="disabled")
@@ -1067,7 +1114,7 @@ class ModManagerWindow(ModListWindow):
             return
         self._uninstall_btn.config(state="normal" if r["kind"] == "managed" else "disabled")
         self._toggle_btn.config(text="Enable" if not r["enabled"] else "Disable", state="normal")
-        self._fix_btn.config(state="normal" if rep or r.get("missing") else "disabled")
+        self._fix_btn.config(state="normal" if fix else "disabled")
 
     def _on_right_click(self, event):
         row = self._tree.identify_row(event.y)
@@ -1086,11 +1133,8 @@ class ModManagerWindow(ModListWindow):
                          state="normal" if managed else "disabled")
         menu.add_command(label="Enable" if not r["enabled"] else "Disable",
                          command=self._on_toggle)
-        if r.get("replaced"):
-            menu.add_command(label=f"Switch to {self._name_by(r['replaced'].by)}",
-                             command=self._on_fix)
-        elif r.get("missing"):
-            menu.add_command(label="Install Dependencies", command=self._on_fix)
+        if fix := self._fix_label(r):
+            menu.add_command(label=fix, command=self._on_fix)
         if managed and self._target == "client_windows":
             menu.add_separator()
             # Kept on self: a BooleanVar with no Python reference can be
@@ -1145,20 +1189,37 @@ class ModManagerWindow(ModListWindow):
         r = self._selected_row()
         if not r or self._busy:
             return
-        if r.get("replaced"):
+        if r.get("withdrawn"):
+            better = self._unwithdrawn(r)
+            self._status.set(f"{r['name']} {r['installed']} has been withdrawn: {r['withdrawn'].reason}"
+                             + (f" Update to {better.highest()}." if better
+                                else " There's no other version, so disable or uninstall it."))
+        elif r.get("replaced"):
             rep = r["replaced"]
             self._status.set(f"{self._name_by(r['key'])} has been replaced by "
                              f"{self._name_by(rep.by)}."
                              + (f" {rep.note}" if rep.note else ""))
+        elif r.get("clashes"):
+            self._status.set(" ".join(f"{r['name']} doesn't work with {self._mod_name(other)}: {inc.note}"
+                                      for inc, other in r["clashes"]))
         elif r.get("missing"):
             self._status.set(f"{r['name']} needs {self._missing_text(r['missing'])}.")
+        elif r.get("state") == "outdated" and r["summary"] and r["summary"].changelog:
+            self._status.set(f"What's new in {r['summary'].highest()}: {r['summary'].changelog}")
 
     def _on_fix(self):
         r = self._selected_row()
-        if not r or self._busy:
+        if not r or self._busy or not self._fix_label(r):
             return
-        if r.get("replaced"):
+        if r.get("withdrawn"):
+            self._install(self._unwithdrawn(r))
+        elif r.get("replaced"):
             self._switch(r)
+        elif r.get("clashes"):
+            other = self._rows.get(f"m:{r['clashes'][0][1]}")
+            if other:
+                self._tree.selection_set(f"m:{other['key']}")
+                self._on_toggle()
         elif r.get("missing"):
             self._install_deps(r["key"], r["name"])
 
@@ -1187,6 +1248,18 @@ class ModManagerWindow(ModListWindow):
         if not r:
             return
         disabling = r["enabled"] is True
+        off = []
+        if not disabling and r["kind"] == "managed":
+            recs = [{**rec, "enabled": True} if rec.get("id") == r["key"] else rec
+                    for rec in self._installed_recs]
+            clash = enabled_clashes(recs, self._index, self._target).get(r["key"], [])
+            off = sorted({other for _inc, other in clash})
+            if clash and not messagebox.askyesno("Doesn't work with an enabled mod",
+                    "\n".join(f"{r['name']} doesn't work with {self._mod_name(other)}: {inc.note}"
+                              for inc, other in clash)
+                    + f"\n\nEnable it and disable {', '.join(self._mod_name(o) for o in off)}?",
+                    parent=self):
+                return
         # A disable is a rename that survives a running game; an enable may
         # write libraries back into UserLibs/.
         if not disabling and not confirm_while_game_running(
@@ -1206,8 +1279,11 @@ class ModManagerWindow(ModListWindow):
             else:
                 ok = (disable_untracked_dll(game_dir, key) if disabling
                       else enable_untracked_dll(game_dir, key))
+            for other in off if ok else ():
+                disable_mod(game_dir, other)
             verb = "disabled" if disabling else "enabled"
-            return f"{name} {verb}." if ok else f"Couldn't {verb[:-1]} {name}."
+            return (f"{name} {verb}." + "".join(f" Disabled {o}." for o in off)) if ok \
+                else f"Couldn't {verb[:-1]} {name}."
         run_bg(self, toggle, on_ok=self._finish,
                on_err=lambda e: self._finish(f"Toggle failed: {e}"))
 
@@ -1296,6 +1372,12 @@ class ModManagerWindow(ModListWindow):
         if plan.replaced:
             lines.append("Replaced since this modlist was made, so the new mod is used:")
             lines += [f"  • {old_id} → {new_id}" for old_id, new_id in plan.replaced]
+        if plan.withdrawn:
+            lines.append("Withdrawn since this modlist was made, so the latest version is used:")
+            lines += [f"  • {mid} {v}: {why}" for mid, v, why in plan.withdrawn]
+        if plan.clashes:
+            lines.append("Don't work together, but are both in this modlist:")
+            lines += [f"  • {' and '.join(sorted(inc.below))}: {inc.note}" for inc in plan.clashes]
         if to_disable:
             lines.append("Will disable (not in this modlist):")
             lines += [f"  • {mid}" for mid in to_disable]

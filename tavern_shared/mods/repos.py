@@ -145,12 +145,36 @@ class Replacement:
     source_repo: str
 
 
-class ModIndex(list):
-    """fetch_indexes' ModSummaries, with every source's replacements."""
+@dataclass
+class Incompatibility:
+    """One entry of a source's `incompatible`: two mods that don't work
+    together while each is below its `below` (None: at every version)."""
+    below: dict                     # {mod id: first version that works, or None}
+    note: str
+    source_repo: str
 
-    def __init__(self, summaries=(), replaced=()):
+    def other(self, mod_id):
+        return next(i for i in self.below if i != mod_id)
+
+
+@dataclass
+class Withdrawal:
+    """One entry of a source's `withdrawn`: a version nothing should install."""
+    mod_id: str
+    version: str
+    reason: str
+    source_repo: str
+
+
+class ModIndex(list):
+    """fetch_indexes' ModSummaries, with every source's replacements,
+    incompatible pairs and withdrawn versions."""
+
+    def __init__(self, summaries=(), replaced=(), incompatible=(), withdrawn=()):
         super().__init__(summaries)
         self.replaced = list(replaced)
+        self.incompatible = list(incompatible)
+        self.withdrawn = list(withdrawn)
 
 
 def replacement_for(index, mod_id, source_repo=None):
@@ -174,6 +198,61 @@ def replacement_of_unlisted(index, mod_id):
     return rep if rep and rep.by in listed else None
 
 
+def withdrawal_for(index, mod_id, version, source_repo=None):
+    """The Withdrawal of mod_id at version, whose word counting as for
+    replacement_for."""
+    ws = [w for w in getattr(index, "withdrawn", ()) if w.mod_id == mod_id and w.version == version]
+    if source_repo is not None:
+        return next((w for w in ws if _norm(w.source_repo) == _norm(source_repo)), None)
+    return next((w for w in ws if _is_default(w.source_repo)), ws[0] if ws else None)
+
+
+def _below(version, first_working):
+    try:
+        return first_working is None or _parse_version(version) < _parse_version(first_working)
+    except ModManagerError:
+        return True         # an unreadable installed version: assume the worst
+
+
+def clashes(index, versions):
+    """The Incompatibilities that apply among `versions` ({mod id: version}),
+    each pair once, whichever sources list it."""
+    out, seen = [], set()
+    for inc in getattr(index, "incompatible", ()):
+        key = frozenset(inc.below)
+        if key not in seen and all(i in versions and _below(versions[i], b) for i, b in inc.below.items()):
+            seen.add(key)
+            out.append(inc)
+    return out
+
+
+def _incompatibilities_from(index, base):
+    raw = index.get("incompatible")
+    out = []
+    for entry in raw if isinstance(raw, list) else ():
+        mods = entry.get("mods") if isinstance(entry, dict) else None
+        if not (isinstance(mods, dict) and len({k.casefold() for k in mods}) == 2 == len(mods)
+                and all(isinstance(side, dict) for side in mods.values())
+                and isinstance(entry.get("note"), str)):
+            continue
+        below = {}
+        for mod_id, side in mods.items():
+            try:
+                below[mod_id] = side["below"] if _parse_version(side.get("below")) else None
+            except ModManagerError:
+                below[mod_id] = None    # absent or unreadable: every version
+        out.append(Incompatibility(below, entry["note"], base))
+    return out
+
+
+def _withdrawals_from(index, base):
+    raw = index.get("withdrawn")
+    return [Withdrawal(mod_id, version, reason, base)
+            for mod_id, versions in (raw.items() if isinstance(raw, dict) else ())
+            for version, reason in (versions.items() if isinstance(versions, dict) else ())
+            if isinstance(reason, str)]
+
+
 def _replacements_from(index, base):
     raw = index.get("replaced")
     out = []
@@ -184,11 +263,12 @@ def _replacements_from(index, base):
     return out
 
 
-_index_cache = {}   # base -> (fetched_at, (list[ModSummary], list[Replacement]))
+_index_cache = {}   # base -> (fetched_at, (summaries, replacements, incompatibilities, withdrawals))
 
 
 def _fetch_repo_index(base, force):
-    """One repo's (ModSummaries, Replacements), cached for _INDEX_TTL_SECONDS.
+    """One repo's (ModSummaries, Replacements, Incompatibilities, Withdrawals),
+    cached for _INDEX_TTL_SECONDS.
     A failed fetch or unsupported index warns and yields the stale cache or
     nothing."""
     base = _norm(base)
@@ -204,7 +284,7 @@ def _fetch_repo_index(base, force):
                                   f"v{SUPPORTED_INDEX_MAJOR}")
     except ModManagerError as e:
         _warn(f"skipping repo {base}: {e}")
-        return hit[1] if hit else ([], [])
+        return hit[1] if hit else ([], [], [], [])
 
     out = []
     mods = index.get("mods")
@@ -213,20 +293,23 @@ def _fetch_repo_index(base, force):
             out += [s for s in (_summary_from_dict(e, mod_id, base)
                                 for e in by_major.values() if isinstance(e, dict))
                     if s is not None]
-    _index_cache[base] = (now, (out, _replacements_from(index, base)))
+    _index_cache[base] = (now, (out, _replacements_from(index, base),
+                                _incompatibilities_from(index, base), _withdrawals_from(index, base)))
     return _index_cache[base][1]
 
 
 def fetch_indexes(repo_bases, force=False):
     """Every repo's index merged to one entry per (id, major): DEFAULT_REPO
     wins a collision, otherwise the highest version does. Carries every
-    repo's replacements."""
+    repo's replacements, incompatible pairs and withdrawn versions."""
     merged = {}   # (id, major) -> (ModSummary, from_default)
-    replaced = []
+    replaced, incompatible, withdrawn = [], [], []
     for base in repo_bases:
         from_default = _is_default(base)
-        summaries, reps = _fetch_repo_index(base, force)
+        summaries, reps, incs, wds = _fetch_repo_index(base, force)
         replaced += reps
+        incompatible += incs
+        withdrawn += wds
         for s in summaries:
             key = (s.id, s.major)
             cur = merged.get(key)
@@ -234,4 +317,4 @@ def fetch_indexes(repo_bases, force=False):
                     or (from_default == cur[1]
                         and _parse_version(s.highest()) > _parse_version(cur[0].highest()))):
                 merged[key] = (s, from_default)
-    return ModIndex((s for s, _default in merged.values()), replaced)
+    return ModIndex((s for s, _default in merged.values()), replaced, incompatible, withdrawn)

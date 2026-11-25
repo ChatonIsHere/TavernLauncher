@@ -19,7 +19,7 @@ from tavern_shared.mods.layout import (
 from tavern_shared.mods.manifest import _manifest_from_dict, parity_required, runs_in_scene
 from tavern_shared.mods.pins import _parse_pin_entry
 from tavern_shared.mods.repos import (
-    _norm, _repo_shorthand, replacement_for, replacement_of_unlisted,
+    _norm, _repo_shorthand, clashes, replacement_for, replacement_of_unlisted, withdrawal_for,
 )
 from tavern_shared.mods.resolve import (
     _fetch_manifest, _index_source, resolve_dependencies,
@@ -66,13 +66,14 @@ class JoinPlan:
     declined: list = field(default_factory=list)          # [(id, version)]
     unresolved_pins: list = field(default_factory=list)   # [(id, version or "latest")]
     shared: list = field(default_factory=list)            # ids left on: this folder's server runs them
-    forced_off: dict = field(default_factory=dict)        # pinned id -> the server's mod it replaces
+    forced_off: dict = field(default_factory=dict)        # pinned id -> why it can't load with the server's mods
+    withdrawn: list = field(default_factory=list)         # [(id, version, reason)] required, withdrawn
 
     @property
     def blocking(self):
         # A required mod that won't be installed could only fail the
         # post-render parity check. Pins never block: no server asked for them.
-        return bool(self.missing or self.needs_repo)
+        return bool(self.missing or self.needs_repo or self.withdrawn)
 
 
 def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=None,
@@ -92,12 +93,19 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
     skipped = [(mid, ver) for mid, ver in recommended.items() if mid in declined]
 
     installed = _client_records(game_dir)
-    roots, missing, needs_repo, unresolved_pins = [], [], [], []
+    roots, missing, needs_repo, unresolved_pins, withdrawn = [], [], [], [], []
     reason = {}         # mod_id -> tag, first wins
     exact_pin = {}      # mod_id -> pinned version, None for latest
     forced_off = {}
 
     def resolve_root(mod_id, version, tag):
+        if tag != "pinned" and (w := withdrawal_for(index, mod_id, version)) is not None:
+            if tag == "required":
+                withdrawn.append((mod_id, version, w.reason))
+            else:
+                _warn(f"'{mod_id}' {version} is recommended by this server but has been "
+                      f"withdrawn ({w.reason}); skipped.")
+            return
         try:
             manifest = _fetch_manifest(repo_bases, mod_id, version,
                                        _index_source(index, mod_id, repo_bases, version))
@@ -144,8 +152,13 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
         if mod_id in replacing_server:
             _warn(f"pinned mod '{mod_id}' replaces '{replacing_server[mod_id]}', which "
                   f"this server runs, so it's left out of this join.")
-            forced_off[mod_id] = replacing_server[mod_id]
+            forced_off[mod_id] = (f"it replaces {replacing_server[mod_id]}, which this server "
+                                  f"runs, so they can't both load")
             continue
+        if version is not None and (w := withdrawal_for(index, mod_id, version)) is not None:
+            _warn(f"pinned mod '{mod_id}' {version} has been withdrawn ({w.reason}); using its "
+                  f"latest instead.")
+            version = None
         exact_pin[mod_id] = version
         if mod_id in reason:
             continue
@@ -171,9 +184,26 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
             _warn(f"'{m.id}' {m.version} is left out of this join: {e}")
             del reason[m.id]
             continue
+        # Recommendations come before pins, so a pin is checked against all the
+        # server's mods. Only a pin, the player's own choice, gives way.
+        before = {x.id: x.version for x in settled + dependencies}
+        new = [inc for inc in clashes(index, {**before, **{x.id: x.version for x in [m] + deps}})
+               if not all(i in before for i in inc.below)]
+        if new and reason[m.id] == "pinned":
+            inc = new[0]
+            other = next((i for i in sorted(inc.below) if i in before), None)
+            why = (f"it doesn't work with {other}, which this server runs: {inc.note}" if other
+                   else f"{' and '.join(sorted(inc.below))}, which it brings, don't work together: {inc.note}")
+            _warn(f"pinned mod '{m.id}' is left out of this join: {why}")
+            forced_off[m.id] = why
+            del reason[m.id]
+            continue
         settled.append(m)
         dependencies = deps
     roots = settled
+    for inc in clashes(index, {x.id: x.version for x in roots + dependencies}):
+        a, b = sorted(inc.below)
+        _warn(f"this server runs '{a}' and '{b}', which don't work together: {inc.note}")
 
     # Only a mod that resolved as a server root can overrule a pin.
     server_versions = {**recommended, **required}
@@ -232,7 +262,8 @@ def plan_join(game_dir, server_mods, index, repo_bases, pinned=None, declined=No
     return JoinPlan(entries=entries, to_deactivate=to_deactivate, libraries=libraries,
                     missing=missing, needs_repo=needs_repo, pin_conflicts=pin_conflicts,
                     declined=skipped, unresolved_pins=unresolved_pins, shared=shared,
-                    forced_off={k: v for k, v in forced_off.items() if k in to_deactivate})
+                    forced_off={k: v for k, v in forced_off.items() if k in to_deactivate},
+                    withdrawn=withdrawn)
 
 
 def _from_record(game_dir, rec, version):
@@ -364,12 +395,11 @@ def build_mod_diff(game_dir, server_mods, plan):
         rows.append(DiffRow(mod_id=mod_id, **row))
 
     for mod_id in plan.to_deactivate:
-        old = plan.forced_off.get(mod_id)
+        why = plan.forced_off.get(mod_id)
         add(mod_id, server_version="", client_enabled=True, action=ACTION_DEACTIVATE,
-            reason="", optional=old is None,
-            note=(f"it replaces {old}, which this server runs, so they can't both load"
-                  if old else "this server doesn't run it. Keep leaves it on for this "
-                  "join; Pin keeps it on for every server"))
+            reason="", optional=why is None,
+            note=why or ("this server doesn't run it. Keep leaves it on for this "
+                         "join; Pin keeps it on for every server"))
     for mod_id in plan.shared:
         add(mod_id, server_version="", client_enabled=True, action=ACTION_MATCH,
             reason="", optional=False,
@@ -388,6 +418,10 @@ def build_mod_diff(game_dir, server_mods, plan):
     for mod_id, version in plan.missing:
         add(mod_id, server_version=version, action=ACTION_MISSING, reason="required",
             optional=False, source_repo="", note="not in any source you've added")
+    for mod_id, version, why in plan.withdrawn:
+        add(mod_id, server_version=version, action=ACTION_MISSING, reason="required",
+            optional=False, source_repo="",
+            note=f"this version has been withdrawn ({why}); the server's host needs to update it")
     for mod_id, version, repo in plan.needs_repo:
         add(mod_id, server_version=version, client_version="", client_enabled=False,
             action=ACTION_NEEDS_REPO, reason="required", optional=False,

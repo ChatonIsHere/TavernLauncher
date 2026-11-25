@@ -1139,6 +1139,9 @@ class ClientLauncher(LauncherCommon, tk.Tk):
                     if plan.needs_repo:
                         reasons.append("are only in a source you haven't added yet "
                                        "(the comparison names it)")
+                    if plan.withdrawn:
+                        reasons.append("have been withdrawn, so the host needs to update them "
+                                       "(the comparison says why)")
                     self._print("This server needs mods that "
                                 + " or ".join(reasons) + "; not launching.", "err")
                 abort()

@@ -10,7 +10,7 @@ from tavern_shared.mods.install import (
 )
 from tavern_shared.mods.pins import _parse_pin_entry
 from tavern_shared.mods.repos import (
-    DEFAULT_REPO, _repo_shorthand, _user_repos, replacement_of_unlisted,
+    DEFAULT_REPO, _repo_shorthand, _user_repos, clashes, replacement_of_unlisted, withdrawal_for,
 )
 from tavern_shared.mods.resolve import (
     _fetch_manifest, _index_source, resolve_dependencies, resolve_mod_by_id,
@@ -47,6 +47,8 @@ class ImportPlan:
     target: str
     no_build: list          # [(mod_id, version)] left out: no build for target
     replaced: list = field(default_factory=list)   # [(old id, new id)] swapped in
+    withdrawn: list = field(default_factory=list)  # [(id, version, reason)] taken at the latest instead
+    clashes: list = field(default_factory=list)    # [Incompatibility] among what it installs
 
     @property
     def blocking(self):
@@ -57,19 +59,23 @@ def import_modlist(modlist, index, repo_bases, target, game_dir=None):
     """Resolves `mods` through the importer's own repos only; the file's
     `repos` is never fetched from. An entry with no `target` build is left
     out, so a server can import a client's list. An entry for a replaced mod
-    takes its replacement's latest. Library conflicts surface here, before
-    anything is confirmed."""
+    takes its replacement's latest, and one for a withdrawn version the mod's
+    latest. Library conflicts surface here, before anything is confirmed;
+    mods that don't work together only warn."""
     if modlist.get("schema") != MODLIST_SCHEMA:
         raise ModManagerError(
             f"This modlist is schema {modlist.get('schema')!r}; this launcher "
             f"only understands schema {MODLIST_SCHEMA}.")
 
-    roots, unresolved, no_build, replaced = [], [], [], []
+    roots, unresolved, no_build, replaced, withdrawn = [], [], [], [], []
     for entry in modlist.get("mods", []):
         mod_id, version = _parse_pin_entry(entry)
         if (rep := replacement_of_unlisted(index, mod_id)) is not None:
             replaced.append((mod_id, rep.by))
             mod_id, version = rep.by, None
+        if version and (w := withdrawal_for(index, mod_id, version)) is not None:
+            withdrawn.append((mod_id, version, w.reason))
+            version = None
         prefer = _index_source(index, mod_id, repo_bases, version)
         try:
             root = (_fetch_manifest(repo_bases, mod_id, version, prefer) if version
@@ -93,7 +99,8 @@ def import_modlist(modlist, index, repo_bases, target, game_dir=None):
     return ImportPlan(roots=roots, dependencies=dependencies, unresolved=unresolved,
                       hinted_repos=list(modlist.get("repos", [])),
                       untracked=[u for u in (modlist.get("untracked") or []) if u.get("name")],
-                      target=target, no_build=no_build, replaced=replaced)
+                      target=target, no_build=no_build, replaced=replaced, withdrawn=withdrawn,
+                      clashes=clashes(index, {m.id: m.version for m in roots + dependencies}))
 
 
 def modlist_import_disables(game_dir, plan):

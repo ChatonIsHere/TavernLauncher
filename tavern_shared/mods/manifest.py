@@ -119,6 +119,7 @@ class ModSummary:
     parity_required: bool = True
     scenes: list = None
     icons: dict = None              # {size in px: https url}, display only
+    changelog: str = ""             # what changed in this major's highest version
 
     def highest(self):
         return max(self.versions, key=_parse_version)
@@ -302,4 +303,5 @@ def _summary_from_dict(d, mod_id, source_repo):
         parity_required=required,
         scenes=scenes,
         icons=icons,
+        changelog=d["changelog"] if isinstance(d.get("changelog"), str) else "",
     )
