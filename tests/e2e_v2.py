@@ -55,11 +55,14 @@ def check(cond, label):
         failures.append(label)
 
 
-def harness(*args):
+def harness(*args, logs=None):
+    """stdout; with logs (a list), TavernLib's log lines go into it too."""
     out = subprocess.run([HARNESS, *args], capture_output=True, encoding="utf-8", timeout=300)
     if out.returncode != 0:
         print(out.stdout, out.stderr)
         raise RuntimeError(f"harness {args[0]} exited {out.returncode}")
+    if logs is not None:
+        logs += out.stderr.splitlines()
     return out.stdout
 
 
@@ -364,6 +367,46 @@ served["replaced"]["ExampleDev.Keeper"] = {"by": "ExampleDev.Ghost"}
 publish("ExampleDev.Ghost", manifest=False)
 harness("reconcile", g7, SCRATCH, "ExampleDev.Keeper")
 check(enabled(g7) == {"ExampleDev.Keeper": True}, f"a replacement that can't be fetched keeps the listed mod ({enabled(g7)})")
+
+# A withdrawn version: the index lists only 1.1.0, and both sides take it for a pin on 1.0.0.
+PULLED = "ExampleDev.Pulled"
+publish(PULLED)
+newer = dict(helper, id=PULLED, name=PULLED, version="1.1.0", parity_required=False, dependencies={},
+             artifacts=[art])
+for leaf in ("1.1.0.json", "latest.json"):
+    with open(os.path.join(scratch, "manifests", "ExampleDev", "Pulled", leaf), "w", encoding="utf-8") as f:
+        json.dump(newer, f)
+served["mods"][PULLED]["1"]["versions"] = ["1.1.0"]
+served["withdrawn"] = {PULLED: {"1.0.0": "Corrupts saves."}}
+save_index()
+g8 = new_game(); games.append(g8)
+logs = []
+harness("reconcile", g8, SCRATCH, f"{PULLED}@1.0.0", logs=logs)
+pulled = json.loads(record(g8, PULLED))["version"]
+check(pulled == "1.1.0", f"C# reconcile: a pin on a withdrawn version installs its major's latest ({pulled})")
+check(any("withdrawn (Corrupts saves.)" in line for line in logs), "C# reconcile says why it skipped the withdrawn version")
+repos._index_cache.clear()
+py_plan = modlist.import_modlist({"schema": 1, "repos": [], "mods": [f"{PULLED}@1.0.0"]},
+                                 repos.fetch_indexes([SCRATCH], force=True), [SCRATCH], target="server")
+check([(m.id, m.version) for m in py_plan.roots] == [(PULLED, "1.1.0")] and py_plan.withdrawn == [(PULLED, "1.0.0", "Corrupts saves.")],
+      f"Python import agrees ({[(m.id, m.version) for m in py_plan.roots]})")
+
+# Two listed mods that don't work together: both stay enabled, and both sides say so.
+publish("ExampleDev.Left")
+publish("ExampleDev.Right")
+served["incompatible"] = [{"mods": {"ExampleDev.Left": {}, "ExampleDev.Right": {"below": "2.0.0"}}, "note": "Both patch vats."}]
+save_index()
+g9 = new_game(); games.append(g9)
+logs = []
+harness("reconcile", g9, SCRATCH, "ExampleDev.Left,ExampleDev.Right", logs=logs)
+check({k: v for k, v in enabled(g9).items() if k in ("ExampleDev.Left", "ExampleDev.Right")}
+      == {"ExampleDev.Left": True, "ExampleDev.Right": True}, "C# reconcile keeps both mods of a clashing pair the list names")
+check(any("don't work together (Both patch vats.)" in line for line in logs), "C# reconcile warns about the pair")
+repos._index_cache.clear()
+py_plan = modlist.import_modlist({"schema": 1, "repos": [], "mods": ["ExampleDev.Left", "ExampleDev.Right"]},
+                                 repos.fetch_indexes([SCRATCH], force=True), [SCRATCH], target="server")
+check([c.note for c in py_plan.clashes] == ["Both patch vats."], "Python import lists the same pair")
+repos._index_cache.clear()
 
 os.makedirs(os.path.join(scratch, "v1"))
 with open(os.path.join(scratch, "v1", "repository.json"), "w", encoding="utf-8") as f:
