@@ -38,7 +38,7 @@ from tavern_shared.app_ready import run_app_ready
 from server.core.data_store import (
     load_cfg, save_cfg, CONFIG_FILE, GAME_LOG_PATH, DISCORD_URL,
     CONSOLE_TOKEN_FILE, PLAYERS_SAVE, SERVER_DATA_DIR, load_server_settings, save_server_settings,
-    _load_whitelist_requests, _tickets_needing_owner_attention,
+    _load_whitelist_requests, _tickets_needing_owner_attention, cfg_port,
 )
 from server.core.server_backup import backup_due, create_backup, prune_backups
 from tavern_shared.flashing import start_flashing_button
@@ -644,8 +644,9 @@ class ServerLauncher(LauncherCommon, tk.Tk):
         if getattr(self, "_stopping", False) or (self._proc and self._proc.poll() is None):
             self._print("The server is still running.", "warn")
             return
-        if not console_port_free():
-            self._print("Port 1760 is in use, so another server is still running on this PC. "
+        console_port = cfg_port("console_port", 1760)
+        if not console_port_free(console_port):
+            self._print(f"Port {console_port} is in use, so another server is still running on this PC. "
                         "Close it first (Task Manager: A Township Tale).", "err")
             return
         exe = self.v_exe.get().strip()
@@ -798,7 +799,7 @@ class ServerLauncher(LauncherCommon, tk.Tk):
         except Exception:
             return "console_token.txt not found"
         ws = WsConsoleClient()
-        ok, msg = ws.connect("127.0.0.1", token)
+        ok, msg = ws.connect("127.0.0.1", token, port=cfg_port("console_port", 1760))
         if not ok:
             return f"the console isn't answering ({msg})"
         try:
@@ -830,11 +831,12 @@ class ServerLauncher(LauncherCommon, tk.Tk):
     def _start_when_console_free(self, tries=30):
         """After a forced stop Windows can hold the console port a few
         seconds more; wait up to 15 s for it rather than refuse."""
-        if tries <= 0 or console_port_free():
+        console_port = cfg_port("console_port", 1760)
+        if tries <= 0 or console_port_free(console_port):
             self._start()
             return
         if tries == 30:
-            self._print("Waiting for port 1760 to be released…", "dim")
+            self._print(f"Waiting for port {console_port} to be released…", "dim")
         self.after(500, lambda: self._start_when_console_free(tries - 1))
 
     def _schedule_auto_reboot(self):

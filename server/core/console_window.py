@@ -11,7 +11,7 @@ from tavern_shared.window_chrome import _start_hidden, _finish_dark_window, _set
 
 from tavern_shared.ws_console_client import WsConsoleClient
 from tavern_shared.console_commands import CONSOLE_COMMANDS
-from server.core.data_store import CONSOLE_TOKEN_FILE
+from server.core.data_store import CONSOLE_TOKEN_FILE, cfg_port
 
 class ConsoleWindow(tk.Toplevel):
     def __init__(self, parent):
@@ -196,7 +196,7 @@ class ConsoleWindow(tk.Toplevel):
 
         def worker():
             ok, msg = client.connect(
-                "127.0.0.1", token,
+                "127.0.0.1", token, port=cfg_port("console_port", 1760),
                 on_line=lambda t: self.after(0, lambda p=t: self._append(p)),
                 on_disc=lambda r: self.after(0, lambda: self._on_disconnected(r)),
             )

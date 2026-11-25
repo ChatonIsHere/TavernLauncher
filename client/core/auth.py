@@ -9,7 +9,20 @@ import base64
 import hashlib
 import hmac as _hmac
 
+from client.core import srv
+
 AUTH_PORT   = 1762
+
+
+def auth_address(host):
+    """(host, port) of host's auth service. Every function here takes a host
+    as the launcher keeps it: a name, an IP, or server_key()'s "ip:port",
+    where the port is always the AUTH port, never the game's. A name with
+    an SRV record goes where the record says; anything else is AUTH_PORT."""
+    h, port = split_host_port(host)
+    if port:
+        return h, port
+    return srv.lookup(h) or (h, AUTH_PORT)
 
 
 def authenticate(host, username, token, password=None, timeout=8):
@@ -19,7 +32,7 @@ def authenticate(host, username, token, password=None, timeout=8):
     try:
         s = socket.socket()
         s.settimeout(timeout)
-        s.connect((host, AUTH_PORT))
+        s.connect(auth_address(host))
         s.sendall(json.dumps(payload).encode())
         raw = s.recv(4096)
         s.close()
@@ -27,17 +40,26 @@ def authenticate(host, username, token, password=None, timeout=8):
     except Exception as e:
         # No auth service reachable at all (vs. a real rejection) --
         # _do_launch uses this to decide whether a headless fallback is worth trying.
-        return None, f"CANNOT_REACH::{e}", False
+        return None, f"CANNOT_REACH::{e}", False, None
     status = resp.get("status")
     if status == "ok":
         if resp.get("tutorial_scene_required"): scene_arg = "/tutorialScene"
         elif resp.get("quest_scene_required"): scene_arg = "/questScene"
         else: scene_arg = None
-        return resp.get("user_id"), None, scene_arg
-    if status == "needs_password": return None, "NEEDS_PASSWORD", False
-    if status == "wrong_password": return None, "Wrong password.", False
-    if status == "not_whitelisted": return None, "NOT_WHITELISTED", False
-    return None, resp.get("message", "Authentication failed."), False
+        return resp.get("user_id"), None, scene_arg, ports_of(resp)
+    if status == "needs_password": return None, "NEEDS_PASSWORD", False, None
+    if status == "wrong_password": return None, "Wrong password.", False, None
+    if status == "not_whitelisted": return None, "NOT_WHITELISTED", False, None
+    return None, resp.get("message", "Authentication failed."), False, None
+
+
+def ports_of(resp):
+    """(game_port, web_port) from a ping or join reply; None for any the
+    server didn't send (servers from before SRV support send no web_port)."""
+    def port(key):
+        value = resp.get(key)
+        return value if isinstance(value, int) and 1 <= value <= 65535 else None
+    return port("game_port"), port("web_port")
 
 
 def send_mods(host, username, token, mods, timeout=8):
@@ -48,7 +70,7 @@ def send_mods(host, username, token, mods, timeout=8):
     try:
         s = socket.socket()
         s.settimeout(timeout)
-        s.connect((host, AUTH_PORT))
+        s.connect(auth_address(host))
         s.sendall(json.dumps(payload).encode())
         raw = s.recv(4096)
         s.close()
@@ -70,7 +92,7 @@ def register_whitelist_application(host, username, timeout=8):
     try:
         s = socket.socket()
         s.settimeout(timeout)
-        s.connect((host, AUTH_PORT))
+        s.connect(auth_address(host))
         s.sendall(json.dumps(payload).encode())
         raw = s.recv(4096)
         s.close()
@@ -93,7 +115,7 @@ def ticket_request(host, action, username, token, timeout=10, **kwargs):
     payload.update(kwargs)
     s = socket.socket()
     s.settimeout(timeout)
-    s.connect((host, AUTH_PORT))
+    s.connect(auth_address(host))
     s.sendall(json.dumps(payload).encode())
     raw = s.recv(65536)
     s.close()
@@ -102,10 +124,11 @@ def ticket_request(host, action, username, token, timeout=10, **kwargs):
 
 def ping_server(host, timeout=5):
     """Returns (info_dict, latency_ms) or raises."""
+    address = auth_address(host)
     t0 = time.time()
     s  = socket.socket()
     s.settimeout(timeout)
-    s.connect((host, AUTH_PORT))
+    s.connect(address)
     s.sendall(json.dumps({"ping": True}).encode())
     raw = s.recv(4096)
     ms  = int((time.time() - t0) * 1000)
@@ -161,7 +184,7 @@ def fetch_server_mods(host, timeout=10):
     s = socket.socket()
     s.settimeout(timeout)
     try:
-        s.connect((host, AUTH_PORT))
+        s.connect(auth_address(host))
         s.sendall(json.dumps({"mods_list": True}).encode())
         body = _recv_framed(s, timeout)
     finally:
@@ -185,25 +208,33 @@ def _jwt(payload):
 
 
 def _resolve_ip_for_game(host):
-    """The game's own /dev_server_ip argument appears to require a literal
-    IP address, not a hostname — passing a DNS name through connects fine
-    at the auth-handshake level (that's plain Python socket code, which
-    resolves hostnames automatically) but then silently fails to actually
-    join: black screen, server sees no incoming connection. This resolves
-    the hostname once, specifically for that one argument, so the game
-    always receives a real IP regardless of whether the player joined via
-    a hostname from the community list or typed one in directly."""
+    """The launcher's key for a server: its IP, plus ":port" when its auth
+    port isn't AUTH_PORT (from an SRV record, or a key that already had one).
+    Tokens, mod caches and declines key on it, so one server reached by name
+    and by IP is one server, and two servers sharing an IP are two.
+
+    The game's own /dev_server_ip needs a literal IP (a DNS name connects at
+    the handshake, then never joins), so game_ip() takes it back off."""
+    h, port = auth_address(host)
     try:
-        return socket.gethostbyname(host)
-    except socket.gaierror:
-        return host
+        ip = socket.gethostbyname(h)
+    except (socket.gaierror, UnicodeError):
+        ip = h
+    if port == AUTH_PORT:
+        return ip
+    return f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}"
+
+
+def game_ip(key):
+    """The IP for the game's /dev_server_ip, from _resolve_ip_for_game's key."""
+    return split_host_port(key)[0]
 
 
 def split_host_port(text):
     """(host, port) from what's in a server field: "1.2.3.4:1757" and
-    "[::1]:1757" carry a game port (an int), a plain host or a bare IPv6
-    address doesn't (None). The auth port is always AUTH_PORT, so a host
-    that kept its ":port" would be looked up as one name, and fail."""
+    "[::1]:1757" carry a port (an int), a plain host or a bare IPv6 address
+    doesn't (None). In what a player types, the port is the game's; in a
+    key from _resolve_ip_for_game it is the auth port (see auth_address)."""
     text = (text or "").strip()
     if text.startswith("["):
         host, sep, rest = text[1:].partition("]")

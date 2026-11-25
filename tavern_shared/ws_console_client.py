@@ -1,5 +1,6 @@
 """
-WebSocket client for the game console (port 1760). Shared by both apps --
+WebSocket client for the game console (port 1760, or the server's
+console_port). Shared by both apps --
 server's local ConsoleWindow and client's RemoteConsoleWindow/TavernKeeper
 all talk to the same protocol.
 """
@@ -30,7 +31,7 @@ class WsConsoleClient:
         self._on_line   = None
         self._on_disc   = None
 
-    def connect(self, host, token, on_line=None, on_disc=None, timeout=6):
+    def connect(self, host, token, on_line=None, on_disc=None, timeout=6, port=WS_CONSOLE_PORT):
         import websocket as _wslib
         self._on_line = on_line
         self._on_disc = on_disc
@@ -38,7 +39,7 @@ class WsConsoleClient:
         try:
             ws = _wslib.WebSocket()
             ws.settimeout(timeout)
-            ws.connect(f"ws://{host}:{WS_CONSOLE_PORT}")
+            ws.connect(f"ws://{host}:{port}")
             ws.send(token)
             raw = ws.recv()
             msg = json.loads(raw)
