@@ -408,8 +408,8 @@ class Windows(_TempDataDirFixture, unittest.TestCase):
     """Window methods bound onto a namespace, as test_mod_sync_flow does."""
 
     def _ns(self, **attrs):
-        ns = types.SimpleNamespace(_game_dir=self.game, _target="client_windows", _index=[],
-                                   _busy=False, _server_scene=None, statuses=[], **attrs)
+        ns = types.SimpleNamespace(**{"_game_dir": self.game, "_target": "client_windows", "_index": [],
+                                      "_busy": False, "_server_scene": None, "statuses": [], **attrs})
         ns._status = types.SimpleNamespace(set=ns.statuses.append)
         ns._set_busy = lambda busy, msg="": ns.statuses.append(msg)
         for name in ("_install", "_confirm_install", "_retire", "_retired", "_finish"):
@@ -448,6 +448,63 @@ class Windows(_TempDataDirFixture, unittest.TestCase):
         self.assertEqual(launcher_common.count_mods_needing_attention(self.game, self.TARGET), 1)
         mm.disable_mod(self.game, "a.m")
         self.assertEqual(launcher_common.count_mods_needing_attention(self.game, self.TARGET), 0)
+
+    def _clashing_index(self, *summaries, withdrawn=()):
+        return mm.ModIndex(list(summaries), [], [mm.Incompatibility({"a.m": None, "b.m": None}, "Both patch vats.", DEFAULT)],
+                           list(withdrawn))
+
+    def test_an_install_asks_before_disabling_a_mod_it_clashes_with(self):
+        self._install("b.m")
+        asked, jobs = [], []
+        stub(self, ui, "confirm_while_game_running", lambda *a: True)
+        stub(self, ui.messagebox, "askyesno", lambda title, text, parent=None: asked.append(text) or answer[0])
+        stub(self, ui, "run_bg", lambda w, fn, on_ok=None, on_err=None: jobs.append(fn))
+        stub(self, ui, "post", lambda w, fn, *a: fn(*a))
+        ns = self._ns(_is_game_running=lambda: False, _index=self._clashing_index(), _installed_recs=[])
+        for name in ("_name_by", "_mod_name", "_record"):
+            setattr(ns, name, types.MethodType(getattr(ui.ModListWindow, name), ns))
+        self._publish("a.m", "1.0.0")
+        a = make_manifest("a.m", "1.0.0")
+        answer = [False]
+        ns._confirm_install("a.m", a, [], [])
+        self.assertIn("doesn't work with", asked[0])
+        self.assertIn("Both patch vats.", asked[0])
+        self.assertEqual((ns.statuses[-1], jobs), ("Install cancelled.", []))
+        answer[0] = True
+        ns._confirm_install("a.m", a, [], [])
+        jobs[0]()
+        self.assertEqual({r["id"]: r["enabled"] for r in mm.list_installed_mods(self.game)},
+                         {"a.m": True, "b.m": False})
+
+    def test_mod_manager_marks_withdrawn_and_clashing_mods(self):
+        ns = types.SimpleNamespace(_index=self._clashing_index(summary("a.m", ["1.2.0"])), _installed_recs=[],
+                                   _rows={})
+        for name in ("_row_tag", "_fix_label", "_unwithdrawn", "_mod_name", "_name_by", "_record"):
+            setattr(ns, name, types.MethodType(getattr(ui.ModManagerWindow, name), ns))
+        row = {"kind": "managed", "key": "a.m", "state": "current", "enabled": True, "installed": "1.0.0",
+               "replaced": None, "missing": [], "withdrawn": None, "clashes": [], "summary": None}
+        inc = ns._index.incompatible[0]
+        clash = dict(row, clashes=[(inc, "b.m")])
+        self.assertEqual((ns._row_tag(clash), ns._fix_label(clash)), ("clash", "Disable b.m"))
+        gone = dict(clash, withdrawn=mm.Withdrawal("a.m", "1.0.0", "Bad.", DEFAULT))
+        self.assertEqual((ns._row_tag(gone), ns._fix_label(gone)), ("withdrawn", "Update to 1.2.0"))
+        ns._index = self._clashing_index()
+        self.assertIsNone(ns._fix_label(gone))          # nothing to update to: disable or uninstall it
+        self.assertIsNone(ns._fix_label(dict(gone, enabled=False)))
+        self.assertEqual(ns._row_tag(row), "current")
+
+    def test_the_badge_counts_withdrawn_and_clashing_mods(self):
+        self._install("a.m")
+        self._install("b.m")
+        index = [self._clashing_index(summary("a.m", ["1.0.0"]), summary("b.m", ["1.0.0"]))]
+        stub(self, launcher_common, "fetch_indexes", lambda bases: index[0])
+        stub(self, launcher_common, "list_repos", lambda cfg: [])
+        stub(self, launcher_common, "load_cfg", lambda: {})
+        self.assertEqual(launcher_common.count_mods_needing_attention(self.game, self.TARGET), 2)
+        rec = self._record("a.m")
+        index[0] = mm.ModIndex([summary("a.m", ["1.0.0"]), summary("b.m", ["1.0.0"])], [], [],
+                               [mm.Withdrawal("a.m", "1.0.0", "Bad.", rec["source_repo"])])
+        self.assertEqual(launcher_common.count_mods_needing_attention(self.game, self.TARGET), 1)
 
     def test_the_server_launcher_guards_its_mod_manager(self):
         from server.core.launcher_window import ServerLauncher
