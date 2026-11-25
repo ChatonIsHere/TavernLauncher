@@ -12,6 +12,7 @@ import hmac as _hmac
 from client.core import srv
 
 AUTH_PORT   = 1762
+CONSOLE_PORT = 1760
 
 
 def auth_address(host):
@@ -59,6 +60,22 @@ def login(host, username, token, password=None, timeout=8):
     if status == "wrong_password": return None, "Wrong password.", False, None
     if status == "not_whitelisted": return None, "NOT_WHITELISTED", False, None
     return None, resp.get("message", "Authentication failed."), False, None
+
+
+def console_address(host, timeout=3):
+    """(host, port) of host's websocket console: where its auth service is,
+    on the console_port its ping reports. 1760 on the host as typed when the
+    ping fails or a server doesn't say (before SRV support). A port typed
+    with the host is the game's, and says nothing about the console."""
+    host = split_host_port(host)[0]
+    try:
+        resp, _ms = ping_server(host, timeout=timeout)
+        port = resp.get("console_port")
+        if isinstance(port, int) and 1 <= port <= 65535:
+            return auth_address(host)[0], port
+    except Exception:
+        pass
+    return host, CONSOLE_PORT
 
 
 def ports_of(resp):

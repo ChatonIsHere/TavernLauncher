@@ -9,7 +9,7 @@ from tavern_shared.theme import (
     BG, SURF, BORDER, AMBER, PARCH, MUTED, RED, GREEN, _btn, _field, _section_label,
 )
 from tavern_shared.ws_console_client import WsConsoleClient
-from client.core.auth import split_host_port
+from client.core.auth import console_address, split_host_port
 from client.core.tavernkeeper.api import Result
 from client.core.tavernkeeper.widgets import error_text, say
 
@@ -63,7 +63,7 @@ class ConnectionMixin:
         self.geometry(f"420x{self.winfo_reqheight()}")
 
     def _attempt_connect(self):
-        # The console has its own port: a game port typed with the host is dropped.
+        # The console has its own port, which the server's ping gives; a game port typed with the host is dropped.
         host = split_host_port(self.v_host.get())[0] or "127.0.0.1"
         token = self.v_token.get().strip()
         if not token:
@@ -74,8 +74,9 @@ class ConnectionMixin:
         self._ws_client = WsConsoleClient()
 
         def worker():
+            console_host, console_port = console_address(host)
             ok, msg = self._ws_client.connect(
-                host, token,
+                console_host, token, port=console_port,
                 on_line=lambda t: self.after(0, lambda p=t: self._on_line(p)),
                 on_disc=lambda r: self.after(0, lambda: self._on_disconnected(r)),
             )
@@ -111,15 +112,16 @@ class ConnectionMixin:
     def _reconnect(self):
         """Reconnect in place with the same host and token, so the tabs keep
         their state."""
-        # The console has its own port: a game port typed with the host is dropped.
+        # The console has its own port, which the server's ping gives; a game port typed with the host is dropped.
         host = split_host_port(self.v_host.get())[0] or "127.0.0.1"
         token = self.v_token.get().strip()
         self._reconnect_btn.config(state="disabled", text="Reconnecting...")
         self._ws_client = WsConsoleClient()
 
         def worker():
+            console_host, console_port = console_address(host)
             ok, msg = self._ws_client.connect(
-                host, token,
+                console_host, token, port=console_port,
                 on_line=lambda t: self.after(0, lambda p=t: self._on_line(p)),
                 on_disc=lambda r: self.after(0, lambda: self._on_disconnected(r)),
             )
