@@ -33,7 +33,7 @@ def bind(ns, *names):
 
 class SceneReachesTheLaunchArgs(unittest.TestCase):
 
-    def _join(self, scene_arg, ip="", port="1757", send_error=None):
+    def _join(self, scene_arg, ip="", port="1757", send_error=None, key="127.0.0.1", ports=None):
         launched = []
         self.planned_scene = []
         self.resolved = []
@@ -83,11 +83,11 @@ class SceneReachesTheLaunchArgs(unittest.TestCase):
 
         with mock.patch.object(lw.os.path, "isfile", lambda p: True), \
              mock.patch.object(lw, "_resolve_ip_for_game",
-                               lambda h: (self.resolved.append(h), "127.0.0.1")[1]), \
+                               lambda h: (self.resolved.append(h), key)[1]), \
              mock.patch.object(lw, "_any_token_files_exist", lambda: True), \
              mock.patch.object(lw, "_get_or_create_token", lambda h, u: ("tok", False)), \
              mock.patch.object(lw, "authenticate",
-                               lambda host, user, token, password=None: (7, None, scene_arg)), \
+                               lambda host, user, token, password=None: (7, None, scene_arg, ports)), \
              mock.patch.object(lw, "load_cfg", lambda: {}), \
              mock.patch.object(lw, "save_cfg", lambda cfg: None), \
              mock.patch.object(lw, "mods", fake_mods), \
@@ -138,6 +138,23 @@ class SceneReachesTheLaunchArgs(unittest.TestCase):
         self.assertEqual(self.ns.v_ip.get(), "100.66.236.126")
         self.assertEqual(self.ns.v_port.get(), "1757")
         self.assertEqual(args[args.index("/dev_server_port") + 1], "1757")
+
+    def test_a_server_found_by_srv_record_launches_on_the_ports_it_reports(self):
+        """The key carries the SRV record's auth port; the game gets the bare
+        IP, and the game and web ports from the join reply."""
+        args = self._join(None, ip="play.example.com", port="1757",
+                          key="203.0.113.5:27016", ports=(27015, 27017))
+        self.assertEqual(args[args.index("/dev_server_ip") + 1], "203.0.113.5")
+        self.assertEqual(args[args.index("/dev_server_port") + 1], "27015")
+        self.assertEqual(args[args.index("/dev_server_web_port") + 1], "27017")
+        self.assertEqual(self.ns.v_port.get(), "27015")
+        # Everything after the handshake goes to the same auth port.
+        self.assertEqual(self.sent_before_launch[0][0], "203.0.113.5:27016")
+
+    def test_a_server_from_before_srv_support_launches_as_before(self):
+        args = self._join(None, ip="203.0.113.5", port="1758", key="203.0.113.5", ports=(None, None))
+        self.assertEqual(args[args.index("/dev_server_port") + 1], "1758")
+        self.assertNotIn("/dev_server_web_port", args)
 
 
 class SplitHostPort(unittest.TestCase):
