@@ -86,7 +86,7 @@ class SceneReachesTheLaunchArgs(unittest.TestCase):
                                lambda h: (self.resolved.append(h), key)[1]), \
              mock.patch.object(lw, "_any_token_files_exist", lambda: True), \
              mock.patch.object(lw, "_get_or_create_token", lambda h, u: ("tok", False)), \
-             mock.patch.object(lw, "authenticate",
+             mock.patch.object(lw, "login",
                                lambda host, user, token, password=None: (7, None, scene_arg, ports)), \
              mock.patch.object(lw, "load_cfg", lambda: {}), \
              mock.patch.object(lw, "save_cfg", lambda cfg: None), \

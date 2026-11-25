@@ -154,7 +154,7 @@ class OverTheWire(unittest.TestCase):
         self._found_at(listener.getsockname()[1])
 
         def serve():
-            for _ in range(2):
+            for _ in range(3):
                 conn, addr = listener.accept()
                 svc._handle_auth(conn, addr, lambda *a: None, lambda: None)
         thread = threading.Thread(target=serve, daemon=True)
@@ -162,11 +162,13 @@ class OverTheWire(unittest.TestCase):
 
         resp, _ms = auth.ping_server("play.example.com")
         self.assertEqual(auth.ports_of(resp), (27015, 27017))
-        user_id, error, _scene, ports = auth.authenticate("play.example.com", "Tester", "tok")
-        thread.join(5)
+        user_id, error, _scene, ports = auth.login("play.example.com", "Tester", "tok")
         self.assertIsNone(error)
         self.assertEqual(user_id, 1000000001)
         self.assertEqual(ports, (27015, 27017))
+        # authenticate() keeps the three values Rover unpacks.
+        self.assertEqual(len(auth.authenticate("play.example.com", "Tester", "tok")), 3)
+        thread.join(5)
 
     def test_the_service_listens_on_auth_port(self):
         free = socket.socket()
