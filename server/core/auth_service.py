@@ -26,7 +26,7 @@ from server.core.data_store import (
     _load_users, _save_users, _users_lock, BASE_USER_ID, UsersSaveError,
     CONSOLE_TOKEN_FILE, USERNAME_MAX_LEN, _is_valid_name,
     MAX_ACCOUNTS_PER_IP, PW_FAIL_LIMIT, _pw_fail_counts,
-    _add_whitelist_application,
+    _add_whitelist_application, cfg_port,
 )
 from tavern_shared.paths import _tavern_data_dir
 from tavern_shared import mods
@@ -249,14 +249,13 @@ def _handle_auth(conn, addr, log_fn, get_game_dir):
         if req.get("ping"):
             ss   = load_server_settings()
             cfg  = load_cfg()
-            try: game_port = int(cfg.get("server_port", 1757))
-            except (TypeError, ValueError): game_port = 1757
             resp = {
                 "status":            "pong",
                 "server_name":       ss.get("name","Tavern Server"),
                 "password_required": bool(ss.get("password_hash","")),
                 "whitelist_enabled": bool(ss.get("whitelist_enabled",False)),
-                "game_port":         game_port,
+                "game_port":         cfg_port("server_port", 1757, cfg),
+                "web_port":          cfg_port("web_port", 1761, cfg),
             }
             live_count, live_limit = _read_live_player_status()
             if live_count is not None: resp["player_count"] = live_count
@@ -457,9 +456,13 @@ def _handle_auth(conn, addr, log_fn, get_game_dir):
             return
 
         log_fn(f"'{username}' (ID {user_id}) from {ip}", "ok")
+        # The ports go back with every join, as TavernLib's do: a player who
+        # found this server by SRV record typed no port at all.
         conn.sendall(json.dumps({"status":"ok","user_id":user_id,
                                   "quest_scene_required": bool(ss.get("quest_scene", False)),
-                                  "tutorial_scene_required": bool(ss.get("tutorial_scene", False))}).encode())
+                                  "tutorial_scene_required": bool(ss.get("tutorial_scene", False)),
+                                  "game_port": cfg_port("server_port", 1757),
+                                  "web_port": cfg_port("web_port", 1761)}).encode())
     except UsersSaveError as e:
         # Never tell the player "ok" for an account that wasn't actually saved
         # -- the next player would be handed the same user ID.
@@ -477,8 +480,11 @@ def _handle_auth(conn, addr, log_fn, get_game_dir):
         except: pass
 
 
-def start_auth_service(log_fn, get_game_dir, port=AUTH_PORT):
-    """get_game_dir() is asked per request, so it follows a changed install."""
+def start_auth_service(log_fn, get_game_dir, port=None):
+    """get_game_dir() is asked per request, so it follows a changed install.
+    The port is the config's auth_port unless given."""
+    if port is None:
+        port = cfg_port("auth_port", AUTH_PORT)
     def serve():
         try:
             s = socket.socket()

@@ -52,7 +52,7 @@ from client.core.config import (
 )
 from tavern_shared.flashing import start_flashing_button
 from client.core.auth import (
-    AUTH_PORT, authenticate, ping_server, _resolve_ip_for_game, _valid_port, split_host_port,
+    auth_address, authenticate, game_ip, ping_server, _resolve_ip_for_game, _valid_port, split_host_port,
     build_tokens, _headless_user_id, register_whitelist_application, send_mods, ticket_request,
     fetch_server_mods,
 )
@@ -1271,7 +1271,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         else:
             token, token_is_new, had_token_before = _token_state
 
-        user_id, error, scene_arg = authenticate(host, username, token, password=password)
+        user_id, error, scene_arg, ports = authenticate(host, username, token, password=password)
 
         if error == "NEEDS_PASSWORD":
             self._action_btn.config(state="normal")
@@ -1299,11 +1299,12 @@ class ClientLauncher(LauncherCommon, tk.Tk):
 
         if error and error.startswith("CANNOT_REACH::"):
             detail = error.split("::", 1)[1]
-            self._print(f"No official auth service at {host}:{AUTH_PORT} — "
+            auth_at = "%s:%s" % auth_address(host)
+            self._print(f"No official auth service at {auth_at} — "
                         "checking community list for a headless registration…", "warn")
             if self._try_headless_fallback(display_host, host):
                 return
-            self._print(f"Rejected: Cannot reach server at {host}:{AUTH_PORT} — {detail}", "err")
+            self._print(f"Rejected: Cannot reach server at {auth_at} — {detail}", "err")
             self._action_btn.config(state="normal")
             return
 
@@ -1313,13 +1314,17 @@ class ClientLauncher(LauncherCommon, tk.Tk):
             return
 
         self._print(f"Welcomed as {username} (ID {user_id})", "ok")
+        game_port, web_port = ports or (None, None)
+        if game_port:
+            # The server's own word, as on Check Server: a name found by SRV has no port typed at all.
+            self.v_port.set(str(game_port))
         # Hooks written as fn(host, log_fn) are still skipped for localhost:
         # custom_models' resync clears and repopulates the flat CustomAssets/
         # folder that TavernLib reads from, whether the game process is your
         # server or a client. Hosting and joining from the same machine, that
         # resync raced the server's own one-time scan of the same folder.
         # A hook that takes is_local runs here too and decides for itself.
-        is_local = host in ("127.0.0.1", "localhost", socket.gethostname())
+        is_local = game_ip(host) in ("127.0.0.1", "localhost", socket.gethostname())
         run_post_auth_hooks(host, self._print, is_local=is_local)
         self._show_token_button()
         if token_is_new and not had_token_before:
@@ -1343,7 +1348,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         self._reconcile_mods(host, exe, lambda installed: self._launch_game(
             exe, ip, host, platform, username, user_id, token,
             lambda: self._do_launch(password=None),
-            scene_arg=scene_arg, installed=installed, kind="join", label=sv_name),
+            scene_arg=scene_arg, installed=installed, kind="join", label=sv_name, web_port=web_port),
             scene=mods.scene_from_arg(scene_arg))
 
     def _mods_list(self, game_dir, installed=None):
@@ -1357,7 +1362,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
             return None
 
     def _launch_game(self, exe, ip, host, platform, username, user_id, token,
-                     relaunch, scene_arg=None, installed=None, kind="join", label=None):
+                     relaunch, scene_arg=None, installed=None, kind="join", label=None, web_port=None):
         """The shared tail of both join paths; `installed` is what the verify
         read, for the mod list. A headless join has no token and no handshake."""
         mods_list = self._mods_list(os.path.dirname(exe), installed) if token else None
@@ -1378,8 +1383,10 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         if ip:
             # Already resolved to a canonical IP above — same value used for
             # the token lookup and the auth handshake, so all three agree.
-            args += ["/dev_server_ip", host]
+            args += ["/dev_server_ip", game_ip(host)]
         args += ["/dev_server_port", str(_valid_port(self.v_port.get()))]
+        if web_port:
+            args += ["/dev_server_web_port", str(web_port)]
         if self.v_debug_helper.get():
             args.append("/debug_helper")
         if scene_arg:
@@ -1432,7 +1439,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         if payload.get("schema") != 1:
             return
         server = payload.get("server") or {}
-        if server.get("host") and server.get("host") != host:
+        if server.get("host") and server.get("host") != game_ip(host):
             # Refused on a join made inside the game (TavernEssentials'
             # board): recover for that server and join it instead.
             relaunch = lambda: self._rejoin(server["host"], server.get("game_port"))

@@ -89,6 +89,15 @@ def load_cfg():
     except: return {}
 
 
+def cfg_port(key, default, cfg=None):
+    """A port from this file, which TavernLib reads too: server_port (1757),
+    console_port (1760), web_port (1761) or auth_port (1762). Missing or
+    unusable means the default, as in TavernLib."""
+    try: port = int((load_cfg() if cfg is None else cfg).get(key, default))
+    except (TypeError, ValueError): return default
+    return port if 1 <= port <= 65535 else default
+
+
 def save_cfg(d):
     try: json.dump(d,open(CONFIG_FILE,"w"),indent=2)
     except: pass
@@ -548,7 +557,7 @@ def kick_player(username, ban=False):
         return False, "console_token.txt not found — start the server first"
     user_id = _load_users().get(username.lower(), {}).get("user_id")
     ws = WsConsoleClient()
-    ok, msg = ws.connect("127.0.0.1", token)
+    ok, msg = ws.connect("127.0.0.1", token, port=cfg_port("console_port", 1760))
     if not ok:
         return False, f"Console not available: {msg}"
 
