@@ -37,7 +37,7 @@ FIELDS = [
     ("SnapRotationMode", "enum", ["Swipe", "Press"]),
     ("SelfStepVolume", "float", None),
     ("CanSellSkillsWithChildren", "bool", None),
-    ("ModsDirectoryPath", "text", None),
+    ("mods_directory_path", "text", None),
     ("CameraPhotoResolutionScale", "float", None),
     ("StreamingResolutionScale", "float", None),
     ("ViewFinderResolutionScale", "float", None),
@@ -56,7 +56,8 @@ FIELDS = [
     ("PixelLightCount", "int", (1, 8)),
 ]
 
-# Exact values as originally specified -- what "Defaults" resets to.
+# The game's own defaults (Alta.Utilities.GameSettings) -- what "Defaults" resets to, and what a
+# field missing from the file shows.
 DEFAULTS = {
     "LogSettingsPath": "",
     "HasHapticsWhenToggleHolding": True,
@@ -77,10 +78,10 @@ DEFAULTS = {
     "SnapRotationMode": "Swipe",
     "SelfStepVolume": 1.0,
     "CanSellSkillsWithChildren": False,
-    "ModsDirectoryPath": "",
+    "mods_directory_path": "",
     "CameraPhotoResolutionScale": 1.0,
     "StreamingResolutionScale": 1.0,
-    "ViewFinderResolutionScale": 1.0,
+    "ViewFinderResolutionScale": 0.2,
     "PlayerNamesToggle": True,
     "IsUsingFreeGestureMode": True,
     "DefaultCullingDistance": 100.0,
@@ -88,8 +89,8 @@ DEFAULTS = {
     "RenderOneCameraFromOtherPlayers": True,
     "HasAmbientOcclusionEnabled": False,
     "AudioFXVolumeMultiplier": 1.0,
-    "HasAccessibilityFeatures": False,
-    "HeightAssistValue": 2,
+    "HasAccessibilityFeatures": True,
+    "HeightAssistValue": -1,
     "UseGrabPositionMemory": True,
     "AccessibleDocksAreToggle": True,
     "HasGrabAssist": True,
@@ -183,6 +184,10 @@ class GameSettingsWindow(tk.Toplevel):
                 self._data = json.load(f)
             if not isinstance(self._data, dict):
                 self._data = {}
+            # Older launchers saved the mods folder as ModsDirectoryPath, which the game never reads.
+            old = self._data.pop("ModsDirectoryPath", None)
+            if old and not self._data.get("mods_directory_path"):
+                self._data["mods_directory_path"] = old
         except Exception as e:
             self._data = {}
             messagebox.showwarning("Couldn't read file",
@@ -209,7 +214,7 @@ class GameSettingsWindow(tk.Toplevel):
             tk.Label(row, text=field, bg=SURF, fg=PARCH,
                      font=("Segoe UI",9,"bold"), width=32, anchor="w").pack(side="left")
 
-            current = self._data.get(field)
+            current = self._data.get(field, DEFAULTS.get(field))
 
             if kind == "bool":
                 var = tk.BooleanVar(value=bool(current) if current is not None else False)
