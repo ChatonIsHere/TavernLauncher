@@ -109,6 +109,25 @@ class Addresses(unittest.TestCase):
         self.assertEqual(auth.ports_of({"game_port": 1757}), (1757, None))
         self.assertEqual(auth.ports_of({"game_port": "1757", "web_port": 70000}), (None, None))
 
+    def test_the_console_is_where_the_ping_says(self):
+        pinged = []
+        with mock.patch.object(auth, "ping_server",
+                               lambda h, timeout=3: (pinged.append(h), ({"console_port": 27018}, 1))[1]):
+            # Found by SRV: the console is on the record's target, on the port the ping gives.
+            self.assertEqual(auth.console_address("play.example.com"), ("box.example.com", 27018))
+            # A typed game port is dropped before the ping.
+            self.assertEqual(auth.console_address("203.0.113.5:1757"), ("203.0.113.5", 27018))
+        self.assertEqual(pinged, ["play.example.com", "203.0.113.5"])
+
+    def test_the_console_falls_back_to_1760(self):
+        with mock.patch.object(auth, "ping_server", lambda h, timeout=3: ({"status": "pong"}, 1)):
+            self.assertEqual(auth.console_address("203.0.113.5"), ("203.0.113.5", 1760))
+
+        def unreachable(h, timeout=3):
+            raise OSError("refused")
+        with mock.patch.object(auth, "ping_server", unreachable):
+            self.assertEqual(auth.console_address("play.example.com"), ("play.example.com", 1760))
+
 
 class CfgPort(unittest.TestCase):
 
@@ -162,6 +181,7 @@ class OverTheWire(unittest.TestCase):
 
         resp, _ms = auth.ping_server("play.example.com")
         self.assertEqual(auth.ports_of(resp), (27015, 27017))
+        self.assertEqual(resp["console_port"], 1760)   # not in this config: the default
         user_id, error, _scene, ports = auth.login("play.example.com", "Tester", "tok")
         self.assertIsNone(error)
         self.assertEqual(user_id, 1000000001)
