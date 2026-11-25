@@ -3229,5 +3229,139 @@ class Scenes(_TempDataDirFixture, unittest.TestCase):
         self.assertEqual([e.mod_id for e in plan.entries], ["srv.m"])
 
 
+
+def quiet():
+    return contextlib.redirect_stderr(io.StringIO())
+
+
+class IncompatibleAndWithdrawn(_TempDataDirFixture, unittest.TestCase):
+    """A source's `incompatible` pairs and `withdrawn` versions."""
+
+    def _pair(self, a="a.m", b="b.m", a_below=None, b_below=None, source=DEFAULT):
+        return mm.Incompatibility({a: a_below, b: b_below}, "Both patch vats.", source)
+
+    def _index(self, summaries=(), incompatible=(), withdrawn=()):
+        return mm.ModIndex(list(summaries), [], list(incompatible), list(withdrawn))
+
+    def test_fetch_indexes_carries_valid_entries_only(self):
+        mm._index_cache.clear()
+        self.manifests[f"{self.BASE}/repository.json"] = dict(
+            slim_index({"a.m": {"1": dict(slim_entry(["1.0.0"]), changelog="Fixed vats.")}}),
+            incompatible=[
+                {"mods": {"a.m": {}, "b.m": {"below": "2.0.0"}}, "note": "Both patch vats."},
+                {"mods": {"a.m": {"below": "nope"}, "c.m": {}}, "note": "Bad below: every version."},
+                {"mods": {"a.m": {}}, "note": "one mod"},
+                {"mods": {"a.m": {}, "A.m": {}}, "note": "same mod"},
+                {"mods": {"a.m": {}, "b.m": "x"}, "note": "side not an object"},
+                {"mods": {"a.m": {}, "b.m": {}}},
+                "junk"],
+            withdrawn={"a.m": {"1.1.0": "Corrupts saves.", "1.2.0": 3}, "b.m": "x"})
+        index = mm.fetch_indexes([self.BASE], force=True)
+        mm._index_cache.clear()
+        self.assertEqual(index.incompatible, [
+            mm.Incompatibility({"a.m": None, "b.m": "2.0.0"}, "Both patch vats.", self.BASE),
+            mm.Incompatibility({"a.m": None, "c.m": None}, "Bad below: every version.", self.BASE)])
+        self.assertEqual(index.withdrawn, [mm.Withdrawal("a.m", "1.1.0", "Corrupts saves.", self.BASE)])
+        self.assertEqual(index[0].changelog, "Fixed vats.")
+
+    def test_a_pair_applies_while_both_are_below_their_bounds(self):
+        index = self._index(incompatible=[self._pair(a_below="1.5.0", b_below="2.0.0")])
+        self.assertEqual(len(mm.clashes(index, {"a.m": "1.4.9", "b.m": "1.9.0"})), 1)
+        self.assertEqual(mm.clashes(index, {"a.m": "1.5.0", "b.m": "1.9.0"}), [])
+        self.assertEqual(mm.clashes(index, {"a.m": "1.0.0", "b.m": "2.0.0"}), [])
+        self.assertEqual(mm.clashes(index, {"a.m": "1.0.0"}), [])
+        self.assertEqual(len(mm.clashes(index, {"a.m": "?", "b.m": "1.0.0"})), 1)   # unreadable: assume the worst
+        # Two sources listing one pair count once.
+        twice = self._index(incompatible=[self._pair(), self._pair(source=OTHER)])
+        self.assertEqual(len(mm.clashes(twice, {"a.m": "1.0.0", "b.m": "1.0.0"})), 1)
+
+    def test_installs_name_an_enabled_mod_they_clash_with(self):
+        self._install("b.m")
+        index = self._index(incompatible=[self._pair()])
+        a = make_manifest("a.m", "1.0.0")
+        [(inc, other)] = mm.install_clashes(self.game, [a], index, "client_windows")
+        self.assertEqual((other, inc.note), ("b.m", "Both patch vats."))
+        mm.disable_mod(self.game, "b.m")
+        self.assertEqual(mm.install_clashes(self.game, [a], index, "client_windows"), [])
+        with self.assertRaisesRegex(mm.ModManagerError, "don't work together"):
+            mm.install_clashes(self.game, [a, make_manifest("b.m", "1.0.0")], index, "client_windows")
+
+    def test_enabled_clashes_marks_both_mods(self):
+        self._install("a.m")
+        self._install("b.m")
+        index = self._index(incompatible=[self._pair()])
+        found = mm.enabled_clashes(mm.list_installed_mods(self.game), index, "client_windows")
+        self.assertEqual({k: [o for _i, o in v] for k, v in found.items()}, {"a.m": ["b.m"], "b.m": ["a.m"]})
+        self.assertEqual(mm.enabled_clashes(mm.list_installed_mods(self.game), index, "server"), {})
+
+    def test_withdrawn_from_reads_the_records_own_source(self):
+        self._install("a.m")
+        rec = mm.list_installed_mods(self.game)[0]
+        theirs = self._index(withdrawn=[mm.Withdrawal("a.m", "1.0.0", "Bad.", OTHER)])
+        self.assertIsNone(mm.withdrawn_from(theirs, rec))
+        ours = self._index(withdrawn=[mm.Withdrawal("a.m", "1.0.0", "Bad.", rec["source_repo"])])
+        self.assertEqual(mm.withdrawn_from(ours, rec).reason, "Bad.")
+
+    def test_a_server_running_a_withdrawn_version_cant_be_joined(self):
+        self._publish("a.m", "1.0.0")
+        index = self._index([summary("a.m", ["1.1.0"])], withdrawn=[mm.Withdrawal("a.m", "1.0.0", "Corrupts saves.", DEFAULT)])
+        plan = self._plan([_srv("a.m", "1.0.0")], index)
+        self.assertEqual((plan.withdrawn, plan.entries, plan.blocking),
+                         ([("a.m", "1.0.0", "Corrupts saves.")], [], True))
+        row = next(r for r in mm.build_mod_diff(self.game, [_srv("a.m", "1.0.0")], plan) if r.mod_id == "a.m")
+        self.assertTrue(row.blocking)
+        self.assertIn("Corrupts saves.", row.note)
+
+    def test_a_withdrawn_recommendation_is_skipped(self):
+        self._publish("a.m", "1.0.0")
+        index = self._index(withdrawn=[mm.Withdrawal("a.m", "1.0.0", "Bad.", DEFAULT)])
+        with quiet():
+            plan = self._plan([_srv("a.m", "1.0.0", required=False)], index)
+        self.assertEqual((plan.entries, plan.blocking), ([], False))
+
+    def test_a_pin_on_a_withdrawn_version_takes_the_latest(self):
+        self._publish("a.m", "1.1.0")
+        index = self._index([summary("a.m", ["1.1.0"])], withdrawn=[mm.Withdrawal("a.m", "1.0.0", "Bad.", DEFAULT)])
+        with quiet():
+            plan = self._plan([], index, pinned=["a.m@1.0.0"])
+        self.assertEqual([(e.mod_id, e.version) for e in plan.entries], [("a.m", "1.1.0")])
+
+    def test_a_pin_that_clashes_with_a_server_mod_is_left_out(self):
+        self._publish("srv.m", "1.0.0")
+        self._install("pin.m")
+        index = self._index([summary("pin.m", ["1.0.0"])],
+                            incompatible=[self._pair("srv.m", "pin.m")])
+        with quiet():
+            plan = self._plan([_srv("srv.m", "1.0.0")], index, pinned=["pin.m"])
+        self.assertEqual([e.mod_id for e in plan.entries], ["srv.m"])
+        self.assertEqual(plan.forced_off, {"pin.m": "it doesn't work with srv.m, which this server runs: Both patch vats."})
+        row = next(r for r in mm.build_mod_diff(self.game, [], plan) if r.mod_id == "pin.m")
+        self.assertEqual((row.action, row.optional), (mm.ACTION_DEACTIVATE, False))
+
+    def test_the_servers_own_clashing_mods_only_warn(self):
+        self._publish("a.m", "1.0.0")
+        self._publish("b.m", "1.0.0")
+        index = self._index(incompatible=[self._pair()])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            plan = self._plan([_srv("a.m", "1.0.0"), _srv("b.m", "1.0.0", required=False)], index)
+        self.assertEqual(sorted(e.mod_id for e in plan.entries), ["a.m", "b.m"])
+        self.assertIn("don't work together", err.getvalue())
+
+    def test_a_modlist_import_swaps_a_withdrawn_version_and_lists_clashes(self):
+        latest = self._publish("a.m", "1.1.0")
+        self.manifests[f"{self.BASE}/manifests/a/m/latest.json"] = latest
+        self._publish("b.m", "1.0.0")
+        index = self._index([summary("a.m", ["1.1.0"]), summary("b.m", ["1.0.0"])],
+                            incompatible=[self._pair()],
+                            withdrawn=[mm.Withdrawal("a.m", "1.0.0", "Bad.", DEFAULT)])
+        plan = mm.import_modlist({"schema": 1, "repos": [], "mods": ["a.m@1.0.0", "b.m@1.0.0"]},
+                                 index, [self.BASE], target="client_windows")
+        self.assertEqual([(m.id, m.version) for m in plan.roots], [("a.m", "1.1.0"), ("b.m", "1.0.0")])
+        self.assertEqual(plan.withdrawn, [("a.m", "1.0.0", "Bad.")])
+        self.assertEqual([sorted(c.below) for c in plan.clashes], [["a.m", "b.m"]])
+        self.assertFalse(plan.blocking)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

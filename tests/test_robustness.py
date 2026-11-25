@@ -215,7 +215,7 @@ class JoinPlanning(_TempDataDirFixture, unittest.TestCase):
                             [mm.Replacement("old.m", "new.m", "", DEFAULT)])
         with quiet():
             plan = self._plan([_srv("old.m", "1.0.0")], index, pinned=["new.m"])
-        self.assertEqual(plan.forced_off, {"new.m": "old.m"})
+        self.assertEqual(plan.forced_off, {"new.m": "it replaces old.m, which this server runs, so they can't both load"})
         row = next(r for r in mm.build_mod_diff(self.game, [], plan) if r.mod_id == "new.m")
         self.assertEqual((row.action, row.optional), (mm.ACTION_DEACTIVATE, False))
 
