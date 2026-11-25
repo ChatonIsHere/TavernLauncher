@@ -52,7 +52,7 @@ from client.core.config import (
 )
 from tavern_shared.flashing import start_flashing_button
 from client.core.auth import (
-    auth_address, authenticate, game_ip, ping_server, _resolve_ip_for_game, _valid_port, split_host_port,
+    auth_address, login, game_ip, ping_server, _resolve_ip_for_game, _valid_port, split_host_port,
     build_tokens, _headless_user_id, register_whitelist_application, send_mods, ticket_request,
     fetch_server_mods,
 )
@@ -1271,7 +1271,7 @@ class ClientLauncher(LauncherCommon, tk.Tk):
         else:
             token, token_is_new, had_token_before = _token_state
 
-        user_id, error, scene_arg, ports = authenticate(host, username, token, password=password)
+        user_id, error, scene_arg, ports = login(host, username, token, password=password)
 
         if error == "NEEDS_PASSWORD":
             self._action_btn.config(state="normal")
