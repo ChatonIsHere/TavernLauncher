@@ -463,8 +463,7 @@ class Windows(_TempDataDirFixture, unittest.TestCase):
         ns = self._ns(_is_game_running=lambda: False, _index=self._clashing_index(), _installed_recs=[])
         for name in ("_name_by", "_mod_name", "_record"):
             setattr(ns, name, types.MethodType(getattr(ui.ModListWindow, name), ns))
-        self._publish("a.m", "1.0.0")
-        a = make_manifest("a.m", "1.0.0")
+        a = mm._manifest_from_dict(self._publish("a.m", "1.0.0"), self.BASE)
         answer = [False]
         ns._confirm_install("a.m", a, [], [])
         self.assertIn("doesn't work with", asked[0])
