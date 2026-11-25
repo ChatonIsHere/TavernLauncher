@@ -256,6 +256,7 @@ def _handle_auth(conn, addr, log_fn, get_game_dir):
                 "whitelist_enabled": bool(ss.get("whitelist_enabled",False)),
                 "game_port":         cfg_port("server_port", 1757, cfg),
                 "web_port":          cfg_port("web_port", 1761, cfg),
+                "console_port":      cfg_port("console_port", 1760, cfg),
             }
             live_count, live_limit = _read_live_player_status()
             if live_count is not None: resp["player_count"] = live_count
