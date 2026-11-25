@@ -6,6 +6,12 @@ Click "Get Mods" to browse and install mods. If a mod needs other mods, Get Mods
 
 A source can retire a mod in favour of another. The Mod Manager marks the old one "Replaced" and offers "Switch to" the new one, which installs it and then removes the old one. Pins, modlists and other mods that name the old one get the new one instead.
 
+Some mods don't work together. The Mod Manager marks an enabled pair "Conflict" and says why, and installing or enabling one of a pair asks before disabling the other. A mod you pinned that doesn't work with one a server runs is left out of that join.
+
+A source can withdraw a harmful or broken version. The Mod Manager marks it "Withdrawn" with the reason and offers the update. Servers still running a withdrawn version can't be joined until their host updates it.
+
+When an update is ready, selecting the mod shows what's new in it, if its author said.
+
 On the client, close the game before changing mods.
 
 ## Joining a modded server
