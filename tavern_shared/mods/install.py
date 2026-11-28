@@ -796,6 +796,27 @@ def enable_untracked_dll(game_dir, filename):
     return _move_untracked_dll(path + ".disabled", path)
 
 
+def uninstall_untracked(game_dir, name, kind):
+    """Deletes a loose mod this manager didn't install: a Mods/<name> folder,
+    or the loose Mods/<name>.dll whether enabled or .disabled. Returns whether
+    anything was deleted. Launcher-only, like uninstall_mod — TavernLib never
+    removes mods, so there's no twin and the join hash is unaffected."""
+    base = _mods_base(game_dir)
+    safe = _safe_basename(name)
+    if kind == "folder":
+        path = os.path.join(base, safe)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+            return True
+        return False
+    removed = False
+    for path in (os.path.join(base, safe), os.path.join(base, safe + ".disabled")):
+        if os.path.isfile(path):
+            os.remove(path)
+            removed = True
+    return removed
+
+
 def _untracked_stamp(game_dir, entry):
     """Whole-second mtime, "?" if unreadable. Twin of TavernLib's
     UntrackedStamp."""

@@ -23,7 +23,7 @@ from tavern_shared.mods.install import (
     _highest_by_id, _is_pre_v2, _verify_memo, disable_mod, disable_untracked_dll, enable_mod,
     enable_untracked_dll, has_target, install_dependencies, install_mod_set, installed_targets,
     list_installed_mods, list_mods, list_untracked_mods, missing_dependencies, mod_status,
-    plan_mod_install, replaced_by, retire_replaced, uninstall_mod,
+    plan_mod_install, replaced_by, retire_replaced, uninstall_mod, uninstall_untracked,
 )
 from tavern_shared.mods.manifest import runs_in_scene
 from tavern_shared.mods.modlist import (
@@ -834,8 +834,8 @@ class ModSourcesWindow(_Dialog):
 
 class ModManagerWindow(ModListWindow):
     """Everything in Mods/, managed and untracked, and the actions on it.
-    Untracked rows only toggle: no uninstall or version change for files this
-    manager didn't place."""
+    Untracked rows can be toggled or deleted, but not version-changed: there's
+    no source to re-download a file this manager didn't place."""
 
     _COLS   = ("status", "author", "mod", "installed", "latest", "managed", "source")
     _WIDTHS = (86,       96,       188,   66,          62,       86,        106)
@@ -1065,7 +1065,8 @@ class ModManagerWindow(ModListWindow):
             self._toggle_btn.config(state="disabled")
             self._fix_btn.config(state="disabled")
             return
-        self._uninstall_btn.config(state="normal" if r["kind"] == "managed" else "disabled")
+        removable = r["kind"] == "managed" or r["kind"].startswith("untracked_")
+        self._uninstall_btn.config(state="normal" if removable else "disabled")
         self._toggle_btn.config(text="Enable" if not r["enabled"] else "Disable", state="normal")
         self._fix_btn.config(state="normal" if rep or r.get("missing") else "disabled")
 
@@ -1082,8 +1083,9 @@ class ModManagerWindow(ModListWindow):
         menu = tk.Menu(self, tearoff=0, bg=SURF, fg=PARCH, selectcolor=AMBER,
                        activebackground=AMBERDIM, activeforeground=PARCH)
         managed = r["kind"] == "managed"
+        removable = managed or r["kind"].startswith("untracked_")
         menu.add_command(label="Uninstall", command=self._on_uninstall,
-                         state="normal" if managed else "disabled")
+                         state="normal" if removable else "disabled")
         menu.add_command(label="Enable" if not r["enabled"] else "Disable",
                          command=self._on_toggle)
         if r.get("replaced"):
@@ -1118,7 +1120,12 @@ class ModManagerWindow(ModListWindow):
         if self._busy:
             return
         r = self._selected_row()
-        if not r or r["kind"] != "managed":
+        if not r:
+            return
+        if r["kind"].startswith("untracked_"):
+            self._uninstall_untracked(r)
+            return
+        if r["kind"] != "managed":
             return
         others = [t for t in r["targets"] if t != self._target]
         also = (f" It's also installed for {target_label(others).replace(' only', '')} "
@@ -1139,6 +1146,27 @@ class ModManagerWindow(ModListWindow):
                on_ok=lambda removed: self._finish(
                    f"{name} removed." if removed else f"{name} was not installed."),
                on_err=lambda e: self._finish(f"Remove failed: {e}"))
+
+    def _uninstall_untracked(self, r):
+        """Deletes a loose file/folder this manager didn't install. Permanent,
+        like the managed uninstall, but spelled out: there's no source to get
+        it back from."""
+        name, what = r["name"], ("folder" if r["kind"] == "untracked_folder" else "file")
+        if not messagebox.askyesno("Delete untracked mod",
+                f"Delete {name} from Mods/?\n\nThis is a {what} copied in by hand, not "
+                f"installed by the Modding Tavern, so there's nothing to re-download it "
+                f"from. It's deleted from disk for good.", parent=self):
+            return
+        # The confirm only blocks this window; the game may have been launched
+        # while it sat open.
+        if not confirm_while_game_running(self, self._is_game_running, f"Deleting {name}"):
+            return
+        self._set_busy(True, f"Deleting {name}...")
+        game_dir, key, kind = self._game_dir, r["key"], r["kind"].split("_", 1)[1]
+        run_bg(self, lambda: uninstall_untracked(game_dir, key, kind),
+               on_ok=lambda removed: self._finish(
+                   f"{name} deleted." if removed else f"{name} was already gone."),
+               on_err=lambda e: self._finish(f"Delete failed: {e}"))
 
     def _on_select(self):
         self._sync_buttons()
