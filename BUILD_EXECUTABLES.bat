@@ -58,7 +58,7 @@ python dependencies\refresh_bundled_payloads.py
 
 echo.
 echo  Installing PyInstaller, Pillow and the console client...
-pip install pyinstaller pillow markdown tkinterweb websocket-client -q
+pip install pyinstaller pillow markdown tkinterweb websocket-client truststore -q
 if errorlevel 1 (
     echo  [ERROR] Failed to install the build packages.
     pause

@@ -16,6 +16,18 @@ import os
 import threading
 import traceback
 
+# Route TLS trust through the OS verifier (Schannel on Windows), so HTTPS
+# works wherever the system itself trusts the host -- fresh or locked-down
+# VPSes included -- instead of relying on Python's bundled cert handling,
+# which can't fetch a missing root/intermediate the way the OS does. Best-
+# effort: if truststore isn't present (source checkout, Python < 3.10),
+# downloads just fall back to the default verifier.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except Exception:
+    pass
+
 # So `import tavern_shared`, `import client.core...` all resolve
 # regardless of the exe's own working directory.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

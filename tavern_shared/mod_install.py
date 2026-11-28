@@ -11,6 +11,7 @@ import zipfile
 import zlib
 import struct
 import contextlib
+import ssl
 import urllib.request
 import urllib.error
 import http.client
@@ -275,8 +276,26 @@ def _download_with_progress(url, dest_path, on_progress,
         try:
             resp = _urlopen_hard_timeout(req, connect_timeout=connect_timeout)
         except urllib.error.URLError as e:
+            reason = getattr(e, "reason", e)
+            host = urlparse(url).netloc
+            if isinstance(reason, ssl.SSLError) and "CERTIFICATE_VERIFY_FAILED" in str(reason):
+                raise DownloadError(
+                    f"Couldn't verify {host}'s security certificate — {reason}\n\n"
+                    "This almost always means this machine's certificate store is out of "
+                    "date (common on a fresh or locked-down VPS), not a firewall or "
+                    "antivirus block.\n\n"
+                    "To tell which it is, run this in PowerShell:\n"
+                    "    Invoke-WebRequest https://github.com -UseBasicParsing | Select-Object StatusCode\n\n"
+                    "  • If it also fails, this machine can't trust GitHub. Run Windows "
+                    "Update, or in an elevated prompt run:\n"
+                    "        certutil -generateSSTFromWU roots.sst\n"
+                    "        certutil -addstore -f Root roots.sst\n"
+                    "    to refresh the root certificates, then retry.\n"
+                    "  • If it prints 200, the machine trusts GitHub but the launcher "
+                    "doesn't yet. Close and reopen the launcher; if it still fails, let "
+                    "us know in the Discord.")
             raise DownloadError(
-                f"Couldn't connect to {urlparse(url).netloc} — {getattr(e,'reason',e)}\n\n"
+                f"Couldn't connect to {host} — {reason}\n\n"
                 "This is usually a network/firewall/antivirus issue on this machine, "
                 "not something wrong with the launcher itself. "
                 + _worth_trying(_TIP_ADMIN, _TIP_AV,
